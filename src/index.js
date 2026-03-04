@@ -1,36 +1,30 @@
 "use strict";
 
-const path         = require('path')
-const sqlite3      = require('sqlite3').verbose()
-const reverse      = require('./reverse')
-const findLocation = require('./location').find
+const path = require("path");
+const geocoder = require("./core/geocoder");
+const nodeAdapter = require("./adapters/node-sqlite3");
 
-function Geocoder(options) {
-  var geocoder = function(options) {
-    this.options = options || {}
-
-    if (this.options.database === undefined) {
-      this.options.database = path.join(__filename, '../../data/db.sqlite')
-    }
-
-    this.db = new sqlite3.Database(this.options.database)
-  }
-
-  geocoder.prototype.reverse = function(latitude, longitude, callback) {
-    return reverse(this, latitude, longitude, callback)
-  }
-
-  geocoder.prototype.location = function() {
-    const _this = this
-
-    return {
-      find: function(locationId) {
-        return findLocation(_this, locationId)
-      }
-    }
-  }
-
-  return new geocoder(options)
+function defaultDatabasePath() {
+  return path.join(__dirname, "../data/db.sqlite");
 }
 
-module.exports = Geocoder;
+function createNodeGeocoder(options) {
+  const geocoderOptions = options || {};
+
+  if (geocoderOptions.adapter) {
+    return geocoder.createGeocoder(geocoderOptions.adapter);
+  }
+
+  const adapter = nodeAdapter.createNodeSqliteAdapter({
+    database: geocoderOptions.database || defaultDatabasePath(),
+    db: geocoderOptions.db,
+    sqlite3: geocoderOptions.sqlite3
+  });
+
+  return geocoder.createGeocoder(adapter);
+}
+
+module.exports = createNodeGeocoder;
+module.exports.createNodeGeocoder = createNodeGeocoder;
+module.exports.createGeocoder = geocoder.createGeocoder;
+module.exports.createNodeSqliteAdapter = nodeAdapter.createNodeSqliteAdapter;

@@ -1,3 +1,11 @@
+### 1.1.0 - 2026-03-04
+
+- Add adapter architecture with separate Node and Expo SQLite adapters
+- Add React Native entrypoint and Expo-focused API (`src/expo.js`)
+- Add forward city search and stable `geonames:<id>` identifiers
+- Update GeoNames generation schema + indexes for forward/reverse lookups
+- Add test coverage for reverse, forward, stable-id find, schema indexes, and Expo adapter execution
+
 ### 1.0.0 - 2018-08-02
 
 - Add bug fix for reverse lookup in rural/remote areas (@cosorio94)
