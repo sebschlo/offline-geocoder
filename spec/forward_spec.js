@@ -1,7 +1,7 @@
 const createGeocoder = require('../src/index.js');
 const fixtureDb = require('./helpers/fixture_db');
 
-describe('geocoder.reverse', () => {
+describe('geocoder.forward', () => {
   var fixture, geocoder;
 
   beforeAll((done) => {
@@ -16,8 +16,8 @@ describe('geocoder.reverse', () => {
     fixture.cleanup();
   });
 
-  it('performs reverse geocoding on a latitude and longitude', (done) => {
-    geocoder.reverse(41.89, 12.49)
+  it('returns the best match for an exact query', (done) => {
+    geocoder.forward('Rome')
       .then(function(result) {
         expect(result).toEqual({
           id: 3169070,
@@ -31,10 +31,18 @@ describe('geocoder.reverse', () => {
       });
   });
 
-  it("resolves an empty object when a location can't be found", (done) => {
-    geocoder.reverse(0, 0)
+  it('falls back to fuzzy matching', (done) => {
+    geocoder.forward('angeles')
       .then(function(result) {
-        expect(result).toEqual({});
+        expect(result.id).toEqual(5368361);
+        done();
+      });
+  });
+
+  it('returns undefined when nothing matches', (done) => {
+    geocoder.forward('xyzzy-not-a-city')
+      .then(function(result) {
+        expect(result).toBeUndefined();
         done();
       });
   });

@@ -1,25 +1,23 @@
 "use strict";
 
+function normalizeId(value) {
+  if (typeof value === 'string') {
+    var match = /^geonames:(\d+)$/i.exec(value.trim())
+    if (match) return Number(match[1])
+    return Number(value)
+  }
+  return value
+}
+
 function find(geocoder, locationId) {
   return new Promise(function(resolve, reject) {
-    const query = `SELECT * FROM everything WHERE id = $id LIMIT 1`
+    const query = `SELECT * FROM everything WHERE id = ? LIMIT 1`
 
-    geocoder.db.all(query, {
-      $id: locationId
-    }, function(err, rows) {
+    geocoder.db.all(query, [normalizeId(locationId)], function(err, rows) {
       if (err) {
-        if (typeof(callback) == 'function') {
-          callback(err, undefined)
-        } else if (typeof(reject) == 'function') {
-          reject(err)
-        }
+        reject(err)
       } else {
-        const result = formatResult(rows)
-        if (typeof(callback) == 'function') {
-          callback(undefined, result)
-        } else if (typeof(resolve) == 'function') {
-          resolve(result)
-        }
+        resolve(formatResult(rows))
       }
     })
   })

@@ -17,22 +17,21 @@ function findFeature(geocoder, latitude, longitude, callback) {
     const query = `SELECT * FROM everything WHERE id IN (
                      SELECT feature_id
                      FROM coordinates
-                     WHERE latitude BETWEEN $lat - 1.5 AND $lat + 1.5
-                     AND longitude BETWEEN $lon - 1.5 AND $lon + 1.5
+                     WHERE latitude BETWEEN ? - 1.5 AND ? + 1.5
+                     AND longitude BETWEEN ? - 1.5 AND ? + 1.5
                      ORDER BY (
-                       ($lat - latitude) * ($lat - latitude) +
-                         ($lon - longitude) * ($lon - longitude) * $scale
+                       (? - latitude) * (? - latitude) +
+                         (? - longitude) * (? - longitude) * ?
                      ) ASC
                      LIMIT 1
                    )`
 
     const scale = Math.pow(Math.cos(latitude * Math.PI / 180), 2)
 
-    geocoder.db.all(query, {
-      $lat:   latitude,
-      $lon:   longitude,
-      $scale: scale
-    }, function(err, rows) {
+    geocoder.db.all(query, [
+      latitude, latitude, longitude, longitude,
+      latitude, latitude, longitude, longitude, scale
+    ], function(err, rows) {
       if (err) {
         if (typeof(callback) == 'function') {
           callback(err, undefined)
