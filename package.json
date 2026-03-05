@@ -1,14 +1,33 @@
 {
   "name": "offline-geocoder",
   "version": "1.0.0",
-  "description": "Node library for offline geocoding",
+  "description": "Offline reverse and forward geocoding for Node and React Native",
   "repository": "https://github.com/lucaspiller/offline-geocoder",
   "main": "src/index.js",
-  "dependencies": {
-    "sqlite3": "^4.0.0"
+  "react-native": "src/expo.js",
+  "exports": {
+    ".": {
+      "react-native": "./src/expo.js",
+      "require": "./src/index.js",
+      "default": "./src/index.js"
+    },
+    "./node": "./src/node.js",
+    "./expo": "./src/expo.js",
+    "./adapters/node": "./src/adapters/node-sqlite3.js",
+    "./adapters/expo": "./src/adapters/expo-sqlite.js"
   },
+  "peerDependencies": {
+    "sqlite3": "^5.1.7"
+  },
+  "peerDependenciesMeta": {
+    "sqlite3": {
+      "optional": true
+    }
+  },
+  "dependencies": {},
   "devDependencies": {
-    "jasmine": "^3.1.0"
+    "jasmine": "^5.12.0",
+    "sqlite3": "^5.1.7"
   },
   "scripts": {
     "test": "jasmine"

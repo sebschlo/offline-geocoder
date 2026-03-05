@@ -1,3 +1,6 @@
 data
 node_modules
 package-lock.json
+.npm-cache
+.geonames-build
+.DS_Store
