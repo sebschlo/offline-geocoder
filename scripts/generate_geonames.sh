@@ -10,16 +10,18 @@ set -euo pipefail
 #   GEONAMES_WORKDIR     working dir for output and temp files (default: current dir)
 #   GEONAMES_DOWNLOAD    set to 0 to skip downloads and use existing local files
 #   GEONAMES_FEATURE_CODES comma-separated GeoNames feature codes to keep
-#                         (default: PPLA,PPLA2,PPLA3,PPLA4,PPLA5,PPLC)
-#                         Note: PPL can include neighborhood-like entries.
+#                         (default: PPL,PPLA,PPLA2,PPLA3,PPLA4,PPLA5,PPLC)
 #   GEONAMES_MIN_POPULATION minimum population to keep (default: 0)
+#   GEONAMES_PPL_MIN_POPULATION minimum population to keep for plain PPL
+#                         populated places (default: 10000)
 #   GEONAMES_INCLUDE_ADMIN1 set to 0 to skip admin1 import entirely (default: 1)
 
 GEONAMES_DATASET="${GEONAMES_DATASET:-cities1000}"
 GEONAMES_WORKDIR="${GEONAMES_WORKDIR:-$(pwd)}"
 GEONAMES_DOWNLOAD="${GEONAMES_DOWNLOAD:-1}"
-GEONAMES_FEATURE_CODES="${GEONAMES_FEATURE_CODES:-PPLA,PPLA2,PPLA3,PPLA4,PPLA5,PPLC}"
+GEONAMES_FEATURE_CODES="${GEONAMES_FEATURE_CODES:-PPL,PPLA,PPLA2,PPLA3,PPLA4,PPLA5,PPLC}"
 GEONAMES_MIN_POPULATION="${GEONAMES_MIN_POPULATION:-0}"
+GEONAMES_PPL_MIN_POPULATION="${GEONAMES_PPL_MIN_POPULATION:-10000}"
 GEONAMES_INCLUDE_ADMIN1="${GEONAMES_INCLUDE_ADMIN1:-1}"
 OUTPUT="${1:-db.sqlite}"
 
@@ -86,9 +88,10 @@ fi
 echo "Preparing TSV files in ${TMP_DIR}..."
 echo "Feature codes: ${GEONAMES_FEATURE_CODES}"
 echo "Minimum population: ${GEONAMES_MIN_POPULATION}"
+echo "Minimum population for PPL: ${GEONAMES_PPL_MIN_POPULATION}"
 echo "Include admin1: ${GEONAMES_INCLUDE_ADMIN1}"
 rm -f "${TMP_DIR}/features.tsv" "${TMP_DIR}/coordinates.tsv"
-awk -v feature_codes="${GEONAMES_FEATURE_CODES}" -v min_population="${GEONAMES_MIN_POPULATION}" -v include_admin1="${GEONAMES_INCLUDE_ADMIN1}" -v features_out="${TMP_DIR}/features.tsv" -v coordinates_out="${TMP_DIR}/coordinates.tsv" 'BEGIN {
+awk -v feature_codes="${GEONAMES_FEATURE_CODES}" -v min_population="${GEONAMES_MIN_POPULATION}" -v ppl_min_population="${GEONAMES_PPL_MIN_POPULATION}" -v include_admin1="${GEONAMES_INCLUDE_ADMIN1}" -v features_out="${TMP_DIR}/features.tsv" -v coordinates_out="${TMP_DIR}/coordinates.tsv" 'BEGIN {
   FS="\t";
   OFS=";";
   split(feature_codes, raw_codes, ",");
@@ -107,6 +110,9 @@ awk -v feature_codes="${GEONAMES_FEATURE_CODES}" -v min_population="${GEONAMES_M
 
   population = ($15 == "" ? 0 : $15);
   if (population < min_population) {
+    next;
+  }
+  if ($8 == "PPL" && population < ppl_min_population) {
     next;
   }
 

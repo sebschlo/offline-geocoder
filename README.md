@@ -151,12 +151,21 @@ Environment variables for customization:
 | `GEONAMES_DATASET` | `cities1000` | GeoNames dump file to use |
 | `GEONAMES_WORKDIR` | current directory | Working directory for temp files |
 | `GEONAMES_DOWNLOAD` | `1` | Set to `0` to skip downloads |
-| `GEONAMES_FEATURE_CODES` | `PPLA,PPLA2,PPLA3,PPLA4,PPLA5,PPLC` | Feature codes to keep |
+| `GEONAMES_FEATURE_CODES` | `PPL,PPLA,PPLA2,PPLA3,PPLA4,PPLA5,PPLC` | Feature codes to keep |
 | `GEONAMES_MIN_POPULATION` | `0` | Minimum population filter |
+| `GEONAMES_PPL_MIN_POPULATION` | `10000` | Additional minimum population filter for plain `PPL` entries |
 | `GEONAMES_INCLUDE_ADMIN1` | `1` | Set to `0` to skip admin1 data |
 
-The default feature codes exclude `PPL` which can include neighbourhood-like
-populated places. The schema is defined in [`scripts/schema.sql`](scripts/schema.sql).
+By default the generator includes GeoNames `PPL` records so user-expected cities
+such as Cannes are retained, but it applies a stricter population floor to
+plain `PPL` entries than to administrative seats/capitals. This keeps many
+small neighbourhood-like populated places out of the default database while
+preserving lower-population `PPLA*` and `PPLC` records.
+
+If you need a stricter dataset, raise `GEONAMES_PPL_MIN_POPULATION` or
+`GEONAMES_MIN_POPULATION`. If you need to include smaller localities, lower
+`GEONAMES_PPL_MIN_POPULATION` or remove `PPL` from `GEONAMES_FEATURE_CODES`.
+The schema is defined in [`scripts/schema.sql`](scripts/schema.sql).
 
 ## License
 
