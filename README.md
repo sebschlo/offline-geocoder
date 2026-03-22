@@ -154,17 +154,24 @@ Environment variables for customization:
 | `GEONAMES_FEATURE_CODES` | `PPL,PPLA,PPLA2,PPLA3,PPLA4,PPLA5,PPLC` | Feature codes to keep |
 | `GEONAMES_MIN_POPULATION` | `0` | Minimum population filter |
 | `GEONAMES_PPL_MIN_POPULATION` | `10000` | Additional minimum population filter for plain `PPL` entries |
+| `GEONAMES_PPL_DEDUP` | `1` | Set to `0` to disable neighbourhood-style `PPL` dedupe near admin seats/capitals |
+| `GEONAMES_PPL_DEDUP_NEAR_KM` | `2` | Suppress any `PPL` this close to a same-admin2 `PPLA*`/`PPLC` centroid |
+| `GEONAMES_PPL_DEDUP_NAME_NEAR_KM` | `12` | Suppress related-name `PPL` entries within this distance of a same-admin2 `PPLA*`/`PPLC` centroid |
 | `GEONAMES_INCLUDE_ADMIN1` | `1` | Set to `0` to skip admin1 data |
 
 By default the generator includes GeoNames `PPL` records so user-expected cities
 such as Cannes are retained, but it applies a stricter population floor to
 plain `PPL` entries than to administrative seats/capitals. This keeps many
 small neighbourhood-like populated places out of the default database while
-preserving lower-population `PPLA*` and `PPLC` records.
+preserving lower-population `PPLA*` and `PPLC` records. It also deduplicates
+`PPL` entries that appear to be city sub-localities by comparing them to nearby
+`PPLA*`/`PPLC` seat centroids inside the same admin2 region.
 
 If you need a stricter dataset, raise `GEONAMES_PPL_MIN_POPULATION` or
 `GEONAMES_MIN_POPULATION`. If you need to include smaller localities, lower
-`GEONAMES_PPL_MIN_POPULATION` or remove `PPL` from `GEONAMES_FEATURE_CODES`.
+`GEONAMES_PPL_MIN_POPULATION`, tune the dedupe radii, or set
+`GEONAMES_PPL_DEDUP=0`. You can also remove `PPL` from
+`GEONAMES_FEATURE_CODES`.
 The schema is defined in [`scripts/schema.sql`](scripts/schema.sql).
 
 ## License

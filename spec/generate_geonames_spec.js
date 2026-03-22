@@ -53,9 +53,14 @@ describe('scripts/generate_geonames.sh', () => {
     fs.mkdirSync(sourceDir, { recursive: true });
 
     fs.writeFileSync(path.join(sourceDir, 'cities1000.txt'), [
-      geonamesRow(['3028808', 'Cannes', 'Cannes', '', '43.55135', '7.01275', 'P', 'PPL', 'FR', '', '93', '', '', '', '74545', '', '', 'Europe/Paris', '2024-01-01']),
-      geonamesRow(['9990001', 'Tiny Hamlet', 'Tiny Hamlet', '', '43.60000', '7.10000', 'P', 'PPL', 'FR', '', '93', '', '', '', '2500', '', '', 'Europe/Paris', '2024-01-01']),
-      geonamesRow(['9990002', 'Admin Seat', 'Admin Seat', '', '41.00000', '15.00000', 'P', 'PPLA3', 'IT', '', '04', '', '', '', '1026', '', '', 'Europe/Rome', '2024-01-01'])
+      geonamesRow(['3028808', 'Cannes', 'Cannes', '', '43.55135', '7.01275', 'P', 'PPL', 'FR', '', '93', '061', '', '', '74545', '', '', 'Europe/Paris', '2024-01-01']),
+      geonamesRow(['9990001', 'Tiny Hamlet', 'Tiny Hamlet', '', '43.60000', '7.10000', 'P', 'PPL', 'FR', '', '93', '061', '', '', '2500', '', '', 'Europe/Paris', '2024-01-01']),
+      geonamesRow(['9990002', 'Admin Seat', 'Admin Seat', '', '41.00000', '15.00000', 'P', 'PPLA3', 'IT', '', '04', '061', '', '', '1026', '', '', 'Europe/Rome', '2024-01-01']),
+      geonamesRow(['9990003', 'Big City', 'Big City', '', '43.30000', '6.80000', 'P', 'PPLA2', 'FR', '', '93', '061', '', '', '60000', '', '', 'Europe/Paris', '2024-01-01']),
+      geonamesRow(['9990004', 'Big City Downtown', 'Big City Downtown', '', '43.30100', '6.80100', 'P', 'PPL', 'FR', '', '93', '061', '', '', '15000', '', '', 'Europe/Paris', '2024-01-01']),
+      geonamesRow(['9990005', 'Big City West', 'Big City West', '', '43.34000', '6.84000', 'P', 'PPL', 'FR', '', '93', '061', '', '', '15000', '', '', 'Europe/Paris', '2024-01-01']),
+      geonamesRow(['9990006', 'Independent Bay', 'Independent Bay', '', '43.43000', '6.98000', 'P', 'PPL', 'FR', '', '93', '061', '', '', '15000', '', '', 'Europe/Paris', '2024-01-01']),
+      geonamesRow(['9990007', 'Small Island', 'Small Island', '', '43.90000', '7.80000', 'P', 'PPL', 'FR', '', '93', '099', '', '', '12000', '', '', 'Europe/Paris', '2024-01-01'])
     ].join(''));
 
     fs.writeFileSync(path.join(sourceDir, 'admin1CodesASCII.txt'), [
@@ -83,7 +88,10 @@ describe('scripts/generate_geonames.sh', () => {
     var rows = await queryAll(dbPath, 'SELECT name, population FROM features ORDER BY id');
     expect(rows).toEqual([
       { name: 'Cannes', population: 74545 },
-      { name: 'Admin Seat', population: 1026 }
+      { name: 'Admin Seat', population: 1026 },
+      { name: 'Big City', population: 60000 },
+      { name: 'Independent Bay', population: 15000 },
+      { name: 'Small Island', population: 12000 }
     ]);
   });
 
@@ -98,7 +106,29 @@ describe('scripts/generate_geonames.sh', () => {
     expect(rows).toEqual([
       { name: 'Cannes' },
       { name: 'Tiny Hamlet' },
-      { name: 'Admin Seat' }
+      { name: 'Admin Seat' },
+      { name: 'Big City' },
+      { name: 'Independent Bay' },
+      { name: 'Small Island' }
+    ]);
+  });
+
+  it('allows disabling PPL dedupe to keep nearby locality records', async () => {
+    await runScript(scriptPath, dbPath, Object.assign({}, process.env, {
+      GEONAMES_WORKDIR: tmpDir,
+      GEONAMES_DOWNLOAD: '0',
+      GEONAMES_PPL_DEDUP: '0'
+    }));
+
+    var rows = await queryAll(dbPath, 'SELECT name FROM features ORDER BY id');
+    expect(rows).toEqual([
+      { name: 'Cannes' },
+      { name: 'Admin Seat' },
+      { name: 'Big City' },
+      { name: 'Big City Downtown' },
+      { name: 'Big City West' },
+      { name: 'Independent Bay' },
+      { name: 'Small Island' }
     ]);
   });
 });

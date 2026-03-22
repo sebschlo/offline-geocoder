@@ -14,6 +14,13 @@ set -euo pipefail
 #   GEONAMES_MIN_POPULATION minimum population to keep (default: 0)
 #   GEONAMES_PPL_MIN_POPULATION minimum population to keep for plain PPL
 #                         populated places (default: 10000)
+#   GEONAMES_PPL_DEDUP set to 0 to disable deduplication of neighborhood-like
+#                         PPL records near nearby administrative seats (default: 1)
+#   GEONAMES_PPL_DEDUP_NEAR_KM suppress any PPL this close to a same-admin2
+#                         seat/capital centroid (default: 2)
+#   GEONAMES_PPL_DEDUP_NAME_NEAR_KM suppress PPL with city-like related names
+#                         within this distance of a same-admin2 seat/capital
+#                         centroid (default: 12)
 #   GEONAMES_INCLUDE_ADMIN1 set to 0 to skip admin1 import entirely (default: 1)
 
 GEONAMES_DATASET="${GEONAMES_DATASET:-cities1000}"
@@ -22,6 +29,9 @@ GEONAMES_DOWNLOAD="${GEONAMES_DOWNLOAD:-1}"
 GEONAMES_FEATURE_CODES="${GEONAMES_FEATURE_CODES:-PPL,PPLA,PPLA2,PPLA3,PPLA4,PPLA5,PPLC}"
 GEONAMES_MIN_POPULATION="${GEONAMES_MIN_POPULATION:-0}"
 GEONAMES_PPL_MIN_POPULATION="${GEONAMES_PPL_MIN_POPULATION:-10000}"
+GEONAMES_PPL_DEDUP="${GEONAMES_PPL_DEDUP:-1}"
+GEONAMES_PPL_DEDUP_NEAR_KM="${GEONAMES_PPL_DEDUP_NEAR_KM:-2}"
+GEONAMES_PPL_DEDUP_NAME_NEAR_KM="${GEONAMES_PPL_DEDUP_NAME_NEAR_KM:-12}"
 GEONAMES_INCLUDE_ADMIN1="${GEONAMES_INCLUDE_ADMIN1:-1}"
 OUTPUT="${1:-db.sqlite}"
 
@@ -89,11 +99,21 @@ echo "Preparing TSV files in ${TMP_DIR}..."
 echo "Feature codes: ${GEONAMES_FEATURE_CODES}"
 echo "Minimum population: ${GEONAMES_MIN_POPULATION}"
 echo "Minimum population for PPL: ${GEONAMES_PPL_MIN_POPULATION}"
+echo "PPL dedupe enabled: ${GEONAMES_PPL_DEDUP}"
+echo "PPL dedupe near radius (km): ${GEONAMES_PPL_DEDUP_NEAR_KM}"
+echo "PPL dedupe related-name radius (km): ${GEONAMES_PPL_DEDUP_NAME_NEAR_KM}"
 echo "Include admin1: ${GEONAMES_INCLUDE_ADMIN1}"
 rm -f "${TMP_DIR}/features.tsv" "${TMP_DIR}/coordinates.tsv"
-awk -v feature_codes="${GEONAMES_FEATURE_CODES}" -v min_population="${GEONAMES_MIN_POPULATION}" -v ppl_min_population="${GEONAMES_PPL_MIN_POPULATION}" -v include_admin1="${GEONAMES_INCLUDE_ADMIN1}" -v features_out="${TMP_DIR}/features.tsv" -v coordinates_out="${TMP_DIR}/coordinates.tsv" 'BEGIN {
+awk -v feature_codes="${GEONAMES_FEATURE_CODES}" -v min_population="${GEONAMES_MIN_POPULATION}" -v ppl_min_population="${GEONAMES_PPL_MIN_POPULATION}" -v ppl_dedup="${GEONAMES_PPL_DEDUP}" -v ppl_dedup_near_km="${GEONAMES_PPL_DEDUP_NEAR_KM}" -v ppl_dedup_name_near_km="${GEONAMES_PPL_DEDUP_NAME_NEAR_KM}" -v include_admin1="${GEONAMES_INCLUDE_ADMIN1}" -v features_out="${TMP_DIR}/features.tsv" -v coordinates_out="${TMP_DIR}/coordinates.tsv" 'BEGIN {
   FS="\t";
   OFS=";";
+  pi = 3.141592653589793;
+  anchor_codes["PPLC"] = 1;
+  anchor_codes["PPLA"] = 1;
+  anchor_codes["PPLA2"] = 1;
+  anchor_codes["PPLA3"] = 1;
+  anchor_codes["PPLA4"] = 1;
+  anchor_codes["PPLA5"] = 1;
   split(feature_codes, raw_codes, ",");
   for (i in raw_codes) {
     code = raw_codes[i];
@@ -102,6 +122,71 @@ awk -v feature_codes="${GEONAMES_FEATURE_CODES}" -v min_population="${GEONAMES_M
       allowed_codes[code] = 1;
     }
   }
+}
+function normalize_name(value, lowered) {
+  lowered = tolower(value);
+  gsub(/[^a-z0-9]+/, " ", lowered);
+  gsub(/^ +| +$/, "", lowered);
+  gsub(/ +/, " ", lowered);
+  return lowered;
+}
+function admin_key(country, admin1, admin2) {
+  return country "|" admin1 "|" admin2;
+}
+function add_anchor(key, latitude, longitude, normalized_name, idx) {
+  idx = ++anchor_count[key];
+  anchor_lat[key, idx] = latitude + 0;
+  anchor_lon[key, idx] = longitude + 0;
+  anchor_name[key, idx] = normalized_name;
+}
+function distance_km(lat1, lon1, lat2, lon2, lat_km, lon_km, avg_lat_rad, dlat, dlon) {
+  lat_km = 111.32;
+  avg_lat_rad = ((lat1 + lat2) / 2.0) * pi / 180.0;
+  lon_km = 111.32 * cos(avg_lat_rad);
+  dlat = (lat1 - lat2) * lat_km;
+  dlon = (lon1 - lon2) * lon_km;
+  return sqrt(dlat * dlat + dlon * dlon);
+}
+function contains_phrase(haystack, needle, padded) {
+  if (haystack == "" || needle == "") {
+    return 0;
+  }
+  padded = " " haystack " ";
+  return index(padded, " " needle " ") > 0;
+}
+function names_related(name_a, name_b) {
+  if (name_a == "" || name_b == "") {
+    return 0;
+  }
+  if (name_a == name_b) {
+    return 1;
+  }
+  return contains_phrase(name_a, name_b) || contains_phrase(name_b, name_a);
+}
+function should_suppress_ppl(record_index, key, count, candidate_lat, candidate_lon, candidate_name, anchor_index, distance) {
+  if (ppl_dedup != "1") {
+    return 0;
+  }
+  count = anchor_count[key];
+  if (count == 0) {
+    return 0;
+  }
+
+  candidate_lat = record_lat[record_index];
+  candidate_lon = record_lon[record_index];
+  candidate_name = record_normalized_name[record_index];
+
+  for (anchor_index = 1; anchor_index <= count; anchor_index++) {
+    distance = distance_km(candidate_lat, candidate_lon, anchor_lat[key, anchor_index], anchor_lon[key, anchor_index]);
+    if (distance <= ppl_dedup_near_km) {
+      return 1;
+    }
+    if (distance <= ppl_dedup_name_near_km && names_related(candidate_name, anchor_name[key, anchor_index])) {
+      return 1;
+    }
+  }
+
+  return 0;
 }
 {
   if (!($8 in allowed_codes)) {
@@ -116,13 +201,58 @@ awk -v feature_codes="${GEONAMES_FEATURE_CODES}" -v min_population="${GEONAMES_M
     next;
   }
 
-  gsub("\"", "", $2);
-  gsub(";", "", $2);
-  gsub("\"", "", $3);
-  gsub(";", "", $3);
+  feature_name = $2;
+  asciiname = $3;
+  gsub("\"", "", feature_name);
+  gsub(";", "", feature_name);
+  gsub("\"", "", asciiname);
+  gsub(";", "", asciiname);
+
+  id = $1;
+  latitude = $5 + 0;
+  longitude = $6 + 0;
+  feature_code = $8;
+  country_id = $9;
   admin1_id = (include_admin1 == "1" ? $11 : "");
-  print $1,$2,$3,$9,admin1_id,population >> features_out;
-  print $1,$5,$6 >> coordinates_out;
+  admin2_id = $12;
+  normalized_name = normalize_name(asciiname != "" ? asciiname : feature_name);
+
+  record_count++;
+  record_id[record_count] = id;
+  record_name[record_count] = feature_name;
+  record_asciiname[record_count] = asciiname;
+  record_country[record_count] = country_id;
+  record_admin1[record_count] = admin1_id;
+  record_admin2[record_count] = admin2_id;
+  record_population[record_count] = population;
+  record_lat[record_count] = latitude;
+  record_lon[record_count] = longitude;
+  record_feature_code[record_count] = feature_code;
+  record_normalized_name[record_count] = normalized_name;
+
+  if (feature_code in anchor_codes && admin2_id != "") {
+    add_anchor(admin_key(country_id, admin1_id, admin2_id), latitude, longitude, normalized_name);
+  }
+}
+END {
+  suppressed_ppl_count = 0;
+
+  for (i = 1; i <= record_count; i++) {
+    if (record_feature_code[i] == "PPL" && record_admin2[i] != "") {
+      key = admin_key(record_country[i], record_admin1[i], record_admin2[i]);
+      if (should_suppress_ppl(i, key)) {
+        suppressed_ppl_count++;
+        continue;
+      }
+    }
+
+    print record_id[i],record_name[i],record_asciiname[i],record_country[i],record_admin1[i],record_population[i] >> features_out;
+    print record_id[i],record_lat[i],record_lon[i] >> coordinates_out;
+  }
+
+  if (ppl_dedup == "1") {
+    print "Suppressed PPL duplicates: " suppressed_ppl_count > "/dev/stderr";
+  }
 }' "${SOURCE_DIR}/${DATA_FILE}"
 
 if [[ "${GEONAMES_INCLUDE_ADMIN1}" == "1" ]]; then
