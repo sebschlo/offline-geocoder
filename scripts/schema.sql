@@ -46,3 +46,49 @@ CREATE INDEX coordinates_lat_lng ON coordinates (latitude, longitude);
 CREATE INDEX features_name_nocase ON features (name COLLATE NOCASE);
 CREATE INDEX features_asciiname_nocase ON features (asciiname COLLATE NOCASE);
 CREATE INDEX features_population_desc ON features (population DESC);
+
+CREATE TABLE places(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  country_id TEXT NOT NULL,
+  admin1_id INTEGER,
+  placetype TEXT NOT NULL,
+  centroid_lat REAL NOT NULL,
+  centroid_lon REAL NOT NULL,
+  bbox_min_lat REAL NOT NULL,
+  bbox_min_lon REAL NOT NULL,
+  bbox_max_lat REAL NOT NULL,
+  bbox_max_lon REAL NOT NULL,
+  priority_rank INTEGER NOT NULL DEFAULT 0,
+  area REAL NOT NULL DEFAULT 0,
+  country_name TEXT,
+  admin1_name TEXT
+);
+
+CREATE TABLE place_geohash_cover(
+  geohash TEXT NOT NULL,
+  precision INTEGER NOT NULL,
+  place_id INTEGER NOT NULL,
+  coverage_type TEXT NOT NULL CHECK (coverage_type IN ('full', 'partial')),
+  PRIMARY KEY (geohash, precision, place_id),
+  FOREIGN KEY (place_id) REFERENCES places(id)
+);
+
+CREATE TABLE place_geometry(
+  place_id INTEGER PRIMARY KEY,
+  encoding TEXT NOT NULL DEFAULT 'json',
+  geometry BLOB NOT NULL,
+  FOREIGN KEY (place_id) REFERENCES places(id)
+);
+
+CREATE TABLE place_geohash_lookup(
+  geohash TEXT PRIMARY KEY,
+  place_id INTEGER NOT NULL,
+  FOREIGN KEY (place_id) REFERENCES places(id)
+);
+
+CREATE INDEX place_geohash_cover_hash_precision ON place_geohash_cover (geohash, precision);
+CREATE INDEX place_geohash_cover_place_id ON place_geohash_cover (place_id);
+CREATE INDEX places_placetype ON places (placetype);
+CREATE INDEX place_geometry_place_id ON place_geometry (place_id);
+CREATE INDEX place_geohash_lookup_place_id ON place_geohash_lookup (place_id);

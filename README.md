@@ -56,6 +56,17 @@ When you initialize the library you need to pass the location of the database:
 const geocoder = require('offline-geocoder')({ database: 'data/geocoder.sqlite' })
 ```
 
+To enable boundary-aware reverse geocoding, pass `reverseMode: 'boundary'`
+(default is `centroid` for backward compatibility):
+
+```javascript
+const geocoder = require('offline-geocoder')({
+  database: 'data/geocoder.sqlite',
+  reverseMode: 'boundary',
+  boundary: { basePrecision: 4, maxPrecision: 7 }
+})
+```
+
 ### Reverse Geocoding
 
 To perform a reverse geocode lookup just pass the coordinates:
@@ -88,6 +99,11 @@ geocoder.reverse(41.89, 12.49, function(error, result) {
   console.log(result)
 })
 ```
+
+Boundary mode keeps the same return payload shape and supports two boundary
+storage modes:
+- compact lookup (`compact_places` + `compact_geohash_lookup`)
+- full polygon mode (`places` + `place_geohash_cover` + `place_geometry`)
 
 ### Forward Geocoding
 
@@ -157,6 +173,104 @@ Environment variables for customization:
 
 The default feature codes exclude `PPL` which can include neighbourhood-like
 populated places. The schema is defined in [`scripts/schema.sql`](scripts/schema.sql).
+
+### Generating a Boundary Index
+
+Build boundary-aware reverse lookup tables from a polygon source (GeoJSON
+FeatureCollection/Feature or newline-delimited GeoJSON):
+
+```bash
+node scripts/generate_boundary_index.js \
+  --database data/geocoder.sqlite \
+  --input data/localities.geojson \
+  --index-mode compact \
+  --include-region true \
+  --min-population 10000 \
+  --base-precision 4 \
+  --max-precision 7
+```
+
+You can also run `npm run build:boundary -- --database ... --input ...`.
+
+You can point the builder directly at directories of WOF GeoJSON files:
+
+```bash
+node scripts/generate_boundary_index.js \
+  --database data/geocoder.sqlite \
+  --input-dir tmp/wof-build/extracted/fr/.../data \
+  --index-mode compact \
+  --include-region true \
+  --min-population 10000 \
+  --base-precision 4 \
+  --max-precision 7 \
+  --drop-contained-localities true
+```
+
+`--drop-contained-localities true` removes `locality` polygons that are fully
+contained in larger localities within the same country/admin1 group. This is
+intended to suppress duplicate neighbourhood-like localities while keeping
+small isolated places (for example islands) that are not contained.
+
+Builder notes:
+
+- Keeps current records only (drops deprecated/superseded where source metadata is present)
+- Includes `locality` placetypes by default (`localadmin` optional via `--include-localadmin true`)
+- Optional `region` fallback polygons via `--include-region true`
+- `--min-population` applies to `locality` only, so low-pop localities can roll up to broader admin areas when `region` is included
+- Point-only capital localities are retained (single-cell locality fallback) so country/admin capitals are not dropped by polygon-only filtering
+- Per-placetype precision caps are supported:
+  - `--locality-max-precision`
+  - `--localadmin-max-precision`
+  - `--region-max-precision`
+  - `--region-sparse-max-precision` + `--region-sparse-min-area-km2` for very large sparse regions (for example geohash-3 in Amazon-like interiors)
+- `--promote-locality-over-region` (default `true`) prefers locality labels in shared parent cells when there is no competing locality (keeps city labels sticky against region-only outskirts)
+- Excludes neighbourhood-like placetypes from default reverse output
+- `--index-mode compact` (default) stores only geohash-to-place mappings (`compact_geohash_lookup`) and no runtime geometry payloads.
+  Compact schema uses `compact_places(id,name,country_id,admin1_id,placetype_code,latitude,longitude)`.
+- `--index-mode full` stores geohash cover + geometry for runtime point-in-polygon
+
+### Building From Who's On First (WOF)
+
+Use the WOF helper script to download country admin repos and build in one step:
+
+```bash
+WOF_COUNTRIES=FR,IT \
+WOF_BASE_PRECISION=4 \
+WOF_MAX_PRECISION=5 \
+WOF_INCLUDE_REGION=1 \
+WOF_MIN_POPULATION=10000 \
+./scripts/generate_wof_boundary.sh data/geocoder.sqlite
+```
+
+Equivalent npm script:
+
+```bash
+npm run build:wof -- data/geocoder.sqlite
+```
+
+Useful WOF build env vars:
+
+- `WOF_COUNTRIES` comma-separated country codes (default `FR,IT`)
+- `WOF_WORKDIR` working directory for downloads/extracted files (default `tmp/wof-build`)
+- `WOF_DOWNLOAD=0` reuse existing archives only
+- `WOF_REF` branch/ref to download (default `master`)
+- `WOF_LOCALITY_MAX_PRECISION` locality precision cap
+- `WOF_REGION_MAX_PRECISION` region precision cap (default `4`)
+- `WOF_REGION_SPARSE_MAX_PRECISION` sparse very-large-region precision (default `3`)
+- `WOF_REGION_SPARSE_MIN_AREA_KM2` area threshold for sparse region precision (default `80000`)
+- `WOF_PROMOTE_LOCALITY_OVER_REGION=1|0` prefer locality labels over region in shared parent cells (default `1`)
+- `WOF_GEOMETRY_DECIMALS` round coordinates before storage/indexing (for example `4`)
+- `WOF_MIN_POPULATION` filter out places below threshold (for example `10000`)
+- `WOF_INCLUDE_REGION=1|0` include/exclude region fallback boundaries
+- `WOF_MAX_PLACES` cap places for experiment runs
+- `WOF_DROP_CONTAINED_LOCALITIES=1|0` enable/disable contained-locality pruning
+
+Boundary runtime modes:
+
+- `reverseMode: 'centroid'` (default): legacy nearest-centroid reverse lookup
+- `reverseMode: 'boundary'`: boundary tables lookup.
+  - Uses compact `compact_geohash_lookup` when present (fast geohash-to-place).
+  - Falls back to full polygon-aware tables when compact rows are absent.
 
 ## License
 

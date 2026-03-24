@@ -3,7 +3,26 @@
 
 "use strict";
 
-const geocoder = require('../src/index.js')()
+function parseOptionalNumber(value) {
+  if (value === undefined) return undefined
+  var parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+var options = {}
+if (process.env.GEOCODER_REVERSE_MODE) {
+  options.reverseMode = process.env.GEOCODER_REVERSE_MODE
+}
+
+var boundaryBase = parseOptionalNumber(process.env.GEOCODER_BOUNDARY_BASE_PRECISION)
+var boundaryMax = parseOptionalNumber(process.env.GEOCODER_BOUNDARY_MAX_PRECISION)
+if (boundaryBase !== undefined || boundaryMax !== undefined) {
+  options.boundary = {}
+  if (boundaryBase !== undefined) options.boundary.basePrecision = boundaryBase
+  if (boundaryMax !== undefined) options.boundary.maxPrecision = boundaryMax
+}
+
+const geocoder = require('../src/index.js')(options)
 const args = process.argv.slice(2)
 
 if (args.length != 2) {

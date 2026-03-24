@@ -32,7 +32,7 @@ describe('geocoder.reverse', () => {
   });
 
   it("resolves an empty object when a location can't be found", (done) => {
-    geocoder.reverse(0, 0)
+    geocoder.reverse(80, 80)
       .then(function(result) {
         expect(result).toEqual({});
         done();
