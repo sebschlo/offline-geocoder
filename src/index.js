@@ -5,9 +5,41 @@ const reverse      = require('./reverse')
 const forward      = require('./forward')
 const findLocation = require('./location').find
 
+function normalizeReverseMode(options) {
+  var mode = options.reverseMode
+  if (mode === undefined && options.reverse && options.reverse.mode) {
+    mode = options.reverse.mode
+  }
+
+  var normalized = String(mode || 'centroid').toLowerCase()
+  return normalized === 'boundary' ? 'boundary' : 'centroid'
+}
+
+function resolveBoundaryOptions(options) {
+  var boundary = options.boundary || {}
+
+  var basePrecision = Number(boundary.basePrecision)
+  if (!Number.isFinite(basePrecision) || basePrecision < 1) {
+    basePrecision = 4
+  }
+
+  var maxPrecision = Number(boundary.maxPrecision)
+  if (!Number.isFinite(maxPrecision) || maxPrecision < basePrecision) {
+    maxPrecision = 7
+  }
+
+  return {
+    basePrecision: basePrecision,
+    maxPrecision: maxPrecision
+  }
+}
+
 function Geocoder(options) {
   var geocoder = function(options) {
     this.options = options || {}
+    this.reverseMode = normalizeReverseMode(this.options)
+    this.reverseDebug = Boolean(this.options.reverseDebug)
+    this.boundaryOptions = resolveBoundaryOptions(this.options)
 
     if (this.options.db) {
       // Accept a pre-opened database object (must have .all(sql, params, cb))

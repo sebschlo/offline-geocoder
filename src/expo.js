@@ -4,6 +4,35 @@ const reverse      = require('./reverse')
 const forward      = require('./forward')
 const findLocation = require('./location').find
 
+function normalizeReverseMode(options) {
+  var mode = options.reverseMode
+  if (mode === undefined && options.reverse && options.reverse.mode) {
+    mode = options.reverse.mode
+  }
+
+  var normalized = String(mode || 'centroid').toLowerCase()
+  return normalized === 'boundary' ? 'boundary' : 'centroid'
+}
+
+function resolveBoundaryOptions(options) {
+  var boundary = options.boundary || {}
+
+  var basePrecision = Number(boundary.basePrecision)
+  if (!Number.isFinite(basePrecision) || basePrecision < 1) {
+    basePrecision = 4
+  }
+
+  var maxPrecision = Number(boundary.maxPrecision)
+  if (!Number.isFinite(maxPrecision) || maxPrecision < basePrecision) {
+    maxPrecision = 7
+  }
+
+  return {
+    basePrecision: basePrecision,
+    maxPrecision: maxPrecision
+  }
+}
+
 // Wraps an expo-sqlite database to match the node-sqlite3 callback
 // interface that reverse.js, forward.js and location.js expect.
 function wrapExpoDb(expoDb) {
@@ -34,6 +63,10 @@ function ExpoGeocoder(options) {
   }
 
   this.db = wrapExpoDb(expoDb)
+  this.options = opts
+  this.reverseMode = normalizeReverseMode(opts)
+  this.reverseDebug = Boolean(opts.reverseDebug)
+  this.boundaryOptions = resolveBoundaryOptions(opts)
 }
 
 ExpoGeocoder.prototype.reverse = function(latitude, longitude, callback) {

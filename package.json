@@ -4,6 +4,12 @@
   "description": "Offline reverse and forward geocoding for Node and React Native",
   "repository": "https://github.com/lucaspiller/offline-geocoder",
   "main": "src/index.js",
+  "bin": {
+    "geocoder": "bin/geocoder",
+    "geocoder-bench": "bin/geocoder-bench",
+    "geocoder-build-boundary": "bin/geocoder-build-boundary",
+    "geocoder-build-wof": "bin/geocoder-build-wof"
+  },
   "react-native": "src/expo.js",
   "exports": {
     ".": {
@@ -27,7 +33,9 @@
     "sqlite3": "^5.1.7"
   },
   "scripts": {
-    "test": "jasmine"
+    "test": "jasmine",
+    "build:boundary": "node scripts/generate_boundary_index.js",
+    "build:wof": "bash scripts/generate_wof_boundary.sh"
   },
   "author": "Luca Spiller",
   "license": "MIT"

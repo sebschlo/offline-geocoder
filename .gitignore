@@ -4,3 +4,4 @@ package-lock.json
 .npm-cache
 .geonames-build
 .DS_Store
+tmp
