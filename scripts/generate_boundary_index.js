@@ -51,7 +51,9 @@ function parseArgs(argv) {
     regionMaxPrecision: null,
     regionSparseMaxPrecision: null,
     regionSparseMinAreaKm2: null,
-    promoteLocalityOverRegion: true
+    promoteLocalityOverRegion: true,
+    dominantLocalityPopulation: 100000,
+    dominantLocalityRatio: 3
   }
 
   for (var i = 0; i < argv.length; i++) {
@@ -103,6 +105,12 @@ function parseArgs(argv) {
       opts.regionSparseMinAreaKm2 = Number.isFinite(sparseAreaKm2) && sparseAreaKm2 > 0 ? sparseAreaKm2 : null
     } else if (arg === '--promote-locality-over-region') {
       opts.promoteLocalityOverRegion = parseBool(argv[++i], true)
+    } else if (arg === '--dominant-locality-population') {
+      var dominantPopulation = Number(argv[++i])
+      opts.dominantLocalityPopulation = Number.isFinite(dominantPopulation) ? dominantPopulation : opts.dominantLocalityPopulation
+    } else if (arg === '--dominant-locality-ratio') {
+      var dominantRatio = Number(argv[++i])
+      opts.dominantLocalityRatio = Number.isFinite(dominantRatio) ? dominantRatio : opts.dominantLocalityRatio
     } else if (arg === '--append') {
       opts.replace = false
     } else if (arg === '--replace') {
@@ -141,6 +149,8 @@ function usage() {
     '  --region-sparse-max-precision  Optional precision for very large region polygons (for example 3)',
     '  --region-sparse-min-area-km2   Area threshold to apply sparse region precision',
     '  --promote-locality-over-region Prefer locality over region in shared parent cells when no competing locality exists (default: true)',
+    '  --dominant-locality-population Population threshold that marks locality as major for dominant-city rollups (default: 100000)',
+    '  --dominant-locality-ratio      Required dominant-vs-next population ratio for locality rollups (default: 3)',
     '  --append                       Keep existing boundary rows and append/replace by place id',
     '  --replace                      Clear boundary rows first (default)',
     '  --help, -h                     Show this help message'
@@ -792,6 +802,83 @@ function isCityPlacetypeCode(code) {
   return code === PLACETYPE_CODES.locality || code === PLACETYPE_CODES.localadmin
 }
 
+function placePopulation(place) {
+  if (!place) return 0
+
+  var pop = Number(place.population)
+  if (!Number.isFinite(pop) || pop < 0) {
+    return 0
+  }
+
+  return pop
+}
+
+function isMajorLocality(place, opts) {
+  if (!place || !isCityPlacetypeCode(place.placetypeCode)) {
+    return false
+  }
+
+  var threshold = Number(opts.dominantLocalityPopulation)
+  if (!Number.isFinite(threshold) || threshold <= 0) {
+    return false
+  }
+
+  return placePopulation(place) >= threshold
+}
+
+function selectDominantLocalityId(localityIds, placeById, opts) {
+  if (!Array.isArray(localityIds) || localityIds.length < 2) {
+    return null
+  }
+
+  var threshold = Number(opts.dominantLocalityPopulation)
+  if (!Number.isFinite(threshold) || threshold <= 0) {
+    return null
+  }
+
+  var ratio = Number(opts.dominantLocalityRatio)
+  if (!Number.isFinite(ratio) || ratio < 1) {
+    ratio = 1
+  }
+
+  var ranked = localityIds
+    .map(function(id) {
+      var place = placeById[String(id)]
+      return {
+        id: Number(id),
+        population: placePopulation(place)
+      }
+    })
+    .sort(function(a, b) {
+      if (a.population !== b.population) {
+        return b.population - a.population
+      }
+      return a.id - b.id
+    })
+
+  if (!ranked.length) {
+    return null
+  }
+
+  var top = ranked[0]
+  if (top.population < threshold) {
+    return null
+  }
+
+  for (var i = 1; i < ranked.length; i++) {
+    if (ranked[i].population >= threshold) {
+      return null
+    }
+  }
+
+  var secondPopulation = ranked.length > 1 ? ranked[1].population : 0
+  if (secondPopulation > 0 && top.population < secondPopulation * ratio) {
+    return null
+  }
+
+  return top.id
+}
+
 function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
   if (!opts.promoteLocalityOverRegion) {
     return
@@ -838,29 +925,53 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
       var parentHash = parentHashes[parentIndex]
       var group = groupByParent[parentHash]
       var localityIds = Object.keys(group.localityById)
-      if (localityIds.length !== 1) {
+      if (!localityIds.length) {
         continue
       }
 
-      var localityId = localityIds[0]
+      var promotion = null
       var existingId = bestByHash[parentHash]
-      var hasRegionCompetition = group.hasRegion
-      if (existingId !== undefined) {
-        var existingPlace = placeById[String(existingId)]
-        if (existingPlace && isCityPlacetypeCode(existingPlace.placetypeCode) && String(existingId) !== localityId) {
+      var existingPlace = existingId !== undefined ? placeById[String(existingId)] : null
+
+      if (localityIds.length === 1) {
+        var localityId = Number(localityIds[0])
+        var hasRegionCompetition = group.hasRegion
+        if (existingPlace && isCityPlacetypeCode(existingPlace.placetypeCode) && Number(existingId) !== localityId) {
           continue
         }
         if (existingPlace && existingPlace.placetypeCode === PLACETYPE_CODES.region) {
           hasRegionCompetition = true
         }
+
+        if (!hasRegionCompetition) {
+          continue
+        }
+
+        promotion = {
+          localityId: localityId,
+          suppressMinorLocalities: false
+        }
+      } else {
+        var dominantLocalityId = selectDominantLocalityId(localityIds, placeById, opts)
+        if (dominantLocalityId === null) {
+          continue
+        }
+
+        if (existingPlace &&
+          isCityPlacetypeCode(existingPlace.placetypeCode) &&
+          Number(existingId) !== dominantLocalityId &&
+          isMajorLocality(existingPlace, opts)) {
+          continue
+        }
+
+        promotion = {
+          localityId: dominantLocalityId,
+          suppressMinorLocalities: true
+        }
       }
 
-      if (!hasRegionCompetition) {
-        continue
-      }
-
-      bestByHash[parentHash] = Number(localityId)
-      promotedParents[parentHash] = true
+      bestByHash[parentHash] = promotion.localityId
+      promotedParents[parentHash] = promotion
     }
 
     if (!Object.keys(promotedParents).length) {
@@ -873,12 +984,29 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
       if (descendantHash.length <= precision) continue
 
       var ancestor = descendantHash.slice(0, precision)
-      if (!promotedParents[ancestor] || descendantHash === ancestor) {
+      var promoted = promotedParents[ancestor]
+      if (!promoted || descendantHash === ancestor) {
         continue
       }
 
-      var descendantPlace = placeById[String(bestByHash[descendantHash])]
-      if (descendantPlace && descendantPlace.placetypeCode === PLACETYPE_CODES.region) {
+      var descendantPlaceId = Number(bestByHash[descendantHash])
+      if (descendantPlaceId === promoted.localityId) {
+        continue
+      }
+
+      var descendantPlace = placeById[String(descendantPlaceId)]
+      if (!descendantPlace) {
+        continue
+      }
+
+      if (descendantPlace.placetypeCode === PLACETYPE_CODES.region) {
+        delete bestByHash[descendantHash]
+        continue
+      }
+
+      if (promoted.suppressMinorLocalities &&
+        isCityPlacetypeCode(descendantPlace.placetypeCode) &&
+        !isMajorLocality(descendantPlace, opts)) {
         delete bestByHash[descendantHash]
       }
     }
@@ -1300,6 +1428,14 @@ async function main() {
   options.localityMaxPrecision = clampPrecision(options.localityMaxPrecision, options.basePrecision, options.maxPrecision)
   options.localadminMaxPrecision = clampPrecision(options.localadminMaxPrecision, options.basePrecision, options.maxPrecision)
   options.regionMaxPrecision = clampPrecision(options.regionMaxPrecision, options.basePrecision, options.maxPrecision)
+  if (!Number.isFinite(options.dominantLocalityPopulation) || options.dominantLocalityPopulation <= 0) {
+    options.dominantLocalityPopulation = 0
+  } else {
+    options.dominantLocalityPopulation = Math.trunc(options.dominantLocalityPopulation)
+  }
+  if (!Number.isFinite(options.dominantLocalityRatio) || options.dominantLocalityRatio < 1) {
+    options.dominantLocalityRatio = 1
+  }
   if (options.regionSparseMaxPrecision !== null) {
     if (!Number.isFinite(options.regionSparseMaxPrecision) || options.regionSparseMaxPrecision < 1) {
       options.regionSparseMaxPrecision = null
@@ -1358,6 +1494,11 @@ async function main() {
     console.log('Placetype precision caps: locality=' + options.localityMaxPrecision + ', localadmin=' + options.localadminMaxPrecision + ', region=' + options.regionMaxPrecision)
     if (Number.isFinite(options.regionSparseMaxPrecision) && Number.isFinite(options.regionSparseMinAreaKm2)) {
       console.log('Sparse region rule: area_km2>=' + options.regionSparseMinAreaKm2 + ' => max_precision=' + options.regionSparseMaxPrecision)
+    }
+    if (options.dominantLocalityPopulation > 0) {
+      console.log('Dominant locality rollup: major_population>=' + options.dominantLocalityPopulation + ', ratio>=' + options.dominantLocalityRatio)
+    } else {
+      console.log('Dominant locality rollup: disabled')
     }
     console.log('Index mode: ' + options.indexMode)
     console.log('Promote locality over region: ' + (options.promoteLocalityOverRegion ? 'true' : 'false'))

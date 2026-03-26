@@ -224,6 +224,9 @@ Builder notes:
   - `--region-max-precision`
   - `--region-sparse-max-precision` + `--region-sparse-min-area-km2` for very large sparse regions (for example geohash-3 in Amazon-like interiors)
 - `--promote-locality-over-region` (default `true`) prefers locality labels in shared parent cells when there is no competing locality (keeps city labels sticky against region-only outskirts)
+- Dominant-city rollup keeps broad city labels sticky in mixed city/suburb cells unless there is competing major-city pressure:
+  - `--dominant-locality-population` (default `100000`)
+  - `--dominant-locality-ratio` (default `3`)
 - Excludes neighbourhood-like placetypes from default reverse output
 - `--index-mode compact` (default) stores only geohash-to-place mappings (`compact_geohash_lookup`) and no runtime geometry payloads.
   Compact schema uses `compact_places(id,name,country_id,admin1_id,placetype_code,latitude,longitude)`.
@@ -259,6 +262,8 @@ Useful WOF build env vars:
 - `WOF_REGION_SPARSE_MAX_PRECISION` sparse very-large-region precision (default `3`)
 - `WOF_REGION_SPARSE_MIN_AREA_KM2` area threshold for sparse region precision (default `80000`)
 - `WOF_PROMOTE_LOCALITY_OVER_REGION=1|0` prefer locality labels over region in shared parent cells (default `1`)
+- `WOF_DOMINANT_LOCALITY_POPULATION` major-locality threshold for dominant-city rollup (default `100000`)
+- `WOF_DOMINANT_LOCALITY_RATIO` dominant-vs-next locality population ratio (default `3`)
 - `WOF_GEOMETRY_DECIMALS` round coordinates before storage/indexing (for example `4`)
 - `WOF_MIN_POPULATION` filter out places below threshold (for example `10000`)
 - `WOF_INCLUDE_REGION=1|0` include/exclude region fallback boundaries
