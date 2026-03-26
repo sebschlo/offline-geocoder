@@ -53,7 +53,8 @@ function parseArgs(argv) {
     regionSparseMinAreaKm2: null,
     promoteLocalityOverRegion: true,
     dominantLocalityPopulation: 100000,
-    dominantLocalityRatio: 3
+    dominantLocalityRatio: 3,
+    parentLocalityMinShare: 0.5
   }
 
   for (var i = 0; i < argv.length; i++) {
@@ -111,6 +112,9 @@ function parseArgs(argv) {
     } else if (arg === '--dominant-locality-ratio') {
       var dominantRatio = Number(argv[++i])
       opts.dominantLocalityRatio = Number.isFinite(dominantRatio) ? dominantRatio : opts.dominantLocalityRatio
+    } else if (arg === '--parent-locality-min-share') {
+      var minShare = Number(argv[++i])
+      opts.parentLocalityMinShare = Number.isFinite(minShare) ? minShare : opts.parentLocalityMinShare
     } else if (arg === '--append') {
       opts.replace = false
     } else if (arg === '--replace') {
@@ -151,6 +155,7 @@ function usage() {
     '  --promote-locality-over-region Prefer locality over region in shared parent cells when no competing locality exists (default: true)',
     '  --dominant-locality-population Population threshold that marks locality as major for dominant-city rollups (default: 100000)',
     '  --dominant-locality-ratio      Required dominant-vs-next population ratio for locality rollups (default: 3)',
+    '  --parent-locality-min-share    Minimum child-cell share (0..1) required to let a locality take over a parent cell (default: 0.5)',
     '  --append                       Keep existing boundary rows and append/replace by place id',
     '  --replace                      Clear boundary rows first (default)',
     '  --help, -h                     Show this help message'
@@ -879,6 +884,27 @@ function selectDominantLocalityId(localityIds, placeById, opts) {
   return top.id
 }
 
+function localityShareInParent(localityId, group) {
+  if (!group) return 0
+
+  var counts = group.localityCellCountById || Object.create(null)
+  var localityCount = Number(counts[String(localityId)] || 0)
+  if (!localityCount) {
+    return 0
+  }
+
+  return localityCount / 32
+}
+
+function localityShareMeetsThreshold(localityId, group, opts) {
+  var threshold = Number(opts.parentLocalityMinShare)
+  if (!Number.isFinite(threshold) || threshold <= 0) {
+    return true
+  }
+
+  return localityShareInParent(localityId, group) >= threshold
+}
+
 function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
   if (!opts.promoteLocalityOverRegion) {
     return
@@ -907,6 +933,7 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
       if (!group) {
         group = {
           localityById: Object.create(null),
+          localityCellCountById: Object.create(null),
           hasRegion: false
         }
         groupByParent[parent] = group
@@ -914,6 +941,7 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
 
       if (isCityPlacetypeCode(place.placetypeCode)) {
         group.localityById[String(place.id)] = true
+        group.localityCellCountById[String(place.id)] = Number(group.localityCellCountById[String(place.id)] || 0) + 1
       } else if (place.placetypeCode === PLACETYPE_CODES.region) {
         group.hasRegion = true
       }
@@ -935,6 +963,10 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
 
       if (localityIds.length === 1) {
         var localityId = Number(localityIds[0])
+        if (!localityShareMeetsThreshold(localityId, group, opts)) {
+          continue
+        }
+
         var hasRegionCompetition = group.hasRegion
         if (existingPlace && isCityPlacetypeCode(existingPlace.placetypeCode) && Number(existingId) !== localityId) {
           continue
@@ -954,6 +986,9 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
       } else {
         var dominantLocalityId = selectDominantLocalityId(localityIds, placeById, opts)
         if (dominantLocalityId === null) {
+          continue
+        }
+        if (!localityShareMeetsThreshold(dominantLocalityId, group, opts)) {
           continue
         }
 
@@ -1436,6 +1471,14 @@ async function main() {
   if (!Number.isFinite(options.dominantLocalityRatio) || options.dominantLocalityRatio < 1) {
     options.dominantLocalityRatio = 1
   }
+  if (!Number.isFinite(options.parentLocalityMinShare)) {
+    options.parentLocalityMinShare = 0.5
+  }
+  if (options.parentLocalityMinShare < 0) {
+    options.parentLocalityMinShare = 0
+  } else if (options.parentLocalityMinShare > 1) {
+    options.parentLocalityMinShare = 1
+  }
   if (options.regionSparseMaxPrecision !== null) {
     if (!Number.isFinite(options.regionSparseMaxPrecision) || options.regionSparseMaxPrecision < 1) {
       options.regionSparseMaxPrecision = null
@@ -1500,6 +1543,7 @@ async function main() {
     } else {
       console.log('Dominant locality rollup: disabled')
     }
+    console.log('Parent locality takeover min share: ' + options.parentLocalityMinShare)
     console.log('Index mode: ' + options.indexMode)
     console.log('Promote locality over region: ' + (options.promoteLocalityOverRegion ? 'true' : 'false'))
     console.log('Min population: ' + options.minPopulation)

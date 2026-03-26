@@ -327,6 +327,95 @@ describe('boundary builder', () => {
     }
   });
 
+  it('does not promote locality to parent cell when locality child-share is below threshold', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'locality-region-share-threshold.geojson');
+      const dbPath = path.join(dir, 'locality-region-share-threshold.sqlite');
+      const parentHash = 's000';
+      const parentBbox = geohash.decodeBbox(parentHash);
+      const splitLon = parentBbox.minLon + ((parentBbox.maxLon - parentBbox.minLon) * 0.25);
+
+      fs.writeFileSync(inputPath, JSON.stringify({
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            id: 5101,
+            properties: {
+              name: 'Wide Region',
+              placetype: 'region',
+              country_id: 'AR',
+              admin1_id: 1,
+              is_current: 1
+            },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [parentBbox.minLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.minLat]
+              ]]
+            }
+          },
+          {
+            type: 'Feature',
+            id: 5102,
+            properties: {
+              name: 'Small Town',
+              placetype: 'locality',
+              country_id: 'AR',
+              admin1_id: 1,
+              population: 40000,
+              is_current: 1
+            },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [parentBbox.minLon, parentBbox.minLat],
+                [splitLon, parentBbox.minLat],
+                [splitLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.minLat]
+              ]]
+            }
+          }
+        ]
+      }));
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', inputPath,
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--parent-locality-min-share', '0.5'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${parentHash}'`);
+        expect(parentRow).toEqual([{ geohash: parentHash, place_id: 5101 }]);
+
+        const localityDescendants = await all(
+          db,
+          `SELECT COUNT(*) AS count FROM compact_geohash_lookup WHERE geohash LIKE '${parentHash}%' AND geohash <> '${parentHash}' AND place_id = 5102`
+        );
+        expect(localityDescendants[0].count).toBeGreaterThan(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rolls parent cells to a dominant major locality and suppresses minor locality descendants', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
     try {
