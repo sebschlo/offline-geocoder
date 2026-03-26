@@ -35,7 +35,8 @@
   "scripts": {
     "test": "jasmine",
     "build:boundary": "node scripts/generate_boundary_index.js",
-    "build:wof": "bash scripts/generate_wof_boundary.sh"
+    "build:wof": "bash scripts/generate_wof_boundary.sh",
+    "validate:locationiq": "node scripts/validate_with_locationiq.js"
   },
   "author": "Luca Spiller",
   "license": "MIT"
