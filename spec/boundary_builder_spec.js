@@ -326,4 +326,234 @@ describe('boundary builder', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('rolls parent cells to a dominant major locality and suppresses minor locality descendants', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'dominant-locality.geojson');
+      const dbPath = path.join(dir, 'dominant-locality.sqlite');
+      const parentHash = 's000';
+      const parentBbox = geohash.decodeBbox(parentHash);
+      const splitLon = parentBbox.minLon + ((parentBbox.maxLon - parentBbox.minLon) * 0.75);
+
+      fs.writeFileSync(inputPath, JSON.stringify({
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            id: 6001,
+            properties: {
+              name: 'Fallback Region',
+              placetype: 'region',
+              country_id: 'AR',
+              admin1_id: 1,
+              is_current: 1
+            },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [parentBbox.minLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.minLat]
+              ]]
+            }
+          },
+          {
+            type: 'Feature',
+            id: 6002,
+            properties: {
+              name: 'Metro Core',
+              placetype: 'locality',
+              country_id: 'AR',
+              admin1_id: 1,
+              population: 1200000,
+              is_current: 1
+            },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [parentBbox.minLon, parentBbox.minLat],
+                [splitLon, parentBbox.minLat],
+                [splitLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.minLat]
+              ]]
+            }
+          },
+          {
+            type: 'Feature',
+            id: 6003,
+            properties: {
+              name: 'Outer Hamlet',
+              placetype: 'locality',
+              country_id: 'AR',
+              admin1_id: 1,
+              population: 18000,
+              is_current: 1
+            },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [splitLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.maxLat],
+                [splitLon, parentBbox.maxLat],
+                [splitLon, parentBbox.minLat]
+              ]]
+            }
+          }
+        ]
+      }));
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', inputPath,
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--dominant-locality-population', '100000',
+        '--dominant-locality-ratio', '3'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${parentHash}'`);
+        expect(parentRow).toEqual([{ geohash: parentHash, place_id: 6002 }]);
+
+        const minorDescendants = await all(
+          db,
+          `SELECT COUNT(*) AS count FROM compact_geohash_lookup WHERE geohash LIKE '${parentHash}%' AND geohash <> '${parentHash}' AND place_id = 6003`
+        );
+        expect(minorDescendants[0].count).toEqual(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps fine locality borders when multiple major localities compete', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'major-competition.geojson');
+      const dbPath = path.join(dir, 'major-competition.sqlite');
+      const parentHash = 's000';
+      const parentBbox = geohash.decodeBbox(parentHash);
+      const midLon = (parentBbox.minLon + parentBbox.maxLon) / 2;
+
+      fs.writeFileSync(inputPath, JSON.stringify({
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            id: 7001,
+            properties: {
+              name: 'Fallback Region',
+              placetype: 'region',
+              country_id: 'AR',
+              admin1_id: 1,
+              is_current: 1
+            },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [parentBbox.minLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.minLat]
+              ]]
+            }
+          },
+          {
+            type: 'Feature',
+            id: 7002,
+            properties: {
+              name: 'West Major City',
+              placetype: 'locality',
+              country_id: 'AR',
+              admin1_id: 1,
+              population: 1000000,
+              is_current: 1
+            },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [parentBbox.minLon, parentBbox.minLat],
+                [midLon, parentBbox.minLat],
+                [midLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.maxLat],
+                [parentBbox.minLon, parentBbox.minLat]
+              ]]
+            }
+          },
+          {
+            type: 'Feature',
+            id: 7003,
+            properties: {
+              name: 'East Major City',
+              placetype: 'locality',
+              country_id: 'AR',
+              admin1_id: 1,
+              population: 850000,
+              is_current: 1
+            },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [midLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.minLat],
+                [parentBbox.maxLon, parentBbox.maxLat],
+                [midLon, parentBbox.maxLat],
+                [midLon, parentBbox.minLat]
+              ]]
+            }
+          }
+        ]
+      }));
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', inputPath,
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--dominant-locality-population', '100000',
+        '--dominant-locality-ratio', '3'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const majorRows = await all(
+          db,
+          `SELECT place_id, COUNT(*) AS count
+           FROM compact_geohash_lookup
+           WHERE geohash LIKE '${parentHash}%' AND place_id IN (7002, 7003)
+           GROUP BY place_id
+           ORDER BY place_id`
+        );
+        expect(majorRows).toEqual([
+          { place_id: 7002, count: jasmine.any(Number) },
+          { place_id: 7003, count: jasmine.any(Number) }
+        ]);
+        expect(majorRows[0].count).toBeGreaterThan(0);
+        expect(majorRows[1].count).toBeGreaterThan(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

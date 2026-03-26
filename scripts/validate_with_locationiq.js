@@ -203,6 +203,7 @@ async function ensureCacheSchema(cacheDb) {
       longitude REAL NOT NULL,
       source_geohash TEXT NOT NULL,
       local_name TEXT,
+      local_placetype TEXT,
       local_country_id TEXT,
       local_admin1_id TEXT,
       local_json TEXT,
@@ -212,10 +213,36 @@ async function ensureCacheSchema(cacheDb) {
       liq_json TEXT,
       locality_match INTEGER NOT NULL DEFAULT 0,
       country_match INTEGER NOT NULL DEFAULT 0,
+      policy_match INTEGER NOT NULL DEFAULT 0,
+      policy_reason TEXT,
+      policy_verdict TEXT NOT NULL DEFAULT 'policy_unset',
       verdict TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `)
+}
+
+async function ensureValidationColumns(cacheDb) {
+  var columns = await dbAll(cacheDb, "PRAGMA table_info(validation_results)")
+  var byName = Object.create(null)
+  for (var i = 0; i < columns.length; i++) {
+    byName[String(columns[i].name)] = true
+  }
+
+  var additions = [
+    ['local_placetype', 'ALTER TABLE validation_results ADD COLUMN local_placetype TEXT'],
+    ['policy_match', 'ALTER TABLE validation_results ADD COLUMN policy_match INTEGER NOT NULL DEFAULT 0'],
+    ['policy_reason', 'ALTER TABLE validation_results ADD COLUMN policy_reason TEXT'],
+    ['policy_verdict', "ALTER TABLE validation_results ADD COLUMN policy_verdict TEXT NOT NULL DEFAULT 'policy_unset'"]
+  ]
+
+  for (var j = 0; j < additions.length; j++) {
+    var name = additions[j][0]
+    var sql = additions[j][1]
+    if (!byName[name]) {
+      await dbExec(cacheDb, sql)
+    }
+  }
 }
 
 function hashString32(value) {
@@ -262,6 +289,61 @@ async function detectLookupTable(sourceDb) {
   if (names.compact_geohash_lookup) return 'compact_geohash_lookup'
   if (names.place_geohash_lookup) return 'place_geohash_lookup'
   throw new Error('No geohash lookup table found (expected compact_geohash_lookup or place_geohash_lookup)')
+}
+
+async function detectPlacetypeSource(sourceDb) {
+  var rows = await dbAll(
+    sourceDb,
+    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('compact_places','places')"
+  )
+  var names = Object.create(null)
+  for (var i = 0; i < rows.length; i++) {
+    names[rows[i].name] = true
+  }
+  if (names.compact_places) return 'compact_places'
+  if (names.places) return 'places'
+  return null
+}
+
+async function resolveLocalPlacetype(sourceDb, source, placeId, cache) {
+  if (placeId === undefined || placeId === null || placeId === '') {
+    return ''
+  }
+  if (!source) {
+    return ''
+  }
+
+  var key = String(placeId)
+  if (cache[key]) {
+    return cache[key]
+  }
+
+  var row
+  if (source === 'compact_places') {
+    row = await dbGet(
+      sourceDb,
+      `SELECT CASE placetype_code
+          WHEN 0 THEN 'locality'
+          WHEN 1 THEN 'localadmin'
+          WHEN 2 THEN 'region'
+          ELSE ''
+        END AS placetype
+       FROM compact_places
+       WHERE id = ?
+       LIMIT 1`,
+      [placeId]
+    )
+  } else {
+    row = await dbGet(
+      sourceDb,
+      'SELECT placetype FROM places WHERE id = ? LIMIT 1',
+      [placeId]
+    )
+  }
+
+  var value = row && row.placetype ? String(row.placetype) : ''
+  cache[key] = value
+  return value
 }
 
 function coordKey(latitude, longitude) {
@@ -351,6 +433,114 @@ function extractLocationIqLocality(address) {
     if (value) return String(value)
   }
   return ''
+}
+
+function matchAddressValue(normalizedLocalName, address, keys) {
+  if (!normalizedLocalName || !address || typeof address !== 'object') {
+    return null
+  }
+
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i]
+    var value = address[key]
+    if (!value) continue
+    if (namesMatch(normalizedLocalName, normalizeName(value))) {
+      return { key: key, value: String(value) }
+    }
+  }
+
+  return null
+}
+
+function displayNameMatch(normalizedLocalName, displayName) {
+  if (!normalizedLocalName || !displayName) {
+    return false
+  }
+
+  var segments = String(displayName).split(',')
+  for (var i = 0; i < segments.length; i++) {
+    if (namesMatch(normalizedLocalName, normalizeName(segments[i]))) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function buildPolicyVerdict(params) {
+  var countryMatch = Boolean(params.countryMatch)
+  var strictLocalityMatch = Boolean(params.strictLocalityMatch)
+  var localPlacetype = String(params.localPlacetype || '')
+  var localName = String(params.localName || '')
+  var normalizedLocalName = normalizeName(localName)
+  var liqAddress = params.liqAddress || {}
+  var liqDisplayName = String(params.liqDisplayName || '')
+
+  if (!countryMatch) {
+    return {
+      match: false,
+      reason: 'country_mismatch',
+      verdict: 'policy_country_mismatch'
+    }
+  }
+
+  if (!normalizedLocalName) {
+    return {
+      match: false,
+      reason: 'missing_local_name',
+      verdict: 'policy_missing_local_name'
+    }
+  }
+
+  if (strictLocalityMatch) {
+    return {
+      match: true,
+      reason: 'strict_locality',
+      verdict: 'policy_match_strict'
+    }
+  }
+
+  var majorKeys = ['city', 'town', 'municipality', 'county', 'state_district', 'state', 'region', 'province']
+  var majorMatch = matchAddressValue(normalizedLocalName, liqAddress, majorKeys)
+  if (majorMatch) {
+    return {
+      match: true,
+      reason: 'major_' + majorMatch.key,
+      verdict: localPlacetype === 'region' ? 'policy_match_region_rollup' : 'policy_match_major_admin'
+    }
+  }
+
+  var minorKeys = ['village', 'borough', 'suburb', 'hamlet', 'quarter', 'neighbourhood', 'city_district', 'district']
+  var minorMatch = matchAddressValue(normalizedLocalName, liqAddress, minorKeys)
+  if (minorMatch) {
+    return {
+      match: true,
+      reason: 'minor_' + minorMatch.key,
+      verdict: 'policy_match_minor_admin'
+    }
+  }
+
+  if (displayNameMatch(normalizedLocalName, liqDisplayName)) {
+    return {
+      match: true,
+      reason: 'display_name_segment',
+      verdict: localPlacetype === 'region' ? 'policy_match_region_rollup' : 'policy_match_display_name'
+    }
+  }
+
+  if (localPlacetype === 'region') {
+    return {
+      match: false,
+      reason: 'region_name_not_present',
+      verdict: 'policy_region_mismatch'
+    }
+  }
+
+  return {
+    match: false,
+    reason: 'no_policy_match',
+    verdict: 'policy_mismatch'
+  }
 }
 
 function buildVerdict(localityMatch, countryMatch, localName, liqLocality) {
@@ -462,7 +652,7 @@ function csvEscape(value) {
 async function writeCsv(cacheDb, csvPath, limit) {
   var rows = await dbAll(
     cacheDb,
-    `SELECT coord_key, latitude, longitude, source_geohash, local_name, local_country_id, liq_locality, liq_country_code, verdict
+    `SELECT coord_key, latitude, longitude, source_geohash, local_name, local_placetype, local_country_id, liq_locality, liq_country_code, verdict, policy_verdict, policy_reason
      FROM validation_results
      ORDER BY updated_at DESC
      LIMIT ?`,
@@ -475,10 +665,13 @@ async function writeCsv(cacheDb, csvPath, limit) {
     'longitude',
     'source_geohash',
     'local_name',
+    'local_placetype',
     'local_country_id',
     'liq_locality',
     'liq_country_code',
-    'verdict'
+    'verdict',
+    'policy_verdict',
+    'policy_reason'
   ]
 
   var lines = [headers.join(',')]
