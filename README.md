@@ -227,6 +227,8 @@ Builder notes:
 - Dominant-city rollup keeps broad city labels sticky in mixed city/suburb cells unless there is competing major-city pressure:
   - `--dominant-locality-population` (default `100000`)
   - `--dominant-locality-ratio` (default `3`)
+- Parent-cell takeover guard:
+  - `--parent-locality-min-share` (default `0.5`) requires locality ownership of at least that child-cell share before replacing a parent cell label
 - Excludes neighbourhood-like placetypes from default reverse output
 - `--index-mode compact` (default) stores only geohash-to-place mappings (`compact_geohash_lookup`) and no runtime geometry payloads.
   Compact schema uses `compact_places(id,name,country_id,admin1_id,placetype_code,latitude,longitude)`.
@@ -264,6 +266,7 @@ Useful WOF build env vars:
 - `WOF_PROMOTE_LOCALITY_OVER_REGION=1|0` prefer locality labels over region in shared parent cells (default `1`)
 - `WOF_DOMINANT_LOCALITY_POPULATION` major-locality threshold for dominant-city rollup (default `100000`)
 - `WOF_DOMINANT_LOCALITY_RATIO` dominant-vs-next locality population ratio (default `3`)
+- `WOF_PARENT_LOCALITY_MIN_SHARE` minimum child-cell share for locality parent takeover (default `0.5`)
 - `WOF_GEOMETRY_DECIMALS` round coordinates before storage/indexing (for example `4`)
 - `WOF_MIN_POPULATION` filter out places below threshold (for example `10000`)
 - `WOF_INCLUDE_REGION=1|0` include/exclude region fallback boundaries

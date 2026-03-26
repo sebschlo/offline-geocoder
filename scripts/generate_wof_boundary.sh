@@ -21,6 +21,7 @@ set -euo pipefail
 #   WOF_PROMOTE_LOCALITY_OVER_REGION Prefer locality labels over region in shared parent cells (default: 1)
 #   WOF_DOMINANT_LOCALITY_POPULATION Major-locality threshold for dominant-city rollup (default: 100000)
 #   WOF_DOMINANT_LOCALITY_RATIO      Dominant-vs-next locality population ratio (default: 3)
+#   WOF_PARENT_LOCALITY_MIN_SHARE    Minimum child-cell share (0..1) required for locality parent takeover (default: 0.5)
 #   WOF_INCLUDE_LOCALADMIN         Include localadmin placetypes (default: 0)
 #   WOF_INCLUDE_REGION             Include region placetypes (default: 1)
 #   WOF_DROP_CONTAINED_LOCALITIES  Drop localities contained in larger localities (default: 1)
@@ -46,6 +47,7 @@ WOF_REGION_SPARSE_MIN_AREA_KM2="${WOF_REGION_SPARSE_MIN_AREA_KM2:-80000}"
 WOF_PROMOTE_LOCALITY_OVER_REGION="${WOF_PROMOTE_LOCALITY_OVER_REGION:-1}"
 WOF_DOMINANT_LOCALITY_POPULATION="${WOF_DOMINANT_LOCALITY_POPULATION:-100000}"
 WOF_DOMINANT_LOCALITY_RATIO="${WOF_DOMINANT_LOCALITY_RATIO:-3}"
+WOF_PARENT_LOCALITY_MIN_SHARE="${WOF_PARENT_LOCALITY_MIN_SHARE:-0.5}"
 WOF_INCLUDE_LOCALADMIN="${WOF_INCLUDE_LOCALADMIN:-0}"
 WOF_INCLUDE_REGION="${WOF_INCLUDE_REGION:-1}"
 WOF_DROP_CONTAINED_LOCALITIES="${WOF_DROP_CONTAINED_LOCALITIES:-1}"
@@ -129,6 +131,7 @@ CMD=(
   --promote-locality-over-region "${WOF_PROMOTE_LOCALITY_OVER_REGION}"
   --dominant-locality-population "${WOF_DOMINANT_LOCALITY_POPULATION}"
   --dominant-locality-ratio "${WOF_DOMINANT_LOCALITY_RATIO}"
+  --parent-locality-min-share "${WOF_PARENT_LOCALITY_MIN_SHARE}"
   --include-localadmin "${WOF_INCLUDE_LOCALADMIN}"
   --include-region "${WOF_INCLUDE_REGION}"
   --drop-contained-localities "${WOF_DROP_CONTAINED_LOCALITIES}"
