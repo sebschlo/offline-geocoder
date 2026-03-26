@@ -272,6 +272,26 @@ Boundary runtime modes:
   - Uses compact `compact_geohash_lookup` when present (fast geohash-to-place).
   - Falls back to full polygon-aware tables when compact rows are absent.
 
+### External Reverse Validation (LocationIQ)
+
+Use this script to compare local reverse results against LocationIQ at sampled
+coordinates, with persistent SQLite caching so requests are not repeated:
+
+```bash
+LOCATIONIQ_API_KEY=... node scripts/validate_with_locationiq.js \
+  --database tmp/wof-fr-it-compact-p5-d3-pop10k-region.sqlite \
+  --samples 300 \
+  --export-csv tmp/locationiq-validation-fr-it.csv
+```
+
+It creates/updates:
+
+- `sample_points` (coordinates sampled from your geohash table)
+- `locationiq_cache` (raw LocationIQ responses keyed by coordinate)
+- `validation_results` (local vs LocationIQ comparison verdicts)
+
+Cache DB path is automatic (default behavior): `tmp/locationiq-validation-<database-basename>.sqlite`.
+
 ## License
 
 This library is licensed under [the MIT license](https://github.com/lucaspiller/offline-geocoder/blob/master/LICENSE).
