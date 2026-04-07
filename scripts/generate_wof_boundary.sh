@@ -11,6 +11,7 @@ set -euo pipefail
 #   WOF_WORKDIR                    Working directory for archives/extraction (default: ./tmp/wof-build)
 #   WOF_DOWNLOAD                   Set to 0 to skip downloads and reuse existing archives (default: 1)
 #   WOF_REF                        Git ref to download from codeload (default: master)
+#   WOF_REF_LOCK_FILE              Optional file with per-country pinned refs: "<iso2> <ref>" per line
 #   WOF_BASE_PRECISION             Geohash base precision (default: 4)
 #   WOF_MAX_PRECISION              Geohash max precision (default: 5)
 #   WOF_LOCALITY_MAX_PRECISION     Locality max precision override (default: WOF_MAX_PRECISION)
@@ -37,6 +38,7 @@ WOF_COUNTRIES="${WOF_COUNTRIES:-FR,IT}"
 WOF_WORKDIR="${WOF_WORKDIR:-$(pwd)/tmp/wof-build}"
 WOF_DOWNLOAD="${WOF_DOWNLOAD:-1}"
 WOF_REF="${WOF_REF:-master}"
+WOF_REF_LOCK_FILE="${WOF_REF_LOCK_FILE:-}"
 WOF_BASE_PRECISION="${WOF_BASE_PRECISION:-4}"
 WOF_MAX_PRECISION="${WOF_MAX_PRECISION:-5}"
 WOF_LOCALITY_MAX_PRECISION="${WOF_LOCALITY_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
@@ -62,6 +64,48 @@ case "${OUTPUT}" in
   *) OUTPUT="$(pwd)/${OUTPUT}" ;;
 esac
 
+if [[ -n "${WOF_REF_LOCK_FILE}" ]]; then
+  case "${WOF_REF_LOCK_FILE}" in
+    /*) ;;
+    *) WOF_REF_LOCK_FILE="$(pwd)/${WOF_REF_LOCK_FILE}" ;;
+  esac
+
+  if [[ ! -f "${WOF_REF_LOCK_FILE}" ]]; then
+    echo "WOF_REF_LOCK_FILE does not exist: ${WOF_REF_LOCK_FILE}" >&2
+    exit 1
+  fi
+fi
+
+resolve_country_ref() {
+  local country="$1"
+  local fallback_ref="$2"
+
+  if [[ -z "${WOF_REF_LOCK_FILE}" ]]; then
+    echo "${fallback_ref}"
+    return 0
+  fi
+
+  local resolved_ref
+  resolved_ref="$(awk -F'[,\t ]+' -v cc="${country}" '
+    BEGIN { lower = tolower(cc) }
+    /^[[:space:]]*#/ { next }
+    NF < 2 { next }
+    {
+      if (tolower($1) == lower) {
+        print $2
+        exit
+      }
+    }
+  ' "${WOF_REF_LOCK_FILE}")"
+
+  if [[ -z "${resolved_ref}" ]]; then
+    echo "Missing pinned ref for country ${country} in ${WOF_REF_LOCK_FILE}" >&2
+    exit 1
+  fi
+
+  echo "${resolved_ref}"
+}
+
 ARCHIVE_DIR="${WOF_WORKDIR}/archives"
 EXTRACT_DIR="${WOF_WORKDIR}/extracted"
 mkdir -p "${ARCHIVE_DIR}" "${EXTRACT_DIR}"
@@ -76,7 +120,8 @@ for item in "${COUNTRY_ITEMS[@]}"; do
   fi
 
   repo="whosonfirst-data-admin-${country}"
-  archive="${ARCHIVE_DIR}/${repo}-${WOF_REF}.tar.gz"
+  country_ref="$(resolve_country_ref "${country}" "${WOF_REF}")"
+  archive="${ARCHIVE_DIR}/${repo}-${country_ref}.tar.gz"
 
   if [[ ! -f "${archive}" ]]; then
     if [[ "${WOF_DOWNLOAD}" != "1" ]]; then
@@ -85,8 +130,8 @@ for item in "${COUNTRY_ITEMS[@]}"; do
       exit 1
     fi
 
-    url="https://codeload.github.com/whosonfirst-data/${repo}/tar.gz/${WOF_REF}"
-    echo "Downloading ${repo}@${WOF_REF}..."
+    url="https://codeload.github.com/whosonfirst-data/${repo}/tar.gz/${country_ref}"
+    echo "Downloading ${repo}@${country_ref}..."
     curl -fsSL "${url}" -o "${archive}"
   else
     echo "Using existing archive ${archive}"

@@ -259,6 +259,7 @@ Useful WOF build env vars:
 - `WOF_WORKDIR` working directory for downloads/extracted files (default `tmp/wof-build`)
 - `WOF_DOWNLOAD=0` reuse existing archives only
 - `WOF_REF` branch/ref to download (default `master`)
+- `WOF_REF_LOCK_FILE` optional per-country pinned refs (`<iso2> <ref>` per line); when set, this overrides `WOF_REF` per country
 - `WOF_LOCALITY_MAX_PRECISION` locality precision cap
 - `WOF_REGION_MAX_PRECISION` region precision cap (default `4`)
 - `WOF_REGION_SPARSE_MAX_PRECISION` sparse very-large-region precision (default `3`)
