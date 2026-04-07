@@ -30,6 +30,8 @@ set -euo pipefail
 #   WOF_GEOMETRY_DECIMALS          Optional coordinate rounding precision (e.g. 4)
 #   WOF_MIN_POPULATION             Optional minimum population filter (default: 0)
 #   WOF_MAX_PLACES                 Optional cap for experiment runs
+#   WOF_SKIP_INVALID_REPOS         Skip repos missing expected extracted data dir (default: 1)
+#   WOF_APPEND                     Append to existing DB instead of replacing schema (default: 0)
 #
 # Notes:
 #   - This helper always builds `--index-mode compact` (geohash -> place only).
@@ -57,6 +59,8 @@ WOF_INCLUDE_ALT="${WOF_INCLUDE_ALT:-0}"
 WOF_GEOMETRY_DECIMALS="${WOF_GEOMETRY_DECIMALS:-}"
 WOF_MIN_POPULATION="${WOF_MIN_POPULATION:-0}"
 WOF_MAX_PLACES="${WOF_MAX_PLACES:-}"
+WOF_SKIP_INVALID_REPOS="${WOF_SKIP_INVALID_REPOS:-1}"
+WOF_APPEND="${WOF_APPEND:-0}"
 OUTPUT="${1:-db.sqlite}"
 
 case "${OUTPUT}" in
@@ -132,7 +136,9 @@ for item in "${COUNTRY_ITEMS[@]}"; do
 
     url="https://codeload.github.com/whosonfirst-data/${repo}/tar.gz/${country_ref}"
     echo "Downloading ${repo}@${country_ref}..."
-    curl -fsSL "${url}" -o "${archive}"
+    curl --fail --silent --show-error --location \
+      --retry 5 --retry-delay 2 --retry-connrefused \
+      "${url}" -o "${archive}"
   else
     echo "Using existing archive ${archive}"
   fi
@@ -140,16 +146,31 @@ for item in "${COUNTRY_ITEMS[@]}"; do
   country_extract="${EXTRACT_DIR}/${country}"
   rm -rf "${country_extract}"
   mkdir -p "${country_extract}"
-  tar -xzf "${archive}" -C "${country_extract}"
+  if ! tar -xzf "${archive}" -C "${country_extract}"; then
+    if [[ "${WOF_SKIP_INVALID_REPOS}" == "1" ]]; then
+      echo "Warning: failed to extract ${archive}; skipping ${repo}" >&2
+      continue
+    fi
+    echo "Failed to extract ${archive}" >&2
+    exit 1
+  fi
 
   root_dir="$(find "${country_extract}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   if [[ -z "${root_dir}" ]]; then
+    if [[ "${WOF_SKIP_INVALID_REPOS}" == "1" ]]; then
+      echo "Warning: failed to find extracted root directory for ${repo}; skipping" >&2
+      continue
+    fi
     echo "Failed to find extracted root directory for ${repo}" >&2
     exit 1
   fi
 
   data_dir="${root_dir}/data"
   if [[ ! -d "${data_dir}" ]]; then
+    if [[ "${WOF_SKIP_INVALID_REPOS}" == "1" ]]; then
+      echo "Warning: expected data directory not found for ${repo}; skipping (${data_dir})" >&2
+      continue
+    fi
     echo "Expected data directory not found: ${data_dir}" >&2
     exit 1
   fi
@@ -190,6 +211,10 @@ fi
 
 if [[ -n "${WOF_GEOMETRY_DECIMALS}" ]]; then
   CMD+=(--geometry-decimals "${WOF_GEOMETRY_DECIMALS}")
+fi
+
+if [[ "${WOF_APPEND}" == "1" ]]; then
+  CMD+=(--append)
 fi
 
 CMD+=("${INPUT_ARGS[@]}")

@@ -273,6 +273,8 @@ Useful WOF build env vars:
 - `WOF_INCLUDE_REGION=1|0` include/exclude region fallback boundaries
 - `WOF_MAX_PLACES` cap places for experiment runs
 - `WOF_DROP_CONTAINED_LOCALITIES=1|0` enable/disable contained-locality pruning
+- `WOF_SKIP_INVALID_REPOS=1|0` skip malformed/unexpected WOF admin repos during bulk runs (default `1`)
+- `WOF_APPEND=1|0` append to an existing compact DB instead of replacing schema (default `0`)
 
 Boundary runtime modes:
 
