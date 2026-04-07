@@ -720,7 +720,10 @@ async function main() {
 
   try {
     await ensureCacheSchema(cacheDb)
+    await ensureValidationColumns(cacheDb)
     var lookupTable = await detectLookupTable(sourceDb)
+    var placetypeSource = await detectPlacetypeSource(sourceDb)
+    var placetypeCache = Object.create(null)
     await ensureSamplePoints(sourceDb, cacheDb, lookupTable, opts.samples, Number.isFinite(opts.seed) ? opts.seed : 1337)
 
     var points = await dbAll(
@@ -746,26 +749,37 @@ async function main() {
       var liqAddress = (liqResult.json && liqResult.json.address) || {}
       var liqLocality = extractLocationIqLocality(liqAddress)
       var liqCountryCode = liqAddress.country_code ? String(liqAddress.country_code).toUpperCase() : ''
+      var liqDisplayName = liqResult.json && liqResult.json.display_name ? String(liqResult.json.display_name) : ''
 
       var localName = localResult.name || ''
       var localCountryId = (localResult.country && localResult.country.id) ? String(localResult.country.id).toUpperCase() : ''
+      var localPlacetype = await resolveLocalPlacetype(sourceDb, placetypeSource, localResult.id, placetypeCache)
       var localityMatch = namesMatch(normalizeName(localName), normalizeName(liqLocality))
-      var countryMatch = localCountryId && liqCountryCode && localCountryId === liqCountryCode
+      var countryMatch = Boolean(localCountryId && liqCountryCode && localCountryId === liqCountryCode)
       var verdict = buildVerdict(localityMatch, countryMatch, localName, liqLocality)
+      var policyVerdict = buildPolicyVerdict({
+        countryMatch: countryMatch,
+        strictLocalityMatch: localityMatch,
+        localPlacetype: localPlacetype,
+        localName: localName,
+        liqAddress: liqAddress,
+        liqDisplayName: liqDisplayName
+      })
 
       await dbRun(
         cacheDb,
         `INSERT INTO validation_results(
           coord_key, latitude, longitude, source_geohash,
-          local_name, local_country_id, local_admin1_id, local_json,
+          local_name, local_placetype, local_country_id, local_admin1_id, local_json,
           liq_locality, liq_country_code, liq_display_name, liq_json,
-          locality_match, country_match, verdict, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          locality_match, country_match, policy_match, policy_reason, policy_verdict, verdict, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(coord_key) DO UPDATE SET
           latitude=excluded.latitude,
           longitude=excluded.longitude,
           source_geohash=excluded.source_geohash,
           local_name=excluded.local_name,
+          local_placetype=excluded.local_placetype,
           local_country_id=excluded.local_country_id,
           local_admin1_id=excluded.local_admin1_id,
           local_json=excluded.local_json,
@@ -775,6 +789,9 @@ async function main() {
           liq_json=excluded.liq_json,
           locality_match=excluded.locality_match,
           country_match=excluded.country_match,
+          policy_match=excluded.policy_match,
+          policy_reason=excluded.policy_reason,
+          policy_verdict=excluded.policy_verdict,
           verdict=excluded.verdict,
           updated_at=excluded.updated_at`,
         [
@@ -783,15 +800,19 @@ async function main() {
           point.longitude,
           point.source_geohash,
           localName || null,
+          localPlacetype || null,
           localCountryId || null,
           (localResult.admin1 && localResult.admin1.id) ? String(localResult.admin1.id) : null,
           JSON.stringify(localResult),
           liqLocality || null,
           liqCountryCode || null,
-          liqResult.json && liqResult.json.display_name ? String(liqResult.json.display_name) : null,
+          liqDisplayName || null,
           JSON.stringify(liqResult.json),
           localityMatch ? 1 : 0,
           countryMatch ? 1 : 0,
+          policyVerdict.match ? 1 : 0,
+          policyVerdict.reason || null,
+          policyVerdict.verdict || 'policy_unset',
           verdict
         ]
       )
@@ -811,6 +832,16 @@ async function main() {
       [opts.samples]
     )
 
+    var policyVerdictRows = await dbAll(
+      cacheDb,
+      `SELECT policy_verdict, COUNT(*) AS count
+       FROM validation_results
+       WHERE coord_key IN (SELECT coord_key FROM sample_points ORDER BY created_at ASC, coord_key ASC LIMIT ?)
+       GROUP BY policy_verdict
+       ORDER BY count DESC, policy_verdict ASC`,
+      [opts.samples]
+    )
+
     var totalRow = await dbGet(
       cacheDb,
       `SELECT COUNT(*) AS count
@@ -818,12 +849,28 @@ async function main() {
        WHERE coord_key IN (SELECT coord_key FROM sample_points ORDER BY created_at ASC, coord_key ASC LIMIT ?)`,
       [opts.samples]
     )
+    var policyMatchRow = await dbGet(
+      cacheDb,
+      `SELECT COUNT(*) AS count
+       FROM validation_results
+       WHERE policy_match = 1
+         AND coord_key IN (SELECT coord_key FROM sample_points ORDER BY created_at ASC, coord_key ASC LIMIT ?)`,
+      [opts.samples]
+    )
+    var totalCount = Number(totalRow && totalRow.count ? totalRow.count : 0)
+    var policyMatchCount = Number(policyMatchRow && policyMatchRow.count ? policyMatchRow.count : 0)
+    var policyRatePct = totalCount > 0 ? ((policyMatchCount * 100) / totalCount) : 0
 
     console.log('Validation complete')
     console.log('Geocoder DB: ' + opts.database)
     console.log('Cache DB: ' + opts.cacheDb)
-    console.log('Samples evaluated: ' + Number(totalRow && totalRow.count ? totalRow.count : 0))
+    console.log('Samples evaluated: ' + totalCount)
     console.log('LocationIQ uncached calls this run: ' + uncachedCalls)
+    console.log('Policy match rate: ' + policyMatchCount + '/' + totalCount + ' (' + policyRatePct.toFixed(1) + '%)')
+    console.log('Policy verdict distribution:')
+    for (var k = 0; k < policyVerdictRows.length; k++) {
+      console.log('  ' + policyVerdictRows[k].policy_verdict + ': ' + policyVerdictRows[k].count)
+    }
     console.log('Verdict distribution:')
     for (var j = 0; j < verdictRows.length; j++) {
       console.log('  ' + verdictRows[j].verdict + ': ' + verdictRows[j].count)
