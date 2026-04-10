@@ -5,3 +5,5 @@ package-lock.json
 .geonames-build
 .DS_Store
 tmp
+*.sqlite
+*.db

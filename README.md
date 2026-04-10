@@ -211,6 +211,17 @@ contained in larger localities within the same country/admin1 group. This is
 intended to suppress duplicate neighbourhood-like localities while keeping
 small isolated places (for example islands) that are not contained.
 
+#### Place selection pipeline
+
+The builder uses a multi-stage pipeline to decide which localities make it into the index:
+
+1. **Primary filter** (`--min-population`): localities at or above this threshold are always included. Country capitals are always included regardless of population.
+2. **Isolation pass** (`--isolation-min-population`): localities between the isolation floor and the primary threshold are evaluated as candidates. A candidate is promoted if at least one of its geohash cover cells (at base precision) is not already claimed by a primary locality. This ensures small but geographically isolated places like islands, remote towns, and oases get their own label without adding noise in dense urban areas.
+3. **Country guarantee** (`--ensure-country-locality`): after the isolation pass, any country that still has zero localities gets its highest-population candidate promoted unconditionally.
+4. **Contained-locality pruning** (`--drop-contained-localities`): removes localities whose polygon is fully contained inside a larger locality in the same country/admin1 group.
+5. **Dominant-city rollup**: in the geohash index, when a major city (population >= `--dominant-locality-population`) dominates its neighbours by a ratio of `--dominant-locality-ratio`, smaller nearby localities are absorbed into the major city label.
+6. **Locality-over-region promotion**: when a locality and a region compete for the same parent geohash cell, the locality wins if it covers >= `--parent-locality-min-share` of child cells.
+
 Builder notes:
 
 - Keeps current records only (drops deprecated/superseded where source metadata is present)
@@ -270,6 +281,8 @@ Useful WOF build env vars:
 - `WOF_PARENT_LOCALITY_MIN_SHARE` minimum child-cell share for locality parent takeover (default `0.5`)
 - `WOF_GEOMETRY_DECIMALS` round coordinates before storage/indexing (for example `4`)
 - `WOF_MIN_POPULATION` filter out places below threshold (for example `10000`)
+- `WOF_ISOLATION_MIN_POPULATION` lower population floor for isolated localities (default `500`). Places between this and `WOF_MIN_POPULATION` are included only if they occupy otherwise-empty geohash cells
+- `WOF_ENSURE_COUNTRY_LOCALITY=1|0` guarantee at least one locality per country (default `1`)
 - `WOF_INCLUDE_REGION=1|0` include/exclude region fallback boundaries
 - `WOF_MAX_PLACES` cap places for experiment runs
 - `WOF_DROP_CONTAINED_LOCALITIES=1|0` enable/disable contained-locality pruning
