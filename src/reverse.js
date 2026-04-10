@@ -4,8 +4,8 @@ const formatLocation = require('./location').format
 const geohash = require('./geohash')
 const geometry = require('./geometry')
 
-const SUPPORTED_PLACETYPES = ['locality', 'localadmin', 'region']
-const SUPPORTED_PLACETYPE_CODES = [0, 1, 2]
+const SUPPORTED_PLACETYPES = ['locality', 'localadmin', 'region', 'county']
+const SUPPORTED_PLACETYPE_CODES = [0, 1, 2, 3]
 const PLACEHOLDER_EMPTY = {}
 
 function dbAll(geocoder, query, params) {
@@ -149,6 +149,7 @@ function fetchCompactBoundaryMatchV2(geocoder, hashes) {
         WHEN 0 THEN 'locality'
         WHEN 1 THEN 'localadmin'
         WHEN 2 THEN 'region'
+        WHEN 3 THEN 'county'
         ELSE 'region'
       END AS placetype,
       0 AS priority_rank,
@@ -467,6 +468,7 @@ function fetchNearestCompactByRegionV2(geocoder, latitude, longitude, region) {
         WHEN 0 THEN 'locality'
         WHEN 1 THEN 'localadmin'
         WHEN 2 THEN 'region'
+        WHEN 3 THEN 'county'
         ELSE 'region'
       END AS placetype,
       0 AS priority_rank,

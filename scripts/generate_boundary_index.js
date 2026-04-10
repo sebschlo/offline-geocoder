@@ -11,7 +11,8 @@ const geohash = require('../src/geohash')
 const PLACETYPE_CODES = {
   locality: 0,
   localadmin: 1,
-  region: 2
+  region: 2,
+  county: 3
 }
 
 function parseBool(value, defaultValue) {
@@ -38,6 +39,7 @@ function parseArgs(argv) {
     basePrecision: 4,
     maxPrecision: 7,
     includeLocaladmin: false,
+    includeCounty: false,
     includeRegion: false,
     replace: true,
     includeAlt: false,
@@ -45,9 +47,12 @@ function parseArgs(argv) {
     maxPlaces: null,
     geometryDecimals: null,
     minPopulation: 0,
+    isolationMinPopulation: null,
+    ensureCountryLocality: true,
     indexMode: 'compact',
     localityMaxPrecision: null,
     localadminMaxPrecision: null,
+    countyMaxPrecision: null,
     regionMaxPrecision: null,
     regionSparseMaxPrecision: null,
     regionSparseMinAreaKm2: null,
@@ -72,6 +77,8 @@ function parseArgs(argv) {
       opts.maxPrecision = Number(argv[++i])
     } else if (arg === '--include-localadmin') {
       opts.includeLocaladmin = parseBool(argv[++i], false)
+    } else if (arg === '--include-county') {
+      opts.includeCounty = parseBool(argv[++i], false)
     } else if (arg === '--include-region') {
       opts.includeRegion = parseBool(argv[++i], false)
     } else if (arg === '--include-alt') {
@@ -87,6 +94,11 @@ function parseArgs(argv) {
     } else if (arg === '--min-population') {
       var minPopulation = Number(argv[++i])
       opts.minPopulation = Number.isFinite(minPopulation) && minPopulation > 0 ? Math.trunc(minPopulation) : 0
+    } else if (arg === '--isolation-min-population') {
+      var isolationMin = Number(argv[++i])
+      opts.isolationMinPopulation = Number.isFinite(isolationMin) && isolationMin > 0 ? Math.trunc(isolationMin) : null
+    } else if (arg === '--ensure-country-locality') {
+      opts.ensureCountryLocality = parseBool(argv[++i], true)
     } else if (arg === '--index-mode') {
       opts.indexMode = String(argv[++i] || '').toLowerCase().trim()
     } else if (arg === '--locality-max-precision') {
@@ -95,6 +107,9 @@ function parseArgs(argv) {
     } else if (arg === '--localadmin-max-precision') {
       var localadminMax = Number(argv[++i])
       opts.localadminMaxPrecision = Number.isFinite(localadminMax) ? Math.trunc(localadminMax) : null
+    } else if (arg === '--county-max-precision') {
+      var countyMax = Number(argv[++i])
+      opts.countyMaxPrecision = Number.isFinite(countyMax) ? Math.trunc(countyMax) : null
     } else if (arg === '--region-max-precision') {
       var regionMax = Number(argv[++i])
       opts.regionMaxPrecision = Number.isFinite(regionMax) ? Math.trunc(regionMax) : null
@@ -140,15 +155,19 @@ function usage() {
     '  --base-precision               Geohash base precision (default: 4)',
     '  --max-precision                Geohash max precision for partial subdivision (default: 7)',
     '  --include-localadmin <bool>    Include localadmin placetypes (default: false)',
+    '  --include-county <bool>       Include county placetypes (default: false)',
     '  --include-region <bool>        Include region placetypes (default: false)',
     '  --include-alt <bool>           Include WOF alt geometries (default: false)',
     '  --drop-contained-localities    Drop locality polygons fully contained by larger localities (default: true)',
     '  --max-places                   Stop after this many normalized places (useful for experiments)',
     '  --geometry-decimals            Round geometry coordinates to N decimals before indexing/storage',
     '  --min-population               Drop localities below this threshold (default: 0, country capitals kept)',
+    '  --isolation-min-population     Lower population floor for localities in otherwise-empty geohash cells (default: off)',
+    '  --ensure-country-locality      Guarantee at least one locality per country (default: true)',
     '  --index-mode                   compact|full (default: compact)',
     '  --locality-max-precision       Max precision override for locality placetype',
     '  --localadmin-max-precision     Max precision override for localadmin placetype',
+    '  --county-max-precision         Max precision override for county placetype',
     '  --region-max-precision         Max precision override for region placetype',
     '  --region-sparse-max-precision  Optional precision for very large region polygons (for example 3)',
     '  --region-sparse-min-area-km2   Area threshold to apply sparse region precision',
@@ -551,13 +570,14 @@ function normalizeFeature(feature, opts) {
   }
 
   var properties = feature.properties || {}
+  var placetype = (extractPlacetype(properties) || '').toLowerCase()
   if (!isCurrentRecord(properties)) {
     return null
   }
 
-  var placetype = (extractPlacetype(properties) || '').toLowerCase()
   var include = placetype === 'locality' ||
     (opts.includeLocaladmin && placetype === 'localadmin') ||
+    (opts.includeCounty && placetype === 'county') ||
     (opts.includeRegion && placetype === 'region')
   if (!include) {
     return null
@@ -565,8 +585,15 @@ function normalizeFeature(feature, opts) {
 
   var population = extractPopulation(properties)
   var isCapital = placetype === 'locality' && isCapitalLocality(properties)
-  if (placetype === 'locality' && population < opts.minPopulation && !isCapital) {
-    return null
+  var isCityLikePlacetype = placetype === 'locality' || placetype === 'county'
+  var isolationCandidate = false
+  if (isCityLikePlacetype && population < opts.minPopulation && !isCapital) {
+    var isolationFloor = opts.isolationMinPopulation
+    if (Number.isFinite(isolationFloor) && isolationFloor > 0 && population >= isolationFloor) {
+      isolationCandidate = true
+    } else {
+      return null
+    }
   }
 
   var rawId = feature.id
@@ -622,6 +649,12 @@ function normalizeFeature(feature, opts) {
       maxPrecision: maxPrecisionForPlace
     })
 
+  var area = geometry.geometryArea(normalizedGeometry)
+
+  // In compact mode, geometry is not written to the DB.  Retain it only
+  // for full index mode which stores polygons.
+  var retainGeometry = opts.indexMode !== 'compact'
+
   return {
     id: id,
     name: name,
@@ -637,11 +670,12 @@ function normalizeFeature(feature, opts) {
     bboxMaxLat: bbox.maxLat,
     bboxMaxLon: bbox.maxLon,
     priorityRank: priorityRank,
-    area: geometry.geometryArea(normalizedGeometry),
+    area: area,
     countryName: pickFirstString(properties.country_name) || countryId || null,
     admin1Name: pickFirstString(properties.admin1_name) || null,
-    geometry: normalizedGeometry,
-    cover: cover
+    geometry: retainGeometry ? normalizedGeometry : null,
+    cover: cover,
+    isolationCandidate: isolationCandidate
   }
 }
 
@@ -660,9 +694,11 @@ function pruneContainedLocalities(places, enabled) {
   var localitiesByGroup = Object.create(null)
   for (var i = 0; i < places.length; i++) {
     var place = places[i]
-    if (place.placetype !== 'locality') continue
+    if (!isCityPlacetypeCode(place.placetypeCode)) continue
 
-    var key = localityGroupKey(place)
+    // Group by placetype + country/admin1 so localities are only pruned by
+    // other localities, not by counties that happen to contain them.
+    var key = place.placetypeCode + '|' + localityGroupKey(place)
     if (!localitiesByGroup[key]) {
       localitiesByGroup[key] = []
     }
@@ -707,7 +743,11 @@ function pruneContainedLocalities(places, enabled) {
           continue
         }
 
-        if (geometry.geometryContainsGeometry(container.geometry, candidate.geometry)) {
+        // Use full geometry containment when available, otherwise bbox is sufficient
+        var geometryContains = container.geometry && candidate.geometry
+          ? geometry.geometryContainsGeometry(container.geometry, candidate.geometry)
+          : true
+        if (geometryContains) {
           dropById[candidate.id] = {
             placeId: candidate.id,
             containedBy: container.id,
@@ -733,6 +773,7 @@ function pruneContainedLocalities(places, enabled) {
 function placetypeRank(placetype) {
   if (placetype === 'locality') return 0
   if (placetype === 'localadmin') return 1
+  if (placetype === 'county') return 1
   if (placetype === 'region') return 2
   return 3
 }
@@ -745,6 +786,7 @@ function placetypeCode(placetype) {
 function resolveMaxPrecisionForPlacetype(opts, placetype, bbox) {
   if (placetype === 'locality') return opts.localityMaxPrecision
   if (placetype === 'localadmin') return opts.localadminMaxPrecision
+  if (placetype === 'county') return opts.countyMaxPrecision
   if (placetype === 'region') {
     var regionPrecision = opts.regionMaxPrecision
     if (Number.isFinite(opts.regionSparseMaxPrecision) && Number.isFinite(opts.regionSparseMinAreaKm2)) {
@@ -804,7 +846,7 @@ function comparePlacesForHash(a, b, hash, hashCenterCache) {
 }
 
 function isCityPlacetypeCode(code) {
-  return code === PLACETYPE_CODES.locality || code === PLACETYPE_CODES.localadmin
+  return code === PLACETYPE_CODES.locality || code === PLACETYPE_CODES.localadmin || code === PLACETYPE_CODES.county
 }
 
 function placePopulation(place) {
@@ -1266,6 +1308,7 @@ async function ensureBoundarySchema(db, opts) {
 
 function normalizePlaces(files, opts) {
   var byId = Object.create(null)
+  var candidateById = Object.create(null)
   var normalizedCount = 0
 
   for (var i = 0; i < files.length; i++) {
@@ -1275,8 +1318,13 @@ function normalizePlaces(files, opts) {
       var place = normalizeFeature(features[j], opts)
       if (!place) continue
 
-      byId[String(place.id)] = place
       normalizedCount += 1
+
+      if (place.isolationCandidate) {
+        candidateById[String(place.id)] = place
+      } else {
+        byId[String(place.id)] = place
+      }
 
       if (opts.maxPlaces && Object.keys(byId).length >= opts.maxPlaces) {
         break
@@ -1292,10 +1340,112 @@ function normalizePlaces(files, opts) {
     .map(function(id) { return byId[id] })
     .sort(function(a, b) { return a.id - b.id })
 
+  var candidates = Object.keys(candidateById)
+    .map(function(id) { return candidateById[id] })
+    .sort(function(a, b) { return a.id - b.id })
+
   return {
     places: places,
+    candidates: candidates,
     normalizedCount: normalizedCount
   }
+}
+
+function promoteIsolatedLocalities(places, candidates, opts) {
+  if (!candidates.length) {
+    return { places: places, promoted: 0, countryFills: 0 }
+  }
+
+  // Build set of geohash cells already claimed by primary places at base precision
+  var claimedCells = Object.create(null)
+  for (var i = 0; i < places.length; i++) {
+    var place = places[i]
+    if (place.placetype !== 'locality' && place.placetype !== 'localadmin') continue
+    for (var j = 0; j < place.cover.length; j++) {
+      var hash = place.cover[j].geohash
+      // Claim at base precision: truncate to basePrecision length
+      var baseHash = hash.length > opts.basePrecision ? hash.slice(0, opts.basePrecision) : hash
+      claimedCells[baseHash] = true
+    }
+  }
+
+  // Track which countries already have at least one city-like place
+  var countriesWithLocality = Object.create(null)
+  for (var i = 0; i < places.length; i++) {
+    if (isCityPlacetypeCode(places[i].placetypeCode)) {
+      countriesWithLocality[places[i].countryId] = true
+    }
+  }
+
+  // Sort candidates by population descending so higher-pop isolated places win first
+  var sortedCandidates = candidates.slice().sort(function(a, b) {
+    return b.population - a.population
+  })
+
+  var promoted = 0
+  var countryFills = 0
+  var result = places.slice()
+
+  for (var c = 0; c < sortedCandidates.length; c++) {
+    var candidate = sortedCandidates[c]
+    var isIsolated = false
+
+    for (var k = 0; k < candidate.cover.length; k++) {
+      var hash = candidate.cover[k].geohash
+      var baseHash = hash.length > opts.basePrecision ? hash.slice(0, opts.basePrecision) : hash
+      if (!claimedCells[baseHash]) {
+        isIsolated = true
+        break
+      }
+    }
+
+    if (!isIsolated) continue
+
+    candidate.isolationCandidate = false
+    result.push(candidate)
+    promoted += 1
+
+    // Mark its cells as claimed
+    for (var k = 0; k < candidate.cover.length; k++) {
+      var hash = candidate.cover[k].geohash
+      var baseHash = hash.length > opts.basePrecision ? hash.slice(0, opts.basePrecision) : hash
+      claimedCells[baseHash] = true
+    }
+
+    if (!countriesWithLocality[candidate.countryId]) {
+      countriesWithLocality[candidate.countryId] = true
+      countryFills += 1
+    }
+  }
+
+  // Ensure every country has at least one locality
+  if (opts.ensureCountryLocality) {
+    var candidatesByCountry = Object.create(null)
+    for (var c = 0; c < sortedCandidates.length; c++) {
+      var candidate = sortedCandidates[c]
+      if (candidate.isolationCandidate === false) continue // already promoted
+      if (!isCityPlacetypeCode(candidate.placetypeCode)) continue
+      var cc = candidate.countryId
+      if (!candidatesByCountry[cc]) {
+        candidatesByCountry[cc] = candidate // first = highest pop (already sorted)
+      }
+    }
+
+    var countryKeys = Object.keys(candidatesByCountry)
+    for (var i = 0; i < countryKeys.length; i++) {
+      var cc = countryKeys[i]
+      if (countriesWithLocality[cc]) continue
+
+      var best = candidatesByCountry[cc]
+      best.isolationCandidate = false
+      result.push(best)
+      countryFills += 1
+      promoted += 1
+      countriesWithLocality[cc] = true
+    }
+  }
+
+  return { places: result, promoted: promoted, countryFills: countryFills }
 }
 
 async function writePlaces(db, places, opts, compactLookupRows) {
@@ -1462,6 +1612,7 @@ async function main() {
 
   options.localityMaxPrecision = clampPrecision(options.localityMaxPrecision, options.basePrecision, options.maxPrecision)
   options.localadminMaxPrecision = clampPrecision(options.localadminMaxPrecision, options.basePrecision, options.maxPrecision)
+  options.countyMaxPrecision = clampPrecision(options.countyMaxPrecision, options.basePrecision, options.maxPrecision)
   options.regionMaxPrecision = clampPrecision(options.regionMaxPrecision, options.basePrecision, options.maxPrecision)
   if (!Number.isFinite(options.dominantLocalityPopulation) || options.dominantLocalityPopulation <= 0) {
     options.dominantLocalityPopulation = 0
@@ -1496,11 +1647,14 @@ async function main() {
   }
 
   var normalized = normalizePlaces(files, options)
-  var dedupedPlaces = normalized.places
+  var primaryPlaces = normalized.places
 
-  if (!dedupedPlaces.length) {
+  if (!primaryPlaces.length && !normalized.candidates.length) {
     throw new Error('No valid locality/localadmin/region records were found in the provided input files')
   }
+
+  var isolation = promoteIsolatedLocalities(primaryPlaces, normalized.candidates, options)
+  var dedupedPlaces = isolation.places
 
   var pruned = pruneContainedLocalities(dedupedPlaces, options.dropContainedLocalities)
   var finalPlaces = pruned.places
@@ -1521,7 +1675,12 @@ async function main() {
     console.log('Database: ' + databasePath)
     console.log('Input files scanned: ' + files.length)
     console.log('Features normalized: ' + normalized.normalizedCount)
-    console.log('Places (deduped by id): ' + dedupedPlaces.length)
+    console.log('Primary places (>= min-population): ' + primaryPlaces.length)
+    if (normalized.candidates.length) {
+      console.log('Isolation candidates evaluated: ' + normalized.candidates.length)
+      console.log('Isolated localities promoted: ' + isolation.promoted + ' (country fills: ' + isolation.countryFills + ')')
+    }
+    console.log('Places after isolation pass: ' + dedupedPlaces.length)
     console.log('Places dropped (contained locality prune): ' + pruned.dropped.length)
     console.log('Places written: ' + finalPlaces.length)
     if (options.indexMode === 'compact') {
@@ -1531,10 +1690,11 @@ async function main() {
     }
     var modeLabel = 'locality'
     if (options.includeLocaladmin) modeLabel += ' + localadmin'
+    if (options.includeCounty) modeLabel += ' + county'
     if (options.includeRegion) modeLabel += ' + region'
     console.log('Mode: ' + modeLabel)
     console.log('Precision: ' + options.basePrecision + ' -> ' + options.maxPrecision)
-    console.log('Placetype precision caps: locality=' + options.localityMaxPrecision + ', localadmin=' + options.localadminMaxPrecision + ', region=' + options.regionMaxPrecision)
+    console.log('Placetype precision caps: locality=' + options.localityMaxPrecision + ', localadmin=' + options.localadminMaxPrecision + ', county=' + options.countyMaxPrecision + ', region=' + options.regionMaxPrecision)
     if (Number.isFinite(options.regionSparseMaxPrecision) && Number.isFinite(options.regionSparseMinAreaKm2)) {
       console.log('Sparse region rule: area_km2>=' + options.regionSparseMinAreaKm2 + ' => max_precision=' + options.regionSparseMaxPrecision)
     }
@@ -1547,6 +1707,12 @@ async function main() {
     console.log('Index mode: ' + options.indexMode)
     console.log('Promote locality over region: ' + (options.promoteLocalityOverRegion ? 'true' : 'false'))
     console.log('Min population: ' + options.minPopulation)
+    if (Number.isFinite(options.isolationMinPopulation) && options.isolationMinPopulation > 0) {
+      console.log('Isolation min population: ' + options.isolationMinPopulation)
+    } else {
+      console.log('Isolation pass: disabled')
+    }
+    console.log('Ensure country locality: ' + (options.ensureCountryLocality ? 'true' : 'false'))
   } finally {
     await dbClose(db)
   }
