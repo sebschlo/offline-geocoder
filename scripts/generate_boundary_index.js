@@ -770,6 +770,64 @@ function pruneContainedLocalities(places, enabled) {
   }
 }
 
+function pruneRedundantRegions(places) {
+  var localitiesByKey = Object.create(null)
+  for (var i = 0; i < places.length; i++) {
+    var place = places[i]
+    if (place.placetypeCode !== PLACETYPE_CODES.locality) continue
+    var key = place.name + '|' + place.countryId
+    if (!localitiesByKey[key]) {
+      localitiesByKey[key] = []
+    }
+    localitiesByKey[key].push(place)
+  }
+
+  var dropById = Object.create(null)
+  for (var i = 0; i < places.length; i++) {
+    var region = places[i]
+    if (region.placetypeCode !== PLACETYPE_CODES.region) continue
+
+    var key = region.name + '|' + region.countryId
+    var matchingLocalities = localitiesByKey[key]
+    if (!matchingLocalities) continue
+
+    var regionBbox = {
+      minLat: region.bboxMinLat,
+      minLon: region.bboxMinLon,
+      maxLat: region.bboxMaxLat,
+      maxLon: region.bboxMaxLon
+    }
+
+    for (var j = 0; j < matchingLocalities.length; j++) {
+      var locality = matchingLocalities[j]
+      var localityBbox = {
+        minLat: locality.bboxMinLat,
+        minLon: locality.bboxMinLon,
+        maxLat: locality.bboxMaxLat,
+        maxLon: locality.bboxMaxLon
+      }
+
+      if (geometry.bboxContainsBbox(regionBbox, localityBbox)) {
+        dropById[region.id] = {
+          placeId: region.id,
+          replacedBy: locality.id
+        }
+        break
+      }
+    }
+  }
+
+  var dropped = Object.keys(dropById).map(function(id) { return dropById[id] })
+  var filtered = places.filter(function(place) {
+    return !dropById[place.id]
+  })
+
+  return {
+    places: filtered,
+    dropped: dropped
+  }
+}
+
 function placetypeRank(placetype) {
   if (placetype === 'locality') return 0
   if (placetype === 'localadmin') return 1
@@ -1657,7 +1715,8 @@ async function main() {
   var dedupedPlaces = isolation.places
 
   var pruned = pruneContainedLocalities(dedupedPlaces, options.dropContainedLocalities)
-  var finalPlaces = pruned.places
+  var regionPrune = pruneRedundantRegions(pruned.places)
+  var finalPlaces = regionPrune.places
   var compactLookupRows = options.indexMode === 'compact' ? buildCompactLookupRows(finalPlaces, options) : []
 
   var databasePath = path.resolve(options.database)
@@ -1682,6 +1741,7 @@ async function main() {
     }
     console.log('Places after isolation pass: ' + dedupedPlaces.length)
     console.log('Places dropped (contained locality prune): ' + pruned.dropped.length)
+    console.log('Regions dropped (redundant with same-name locality): ' + regionPrune.dropped.length)
     console.log('Places written: ' + finalPlaces.length)
     if (options.indexMode === 'compact') {
       console.log('Geohash lookup rows: ' + compactLookupRows.length)
