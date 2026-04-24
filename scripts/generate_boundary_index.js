@@ -782,6 +782,12 @@ function pruneRedundantRegions(places) {
     localitiesByKey[key].push(place)
   }
 
+  // Only treat a region as redundant when a same-named locality covers most
+  // of the region's bbox area. A bare bbox-contains check would drop legit
+  // regions that simply happen to contain a same-named city (e.g. New York
+  // state contains New York city).
+  var REDUNDANT_AREA_SHARE = 0.5
+
   var dropById = Object.create(null)
   for (var i = 0; i < places.length; i++) {
     var region = places[i]
@@ -797,6 +803,8 @@ function pruneRedundantRegions(places) {
       maxLat: region.bboxMaxLat,
       maxLon: region.bboxMaxLon
     }
+    var regionAreaKm2 = bboxAreaKm2(regionBbox)
+    if (!(regionAreaKm2 > 0)) continue
 
     for (var j = 0; j < matchingLocalities.length; j++) {
       var locality = matchingLocalities[j]
@@ -807,13 +815,16 @@ function pruneRedundantRegions(places) {
         maxLon: locality.bboxMaxLon
       }
 
-      if (geometry.bboxContainsBbox(regionBbox, localityBbox)) {
-        dropById[region.id] = {
-          placeId: region.id,
-          replacedBy: locality.id
-        }
-        break
+      if (!geometry.bboxContainsBbox(regionBbox, localityBbox)) continue
+
+      var localityAreaKm2 = bboxAreaKm2(localityBbox)
+      if (localityAreaKm2 / regionAreaKm2 < REDUNDANT_AREA_SHARE) continue
+
+      dropById[region.id] = {
+        placeId: region.id,
+        replacedBy: locality.id
       }
+      break
     }
   }
 

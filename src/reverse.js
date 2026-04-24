@@ -142,7 +142,7 @@ function fetchCompactBoundaryMatchV2(geocoder, hashes) {
       p.country_id AS country_id,
       p.country_id AS country_name,
       p.admin1_id AS admin1_id,
-      '' AS admin1_name,
+      COALESCE(a.name, '') AS admin1_name,
       p.latitude AS latitude,
       p.longitude AS longitude,
       CASE p.placetype_code
@@ -156,6 +156,7 @@ function fetchCompactBoundaryMatchV2(geocoder, hashes) {
       0 AS area
     FROM compact_geohash_lookup l
     JOIN compact_places p ON p.id = l.place_id
+    LEFT JOIN compact_places a ON a.id = p.admin1_id AND a.placetype_code = 2
     WHERE l.geohash IN (${placeholders})
       AND p.placetype_code IN (${placetypePlaceholders})
     ORDER BY
@@ -461,7 +462,7 @@ function fetchNearestCompactByRegionV2(geocoder, latitude, longitude, region) {
       p.country_id AS country_id,
       p.country_id AS country_name,
       p.admin1_id AS admin1_id,
-      '' AS admin1_name,
+      COALESCE(a.name, '') AS admin1_name,
       p.latitude AS latitude,
       p.longitude AS longitude,
       CASE p.placetype_code
@@ -474,6 +475,7 @@ function fetchNearestCompactByRegionV2(geocoder, latitude, longitude, region) {
       0 AS priority_rank,
       0 AS area
     FROM compact_places p
+    LEFT JOIN compact_places a ON a.id = p.admin1_id AND a.placetype_code = 2
     WHERE ${where.join(' AND ')}
     ORDER BY
       ((? - p.latitude) * (? - p.latitude) +
