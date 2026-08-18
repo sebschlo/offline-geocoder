@@ -17,6 +17,8 @@ set -euo pipefail
 #   WOF_LOCALITY_MAX_PRECISION     Locality max precision override (default: WOF_MAX_PRECISION)
 #   WOF_LOCALADMIN_MAX_PRECISION   Localadmin max precision override (default: WOF_MAX_PRECISION)
 #   WOF_COUNTY_MAX_PRECISION       County max precision override (default: WOF_MAX_PRECISION)
+#   WOF_COUNTY_DENSE_MAX_PRECISION Dense small-county precision (default: empty = rule off)
+#   WOF_COUNTY_DENSE_MAX_AREA_KM2  Bbox area threshold to apply dense county precision (default: empty = rule off)
 #   WOF_REGION_MAX_PRECISION       Region max precision override (default: 4)
 #   WOF_REGION_SPARSE_MAX_PRECISION  Sparse large-region precision (default: 3)
 #   WOF_REGION_SPARSE_MIN_AREA_KM2 Area threshold for sparse region precision (default: 80000)
@@ -51,6 +53,8 @@ WOF_MAX_PRECISION="${WOF_MAX_PRECISION:-5}"
 WOF_LOCALITY_MAX_PRECISION="${WOF_LOCALITY_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
 WOF_LOCALADMIN_MAX_PRECISION="${WOF_LOCALADMIN_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
 WOF_COUNTY_MAX_PRECISION="${WOF_COUNTY_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
+WOF_COUNTY_DENSE_MAX_PRECISION="${WOF_COUNTY_DENSE_MAX_PRECISION:-}"
+WOF_COUNTY_DENSE_MAX_AREA_KM2="${WOF_COUNTY_DENSE_MAX_AREA_KM2:-}"
 WOF_REGION_MAX_PRECISION="${WOF_REGION_MAX_PRECISION:-4}"
 WOF_REGION_SPARSE_MAX_PRECISION="${WOF_REGION_SPARSE_MAX_PRECISION:-3}"
 WOF_REGION_SPARSE_MIN_AREA_KM2="${WOF_REGION_SPARSE_MIN_AREA_KM2:-80000}"
@@ -147,6 +151,14 @@ COMMON_FLAGS=(
   --isolation-min-population "${WOF_ISOLATION_MIN_POPULATION}"
   --ensure-country-locality "${WOF_ENSURE_COUNTRY_LOCALITY}"
 )
+
+if [[ -n "${WOF_COUNTY_DENSE_MAX_PRECISION}" ]]; then
+  COMMON_FLAGS+=(--county-dense-max-precision "${WOF_COUNTY_DENSE_MAX_PRECISION}")
+fi
+
+if [[ -n "${WOF_COUNTY_DENSE_MAX_AREA_KM2}" ]]; then
+  COMMON_FLAGS+=(--county-dense-max-area-km2 "${WOF_COUNTY_DENSE_MAX_AREA_KM2}")
+fi
 
 if [[ -n "${WOF_MAX_PLACES}" ]]; then
   COMMON_FLAGS+=(--max-places "${WOF_MAX_PLACES}")
