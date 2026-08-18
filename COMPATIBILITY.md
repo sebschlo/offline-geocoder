@@ -36,32 +36,38 @@ Builders (`scripts/generate_boundary_index.js` and friends):
 
 ## Known schema generations
 
-Every generation that ever shipped stays supported. Newest first:
+Every generation that ever shipped stays supported. A generation may be
+cataloged as *pending* while the change introducing it is still in review,
+so the reader-side guarantee is pinned ahead of the merge. Newest first:
 
-| # | Generation | Tables | Notes |
-|---|---|---|---|
-| 4 | Compact v2 + population/area | `compact_places` (+ nullable `population`, `area`) + `compact_geohash_lookup` | Extra columns rank append/merge conflicts in the builder; readers ignore them. Older compact v2 databases are upgraded in place on `--append`. |
-| 3 | Compact v2 | `compact_places` + `compact_geohash_lookup` | Seven-column `compact_places` (`id`, `name`, `country_id`, `admin1_id`, `placetype_code`, `latitude`, `longitude`). This is the generation bundled in shipped apps. No stored country display name — the reader uses `country_id` and resolves the admin1 name via a self-join on the region row. |
-| 2 | Compact legacy | `places` + `place_geohash_lookup` | Full-width `places` table with a flat geohash-to-place lookup; the reader joins `countries`/`admin1` for display names. |
-| 1 | Full boundary | `places` + `place_geohash_cover` + `place_geometry` | Runtime point-in-polygon over stored geometry. `place_geohash_lookup` exists but may be empty; the reader tries the compact lookup first and falls through to the polygon path. |
+| # | Generation | Status | Tables | Notes |
+|---|---|---|---|---|
+| 4 | Compact v2 + population/area | Pending — [PR #3](https://github.com/sebschlo/offline-geocoder/pull/3) | `compact_places` (+ nullable `population`, `area`) + `compact_geohash_lookup` | Proposed by the append/merge work: the extra nullable columns rank append conflicts in the builder, older compact v2 databases are upgraded in place on `--append`, and readers ignore the columns entirely. No released builder produces this yet; the fixture pins the reader guarantee in advance. |
+| 3 | Compact v2 | Shipped | `compact_places` + `compact_geohash_lookup` | Seven-column `compact_places` (`id`, `name`, `country_id`, `admin1_id`, `placetype_code`, `latitude`, `longitude`). This is the generation bundled in shipped apps. No stored country display name — the reader uses `country_id` and resolves the admin1 name via a self-join on the region row. |
+| 2 | Compact legacy | Shipped | `places` + `place_geohash_lookup` | Full-width `places` table with a flat geohash-to-place lookup; the reader joins `countries`/`admin1` for display names. |
+| 1 | Full boundary | Shipped | `places` + `place_geohash_cover` + `place_geometry` | Runtime point-in-polygon over stored geometry. `place_geohash_lookup` exists but may be empty; the reader tries the compact lookup first and falls through to the polygon path. |
+| 0 | Centroid-only (v1.0.0) | Shipped | `features` + `coordinates` + `countries` + `admin1` + `everything` view | The originally released schema: four-column `features` (no `asciiname`, no `population`) and no boundary tables. Centroid reverse and id lookup work; forward geocoding feature-detects the missing columns and returns `undefined`; a boundary-mode reader falls through to the centroid path. |
 
-All generations may additionally carry the GeoNames base tables
-(`features`, `coordinates`, `countries`, `admin1` and the `everything`
-view) used by centroid mode, forward geocoding, and id lookup.
+The boundary generations (1–4) may additionally carry the GeoNames base
+tables of generation 0 (in their current widened form) for centroid mode,
+forward geocoding, and id lookup.
 
 ## Enforcement
 
-Every shipped schema generation has a **permanent fixture** in
+Every known schema generation has a **permanent fixture** in
 [`spec/reader_compatibility_spec.js`](spec/reader_compatibility_spec.js).
 Each fixture builds a database with the frozen schema of its generation —
 deliberately not derived from `scripts/schema.sql` or the builder, which
-move forward over time — and asserts that reverse lookups in boundary mode
-return the expected results.
+move forward over time — and asserts the reader paths that generation
+supports (boundary and/or centroid reverse, id lookup, graceful forward
+degradation).
 
 Rules for contributors:
 
-- **Never modify an existing generation fixture.** They pin history; a
-  change that requires editing one is a compatibility break by definition.
+- **Never modify the fixture of a shipped generation.** They pin history;
+  a change that requires editing one is a compatibility break by
+  definition. A *pending* generation's fixture may still be amended until
+  the change introducing it ships.
 - When you ship a new schema generation: add a new fixture block to
   `spec/reader_compatibility_spec.js` and a new row to the table above.
 - Reader changes must keep every existing fixture green.
