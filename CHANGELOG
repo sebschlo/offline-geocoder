@@ -1,3 +1,8 @@
+### Unreleased
+
+- Run the test suite in GitHub Actions on pushes to master and all pull
+  requests (Node 20.x and 22.x)
+
 ### 1.0.0 - 2018-08-02
 
 - Add bug fix for reverse lookup in rural/remote areas (@cosorio94)
