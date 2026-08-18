@@ -1,7 +1,8 @@
 ### Unreleased
 
 - Run the test suite in GitHub Actions on pushes to master and all pull
-  requests (Node 20.x and 22.x)
+  requests (Node 20.x and 22.x); raise Jasmine's per-hook timeout so
+  fixture-database construction survives slow shared runners
 
 ### 1.0.0 - 2018-08-02
 
