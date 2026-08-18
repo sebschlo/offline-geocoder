@@ -1,3 +1,9 @@
+### Unreleased
+
+- Document the database backwards-compatibility contract in COMPATIBILITY.md
+  and enforce it with permanent per-generation reader fixtures in
+  spec/reader_compatibility_spec.js
+
 ### 1.0.0 - 2018-08-02
 
 - Add bug fix for reverse lookup in rural/remote areas (@cosorio94)
