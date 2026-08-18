@@ -36,6 +36,7 @@
     "test": "jasmine",
     "build:boundary": "node scripts/generate_boundary_index.js",
     "build:wof": "bash scripts/generate_wof_boundary.sh",
+    "curate": "node scripts/apply_curation.js",
     "validate:locationiq": "node scripts/validate_with_locationiq.js"
   },
   "author": "Luca Spiller",

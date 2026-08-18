@@ -1,0 +1,19 @@
+{
+  "country": "GT",
+  "entries": [
+    {
+      "op": "merge",
+      "into": 421169087,
+      "absorb": [421191461, 1108695621, 421185999],
+      "minPrecision": 5,
+      "rationale": "The Carretera a El Salvador corridor (Santa Catarina Pinula 1108695621, Fraijanes 421185999) functions as part of Guatemala City, and the municipality of Guatemala (421191461) is named bare 'Guatemala', which reads as a country-level label. Coarse cells keep their original owner so remote fallback points stay country-ish. Mixco and Villa Nueva intentionally keep their own names.",
+      "probes": [
+        { "lat": 14.5330, "lon": -90.4350, "expect": "Guatemala City", "note": "km 18 Carretera a El Salvador" },
+        { "lat": 14.5400, "lon": -90.4430, "expect": "Guatemala City", "note": "km 17 corridor" },
+        { "lat": 14.6007, "lon": -90.5133, "expect": "Guatemala City", "note": "zona 14" },
+        { "lat": 14.6339, "lon": -90.6064, "expect": "Mixco", "note": "guard: Mixco stays itself" },
+        { "lat": 14.5567, "lon": -90.7337, "expect": "Antigua Guatemala", "note": "guard: curation must not leak beyond the metro" }
+      ]
+    }
+  ]
+}

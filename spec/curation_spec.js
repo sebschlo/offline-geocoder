@@ -1,0 +1,456 @@
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const sqlite3 = require('sqlite3');
+const geohash = require('../src/geohash');
+const curation = require('../scripts/apply_curation.js');
+
+const SCRIPT = path.join(__dirname, '..', 'scripts', 'apply_curation.js');
+
+const CITY = 8000001;
+const EAST = 8000002;
+const WEST = 8000003;
+const BYSTANDER = 8000004;
+const GHOST = 8000005;
+
+const points = {
+  city: { lat: 10.2, lon: 10.2 },
+  east: { lat: 20.2, lon: 20.2 },
+  west: { lat: 30.2, lon: 30.2 },
+  bystander: { lat: -20.2, lon: -20.2 },
+  ghost: { lat: 40.2, lon: 40.2 }
+};
+
+// Cells owned by each place: one precision-4 (coarse fallback) cell and, for
+// the counties, one precision-5 (fine) cell containing the place's point.
+const cells = {
+  cityCoarse: geohash.encode(points.city.lat, points.city.lon, 4),
+  eastFine: geohash.encode(points.east.lat, points.east.lon, 5),
+  westFine: geohash.encode(points.west.lat, points.west.lon, 5),
+  bystanderFine: geohash.encode(points.bystander.lat, points.bystander.lon, 5)
+};
+cells.eastCoarse = cells.eastFine.slice(0, 4);
+cells.westCoarse = cells.westFine.slice(0, 4);
+cells.bystanderCoarse = cells.bystanderFine.slice(0, 4);
+
+// A point inside the coarse (precision-4) cell but outside the fine
+// (precision-5) cell, so a reverse lookup there only matches the coarse row.
+function probeAvoidingChild(parentHash, childHash) {
+  const bbox = geohash.decodeBbox(parentHash);
+  const latSpan = bbox.maxLat - bbox.minLat;
+  const lonSpan = bbox.maxLon - bbox.minLon;
+  const candidates = [
+    { lat: bbox.minLat + latSpan * 0.03, lon: bbox.minLon + lonSpan * 0.03 },
+    { lat: bbox.maxLat - latSpan * 0.03, lon: bbox.maxLon - lonSpan * 0.03 },
+    { lat: bbox.minLat + latSpan * 0.03, lon: bbox.maxLon - lonSpan * 0.03 },
+    { lat: bbox.maxLat - latSpan * 0.03, lon: bbox.minLon + lonSpan * 0.03 }
+  ];
+
+  for (let i = 0; i < candidates.length; i++) {
+    if (geohash.encode(candidates[i].lat, candidates[i].lon, childHash.length) !== childHash) {
+      return candidates[i];
+    }
+  }
+
+  throw new Error('Could not find a probe point outside the child cell');
+}
+
+const coarseEastProbe = probeAvoidingChild(cells.eastCoarse, cells.eastFine);
+
+function exec(db, sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+function all(db, sql) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, [], (err, rows) => (err ? reject(err) : resolve(rows || [])));
+  });
+}
+
+function close(db) {
+  return new Promise((resolve, reject) => {
+    db.close((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+async function seedCompactDb(dbPath) {
+  const db = new sqlite3.Database(dbPath);
+  try {
+    await exec(db, `
+      CREATE TABLE compact_places(
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        country_id TEXT NOT NULL,
+        admin1_id INTEGER,
+        placetype_code INTEGER NOT NULL,
+        latitude REAL NOT NULL,
+        longitude REAL NOT NULL
+      );
+
+      CREATE TABLE compact_geohash_lookup(
+        geohash TEXT PRIMARY KEY,
+        place_id INTEGER NOT NULL,
+        FOREIGN KEY (place_id) REFERENCES compact_places(id)
+      );
+
+      INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude) VALUES
+        (${CITY}, 'Big City', 'US', 5, 0, ${points.city.lat}, ${points.city.lon}),
+        (${EAST}, 'East County', 'US', 5, 3, ${points.east.lat}, ${points.east.lon}),
+        (${WEST}, 'West County', 'US', 5, 3, ${points.west.lat}, ${points.west.lon}),
+        (${BYSTANDER}, 'Bystander County', 'US', 5, 3, ${points.bystander.lat}, ${points.bystander.lon}),
+        (${GHOST}, 'Ghost Town', 'US', 5, 0, ${points.ghost.lat}, ${points.ghost.lon});
+
+      INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES
+        ('${cells.cityCoarse}', ${CITY}),
+        ('${cells.eastCoarse}', ${EAST}),
+        ('${cells.eastFine}', ${EAST}),
+        ('${cells.westCoarse}', ${WEST}),
+        ('${cells.westFine}', ${WEST}),
+        ('${cells.bystanderCoarse}', ${BYSTANDER}),
+        ('${cells.bystanderFine}', ${BYSTANDER});
+    `);
+  } finally {
+    await close(db);
+  }
+}
+
+async function lookupSnapshot(dbPath) {
+  const db = new sqlite3.Database(dbPath);
+  try {
+    return await all(db, 'SELECT geohash, place_id FROM compact_geohash_lookup ORDER BY geohash ASC');
+  } finally {
+    await close(db);
+  }
+}
+
+function ownerOf(rows, hash) {
+  const row = rows.find((candidate) => candidate.geohash === hash);
+  return row ? row.place_id : undefined;
+}
+
+function baseDoc() {
+  return {
+    country: 'US',
+    entries: [
+      {
+        op: 'merge',
+        into: CITY,
+        absorb: [EAST, WEST],
+        minPrecision: 5,
+        rationale: 'Synthetic metro: East County and West County function as part of Big City at street-level precision.',
+        probes: [
+          { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'absorbed fine cell reads as the city' },
+          { lat: coarseEastProbe.lat, lon: coarseEastProbe.lon, expect: 'East County', note: 'coarse fallback keeps its owner' },
+          { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard: bystander untouched' }
+        ]
+      }
+    ]
+  };
+}
+
+function writeDoc(dir, name, doc) {
+  const docPath = path.join(dir, name);
+  fs.writeFileSync(docPath, typeof doc === 'string' ? doc : JSON.stringify(doc, null, 2));
+  return docPath;
+}
+
+function runCurate(args) {
+  return spawnSync('node', [SCRIPT].concat(args), { encoding: 'utf8' });
+}
+
+describe('curation overlay (scripts/apply_curation.js)', () => {
+  it('relabels absorbed cells at or above minPrecision to the merge target', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(0);
+      expect(result.stdout).toContain('relabeled 2 cell(s)');
+
+      const rows = await lookupSnapshot(dbPath);
+      expect(ownerOf(rows, cells.eastFine)).toEqual(CITY);
+      expect(ownerOf(rows, cells.westFine)).toEqual(CITY);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps coarse cells below minPrecision with their original owner', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(0);
+
+      const rows = await lookupSnapshot(dbPath);
+      expect(ownerOf(rows, cells.eastCoarse)).toEqual(EAST);
+      expect(ownerOf(rows, cells.westCoarse)).toEqual(WEST);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves places outside the entry untouched', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(0);
+
+      const rows = await lookupSnapshot(dbPath);
+      expect(ownerOf(rows, cells.bystanderCoarse)).toEqual(BYSTANDER);
+      expect(ownerOf(rows, cells.bystanderFine)).toEqual(BYSTANDER);
+      expect(ownerOf(rows, cells.cityCoarse)).toEqual(CITY);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps absorbed places in compact_places', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const places = await all(db, `SELECT id FROM compact_places WHERE id IN (${EAST}, ${WEST}) ORDER BY id ASC`);
+        expect(places).toEqual([{ id: EAST }, { id: WEST }]);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is idempotent: a second apply changes nothing', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+
+      const first = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(first.status).toEqual(0);
+      const afterFirst = await lookupSnapshot(dbPath);
+
+      const second = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(second.status).toEqual(0);
+      expect(second.stdout).toContain('relabeled 0 cell(s)');
+
+      const afterSecond = await lookupSnapshot(dbPath);
+      expect(afterSecond).toEqual(afterFirst);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an entry referencing a place id missing from the database and writes nothing', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      const doc = baseDoc();
+      doc.entries[0].absorb = [EAST, 9999999];
+      const docPath = writeDoc(dir, 'tc.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('9999999');
+      expect(result.stderr).toContain('not found in compact_places');
+
+      const after = await lookupSnapshot(dbPath);
+      expect(after).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an entry whose merge target also appears in absorb and writes nothing', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      const doc = baseDoc();
+      doc.entries[0].absorb = [CITY, EAST];
+      const docPath = writeDoc(dir, 'tc.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('both "into" and an "absorb"');
+
+      const after = await lookupSnapshot(dbPath);
+      expect(after).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed curation files with a clear message', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      const brokenJson = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'broken.json', '{ this is not json')
+      ]);
+      expect(brokenJson.status).toEqual(1);
+      expect(brokenJson.stderr).toContain('Failed to parse curation file');
+
+      const badPrecision = baseDoc();
+      badPrecision.entries[0].minPrecision = 'five';
+      const badPrecisionResult = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'bad-precision.json', badPrecision)
+      ]);
+      expect(badPrecisionResult.status).toEqual(1);
+      expect(badPrecisionResult.stderr).toContain('minPrecision');
+
+      const badOp = baseDoc();
+      badOp.entries[0].op = 'delete';
+      const badOpResult = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'bad-op.json', badOp)
+      ]);
+      expect(badOpResult.status).toEqual(1);
+      expect(badOpResult.stderr).toContain('"op"');
+
+      const typoField = baseDoc();
+      typoField.entries[0].minPrecison = 5;
+      const typoResult = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'typo.json', typoField)
+      ]);
+      expect(typoResult.status).toEqual(1);
+      expect(typoResult.stderr).toContain('unknown field "minPrecison"');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports affected rows in dry-run mode without writing', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--dry-run']);
+      expect(result.status).toEqual(0);
+      expect(result.stdout).toContain('would relabel 2 cell(s)');
+
+      const after = await lookupSnapshot(dbPath);
+      expect(after).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('verifies probes through the reverse geocoder after applying', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(result.status).toEqual(0);
+      expect(result.stdout).toContain('Probes passed: 3, skipped: 0, failed: 0');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails verification with a nonzero exit when a probe mismatches', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      const doc = baseDoc();
+      doc.entries[0].probes = [
+        { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Big City', note: 'deliberately wrong' }
+      ];
+      const docPath = writeDoc(dir, 'tc.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('FAIL');
+      expect(result.stderr).toContain('expected "Big City", got "Bystander County"');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('skips probes whose expected place owns no cells only with --skip-unresolvable', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // Ghost Town exists in compact_places but owns no lookup cells, and the
+      // probed coordinate resolves to another place — the situation of a
+      // curation file shipped ahead of the data build that makes it effective.
+      const doc = baseDoc();
+      doc.entries[0].probes.push({
+        lat: points.east.lat,
+        lon: points.east.lon,
+        expect: 'Ghost Town',
+        note: 'expected place owns no cells yet'
+      });
+      const docPath = writeDoc(dir, 'tc.json', doc);
+
+      const skipped = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(skipped.status).toEqual(0);
+      expect(skipped.stderr).toContain('owns no cells in this database yet');
+      expect(skipped.stdout).toContain('Probes passed: 3, skipped: 1, failed: 0');
+
+      const strict = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(strict.status).toEqual(1);
+      expect(strict.stderr).toContain('--skip-unresolvable');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ships a structurally valid Guatemala curation file', () => {
+    const gtPath = path.join(__dirname, '..', 'curation', 'gt.json');
+    const doc = JSON.parse(fs.readFileSync(gtPath, 'utf8'));
+
+    let entries;
+    expect(() => {
+      entries = curation.validateCurationDocument(doc, 'curation/gt.json');
+    }).not.toThrow();
+
+    expect(entries.length).toEqual(1);
+    expect(entries[0].op).toEqual('merge');
+    expect(entries[0].into).toEqual(421169087);
+    expect(entries[0].absorb).toEqual([421191461, 1108695621, 421185999]);
+    expect(entries[0].minPrecision).toEqual(5);
+    expect(entries[0].probes.length).toEqual(5);
+  });
+});

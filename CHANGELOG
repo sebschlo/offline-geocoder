@@ -1,3 +1,7 @@
+### Unreleased
+
+- Add curation overlay mechanism (`curation/`, `scripts/apply_curation.js`, `npm run curate`) for judgment calls the build rules cannot derive from data, with the first entry: Guatemala City absorbs the Carretera a El Salvador corridor municipalities at fine precision only
+
 ### 1.0.0 - 2018-08-02
 
 - Add bug fix for reverse lookup in rural/remote areas (@cosorio94)
