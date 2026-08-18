@@ -1,3 +1,7 @@
+### Unreleased
+
+- Add `sample` and `sweep` subcommands to `scripts/validate_with_locationiq.js`: a quota-aware, resumable world validation sweep against LocationIQ (JSONL response cache keyed by rounded coordinates, persisted per-UTC-day request cap, per-country Markdown mismatch report plus machine-readable mismatch JSONL, `--dry-run` for cache-only evaluation) and a GeoNames-TSV sampler that picks the top-N most populous places per country. Name comparison now preserves non-Latin scripts.
+
 ### 1.0.0 - 2018-08-02
 
 - Add bug fix for reverse lookup in rural/remote areas (@cosorio94)

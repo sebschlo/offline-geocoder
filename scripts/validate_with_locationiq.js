@@ -11,9 +11,14 @@ const geohash = require('../src/geohash')
 
 function usage() {
   return [
-    'Usage: node scripts/validate_with_locationiq.js --database <geocoder.sqlite> [options]',
+    'Usage:',
+    '  node scripts/validate_with_locationiq.js [legacy options]   Random-sample validation of one database (options below)',
+    '  node scripts/validate_with_locationiq.js sample [options]   Build a world points file from a GeoNames-style TSV',
+    '  node scripts/validate_with_locationiq.js sweep [options]    Quota-aware, resumable world validation sweep',
     '',
-    'Options:',
+    'Run `sample --help` or `sweep --help` for the subcommand options.',
+    '',
+    'Legacy options:',
     '  --database <path>              Geocoder SQLite database to validate (required)',
     '  --api-key <key>                LocationIQ API key (or env LOCATIONIQ_API_KEY)',
     '  --samples <n>                  Number of sample points to evaluate (default: 200)',
@@ -403,7 +408,7 @@ function normalizeName(value) {
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim()
     .replace(/\s+/g, ' ')
 }
@@ -576,7 +581,7 @@ function fetchJson(endpointUrl, timeoutMs) {
   })
 }
 
-function buildLocationIqUrl(endpoint, apiKey, latitude, longitude) {
+function buildLocationIqUrl(endpoint, apiKey, latitude, longitude, acceptLanguage) {
   var url = new URL(endpoint)
   url.searchParams.set('key', apiKey)
   url.searchParams.set('lat', String(latitude))
@@ -584,6 +589,9 @@ function buildLocationIqUrl(endpoint, apiKey, latitude, longitude) {
   url.searchParams.set('format', 'json')
   url.searchParams.set('normalizecity', '1')
   url.searchParams.set('addressdetails', '1')
+  if (acceptLanguage) {
+    url.searchParams.set('accept-language', acceptLanguage)
+  }
   return url.toString()
 }
 
@@ -891,7 +899,865 @@ async function main() {
   }
 }
 
-main().catch(function(err) {
-  console.error(err.message || err)
-  process.exit(1)
-})
+// ---------------------------------------------------------------------------
+// World validation sweep (subcommands: sample, sweep)
+//
+// `sample` turns a GeoNames-style TSV (cities1000 format) into a JSONL points
+// file with the top-N most populous places per country. `sweep` reverse
+// geocodes every point with LocationIQ (JSONL response cache, persisted UTC
+// daily request cap) and compares the answers against the offline geocoder,
+// ranking countries by mismatch rate in a Markdown report.
+// ---------------------------------------------------------------------------
+
+var SWEEP_CACHE_DECIMALS = 4
+var SWEEP_TIMEOUT_MS = 20000
+var SWEEP_DEFAULT_WORKDIR = 'tmp/locationiq-sweep'
+var SWEEP_SEVERITY = {
+  country_mismatch: 3,
+  offline_empty: 2,
+  name_mismatch: 1
+}
+
+var LIQ_LOCALITY_KEYS = ['city', 'town', 'village', 'municipality', 'hamlet', 'borough', 'suburb', 'city_district', 'district', 'quarter', 'neighbourhood']
+var LIQ_COUNTY_KEYS = ['county', 'state_district']
+var LIQ_STATE_KEYS = ['state', 'region', 'province']
+
+function sampleUsage() {
+  return [
+    'Usage: node scripts/validate_with_locationiq.js sample --geonames <places.tsv> [options]',
+    '',
+    'Builds a JSONL points file ({lat, lon, country, name, population} per line)',
+    'from a GeoNames-style TSV (the cities1000 format: tab separated, feature',
+    'class in column 7, country code in column 9, population in column 15).',
+    'Rows whose feature class is not P are skipped. No data file is committed to',
+    'the repository; download e.g. cities1000.zip from download.geonames.org.',
+    '',
+    'Options:',
+    '  --geonames <path>    GeoNames-style TSV input (required)',
+    '  --out <path>         Output JSONL points file (default: ' + SWEEP_DEFAULT_WORKDIR + '/points.jsonl)',
+    '  --per-country <n>    Places per country, most populous first (default: 25)',
+    '  --max-points <n>     Optional total cap, filled round-robin by rank so every country keeps coverage',
+    '  --help, -h           Show this help message'
+  ].join('\n')
+}
+
+function sweepUsage() {
+  return [
+    'Usage: node scripts/validate_with_locationiq.js sweep --points <points.jsonl> --database <geocoder.sqlite> [options]',
+    '',
+    'Reverse geocodes every point with LocationIQ and compares the answer to the',
+    'offline geocoder. Every LocationIQ response is cached (JSONL, keyed by',
+    'coordinates rounded to ' + SWEEP_CACHE_DECIMALS + ' decimals); cached points are never re-queried, so',
+    're-running the same command resumes where the previous run stopped. A state',
+    'file records the UTC date and request count, so multiple runs on the same',
+    'UTC day share one daily cap. On HTTP 429 the run backs off and stops',
+    'cleanly. Designed for LocationIQ\'s free tier; run one sweep at a time.',
+    '',
+    'Options:',
+    '  --points <path>          JSONL points file (required; see the sample subcommand)',
+    '  --database <path>        Offline geocoder SQLite database (required)',
+    '  --workdir <path>         Directory for cache/state/report files (default: ' + SWEEP_DEFAULT_WORKDIR + ')',
+    '  --cache <path>           LocationIQ response cache (default: <workdir>/cache.jsonl)',
+    '  --state <path>           Daily quota state file (default: <workdir>/quota.json)',
+    '  --report <path>          Markdown report output (default: <workdir>/report.md)',
+    '  --mismatches <path>      Mismatch JSONL output (default: <workdir>/mismatches.jsonl)',
+    '  --api-key <key>          LocationIQ API key (or env LOCATIONIQ_API_KEY)',
+    '  --daily-cap <n>          Max LocationIQ requests per UTC day, all runs combined (default: 4500)',
+    '  --rps <n>                Max LocationIQ requests per second (default: 1)',
+    '  --max-requests <n>       Optional per-run request limit (useful for smoke tests)',
+    '  --endpoint <url>         LocationIQ reverse endpoint (default: https://us1.locationiq.com/v1/reverse)',
+    '  --accept-language <tag>  Accept-language sent to LocationIQ (default: en; empty to disable)',
+    '  --reverse-mode <mode>    centroid|boundary (default: boundary)',
+    '  --base-precision <n>     Boundary lookup base precision (default: 4)',
+    '  --max-precision <n>      Boundary lookup max precision (default: 7)',
+    '  --dry-run                No network: evaluate cached responses only and rebuild the report',
+    '  --help, -h               Show this help message',
+    '',
+    'Example:',
+    '  node scripts/validate_with_locationiq.js sample --geonames tmp/cities1000.txt --per-country 25',
+    '  LOCATIONIQ_API_KEY=... node scripts/validate_with_locationiq.js sweep \\',
+    '    --points ' + SWEEP_DEFAULT_WORKDIR + '/points.jsonl --database tmp/world.sqlite',
+    '  node scripts/validate_with_locationiq.js sweep \\',
+    '    --points ' + SWEEP_DEFAULT_WORKDIR + '/points.jsonl --database tmp/world.sqlite --dry-run'
+  ].join('\n')
+}
+
+function utcDateString(date) {
+  return date.toISOString().slice(0, 10)
+}
+
+function sweepCoordKey(latitude, longitude) {
+  return Number(latitude).toFixed(SWEEP_CACHE_DECIMALS) + ',' + Number(longitude).toFixed(SWEEP_CACHE_DECIMALS)
+}
+
+// --- sample: GeoNames TSV -> points JSONL ----------------------------------
+
+function parseGeonamesLine(line) {
+  if (!line || !line.trim()) return null
+
+  var cols = line.split('\t')
+  if (cols.length < 15) return null
+
+  var latitude = Number(cols[4])
+  var longitude = Number(cols[5])
+  var featureClass = String(cols[6] || '').trim()
+  var country = String(cols[8] || '').trim().toUpperCase()
+  var population = Number(cols[14])
+
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) return null
+  if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) return null
+  if (featureClass !== 'P') return null
+  if (!/^[A-Z]{2}$/.test(country)) return null
+
+  return {
+    geonameid: Number(cols[0]) || 0,
+    name: String(cols[1] || '').trim(),
+    lat: latitude,
+    lon: longitude,
+    country: country,
+    population: Number.isFinite(population) && population > 0 ? Math.trunc(population) : 0
+  }
+}
+
+function selectTopPlaces(rows, perCountry, maxPoints) {
+  var byCountry = Object.create(null)
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i]
+    if (!byCountry[row.country]) byCountry[row.country] = []
+    byCountry[row.country].push(row)
+  }
+
+  var countries = Object.keys(byCountry).sort()
+  var total = 0
+  for (var c = 0; c < countries.length; c++) {
+    var list = byCountry[countries[c]]
+    list.sort(function(a, b) {
+      if (b.population !== a.population) return b.population - a.population
+      return a.geonameid - b.geonameid
+    })
+    byCountry[countries[c]] = list.slice(0, perCountry)
+    total += byCountry[countries[c]].length
+  }
+
+  var picked = []
+  if (maxPoints && total > maxPoints) {
+    // Fill round-robin by rank so a total cap trims depth per country instead
+    // of dropping whole countries.
+    for (var rank = 0; rank < perCountry && picked.length < maxPoints; rank++) {
+      for (var j = 0; j < countries.length && picked.length < maxPoints; j++) {
+        var ranked = byCountry[countries[j]]
+        if (rank < ranked.length) picked.push(ranked[rank])
+      }
+    }
+  } else {
+    for (var k = 0; k < countries.length; k++) {
+      picked = picked.concat(byCountry[countries[k]])
+    }
+  }
+
+  picked.sort(function(a, b) {
+    if (a.country !== b.country) return a.country < b.country ? -1 : 1
+    if (b.population !== a.population) return b.population - a.population
+    return a.geonameid - b.geonameid
+  })
+
+  return picked.map(function(place) {
+    return {
+      lat: place.lat,
+      lon: place.lon,
+      country: place.country,
+      name: place.name,
+      population: place.population
+    }
+  })
+}
+
+function buildSamplePoints(tsvText, perCountry, maxPoints) {
+  var lines = String(tsvText).split(/\r?\n/)
+  var rows = []
+  var skipped = 0
+  for (var i = 0; i < lines.length; i++) {
+    if (!lines[i].trim()) continue
+    var row = parseGeonamesLine(lines[i])
+    if (row) rows.push(row)
+    else skipped += 1
+  }
+  return {
+    points: selectTopPlaces(rows, perCountry, maxPoints),
+    parsed: rows.length,
+    skipped: skipped
+  }
+}
+
+function parseSampleArgs(argv) {
+  var opts = {
+    geonames: null,
+    out: path.resolve(SWEEP_DEFAULT_WORKDIR, 'points.jsonl'),
+    perCountry: 25,
+    maxPoints: null,
+    help: false
+  }
+
+  for (var i = 0; i < argv.length; i++) {
+    var arg = argv[i]
+
+    if (arg === '--geonames') {
+      opts.geonames = path.resolve(argv[++i])
+    } else if (arg === '--out') {
+      opts.out = path.resolve(argv[++i])
+    } else if (arg === '--per-country') {
+      opts.perCountry = Math.max(1, Math.trunc(Number(argv[++i])))
+    } else if (arg === '--max-points') {
+      var maxPoints = Number(argv[++i])
+      opts.maxPoints = Number.isFinite(maxPoints) && maxPoints > 0 ? Math.trunc(maxPoints) : null
+    } else if (arg === '--help' || arg === '-h') {
+      opts.help = true
+    } else {
+      throw new Error('Unknown sample argument: ' + arg)
+    }
+  }
+
+  return opts
+}
+
+async function sampleMain(argv) {
+  var opts = parseSampleArgs(argv)
+  if (opts.help) {
+    console.log(sampleUsage())
+    return
+  }
+
+  if (!opts.geonames) {
+    throw new Error('Missing required --geonames (see `sample --help`)')
+  }
+  if (!fs.existsSync(opts.geonames)) {
+    throw new Error('GeoNames TSV not found: ' + opts.geonames)
+  }
+  if (!Number.isFinite(opts.perCountry) || opts.perCountry <= 0) {
+    throw new Error('--per-country must be > 0')
+  }
+
+  var result = buildSamplePoints(fs.readFileSync(opts.geonames, 'utf8'), opts.perCountry, opts.maxPoints)
+  if (!result.points.length) {
+    throw new Error('No usable rows found in ' + opts.geonames)
+  }
+
+  var countries = Object.create(null)
+  var lines = []
+  for (var i = 0; i < result.points.length; i++) {
+    countries[result.points[i].country] = true
+    lines.push(JSON.stringify(result.points[i]))
+  }
+
+  fs.mkdirSync(path.dirname(opts.out), { recursive: true })
+  fs.writeFileSync(opts.out, lines.join('\n') + '\n', 'utf8')
+
+  console.log('Parsed rows: ' + result.parsed + ' (skipped ' + result.skipped + ')')
+  console.log('Points written: ' + result.points.length + ' across ' + Object.keys(countries).length + ' countries')
+  console.log('Points file: ' + opts.out)
+}
+
+// --- sweep: cache, quota state, comparison, report -------------------------
+
+function loadPointsFile(pointsPath) {
+  var lines = fs.readFileSync(pointsPath, 'utf8').split(/\r?\n/)
+  var points = []
+  var seen = Object.create(null)
+  var skipped = 0
+  var duplicates = 0
+
+  for (var i = 0; i < lines.length; i++) {
+    if (!lines[i].trim()) continue
+
+    var row
+    try {
+      row = JSON.parse(lines[i])
+    } catch (err) {
+      skipped += 1
+      continue
+    }
+
+    var lat = Number(row.lat !== undefined ? row.lat : row.latitude)
+    var lon = Number(row.lon !== undefined ? row.lon : row.longitude)
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180) {
+      skipped += 1
+      continue
+    }
+
+    var key = sweepCoordKey(lat, lon)
+    if (seen[key]) {
+      duplicates += 1
+      continue
+    }
+    seen[key] = true
+
+    points.push({
+      key: key,
+      lat: lat,
+      lon: lon,
+      country: row.country ? String(row.country).toUpperCase() : '',
+      name: row.name ? String(row.name) : '',
+      population: Number(row.population) || 0
+    })
+  }
+
+  return { points: points, skipped: skipped, duplicates: duplicates }
+}
+
+function loadSweepCache(cachePath) {
+  var map = Object.create(null)
+  if (!fs.existsSync(cachePath)) return map
+
+  var lines = fs.readFileSync(cachePath, 'utf8').split(/\r?\n/)
+  for (var i = 0; i < lines.length; i++) {
+    if (!lines[i].trim()) continue
+    try {
+      var entry = JSON.parse(lines[i])
+      if (entry && entry.key) map[entry.key] = entry
+    } catch (err) {
+      // Ignore torn/corrupt lines (e.g. from an interrupted write); the point
+      // will simply be fetched again.
+    }
+  }
+  return map
+}
+
+function appendSweepCache(cachePath, entry) {
+  fs.appendFileSync(cachePath, JSON.stringify(entry) + '\n', 'utf8')
+}
+
+function loadQuotaState(statePath, todayUtc) {
+  try {
+    var raw = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+    if (raw && raw.date === todayUtc && Number.isFinite(Number(raw.count))) {
+      return { date: todayUtc, count: Math.max(0, Math.trunc(Number(raw.count))) }
+    }
+  } catch (err) {
+    // Missing or unreadable state resets to zero for today.
+  }
+  return { date: todayUtc, count: 0 }
+}
+
+function saveQuotaState(statePath, state) {
+  fs.mkdirSync(path.dirname(statePath), { recursive: true })
+  fs.writeFileSync(statePath, JSON.stringify({ date: state.date, count: state.count }) + '\n', 'utf8')
+}
+
+function findLiqNameMatch(normalizedOfflineName, address, displayName) {
+  if (!normalizedOfflineName) return null
+
+  var groups = [LIQ_LOCALITY_KEYS, LIQ_COUNTY_KEYS, LIQ_STATE_KEYS]
+  for (var g = 0; g < groups.length; g++) {
+    var hit = matchAddressValue(normalizedOfflineName, address, groups[g])
+    if (hit) return hit.key
+  }
+
+  if (displayNameMatch(normalizedOfflineName, displayName)) {
+    return 'display_name'
+  }
+
+  return null
+}
+
+function comparePoint(point, offlineResult, cacheEntry) {
+  var body = cacheEntry && cacheEntry.body && typeof cacheEntry.body === 'object' ? cacheEntry.body : null
+  var address = body && body.address && typeof body.address === 'object' ? body.address : null
+  var liqOk = Boolean(cacheEntry && Number(cacheEntry.status) === 200 && address && !body.error)
+
+  var offlineName = offlineResult && offlineResult.name ? String(offlineResult.name) : ''
+  var offlineCountry = offlineResult && offlineResult.country && offlineResult.country.id
+    ? String(offlineResult.country.id).toUpperCase()
+    : ''
+
+  var record = {
+    key: point.key,
+    lat: point.lat,
+    lon: point.lon,
+    country: point.country || '',
+    sample_name: point.name || '',
+    offline_name: offlineName,
+    offline_country: offlineCountry,
+    liq_name: '',
+    liq_country: '',
+    liq_display_name: '',
+    verdict: '',
+    match_via: ''
+  }
+
+  if (liqOk) {
+    record.liq_name = extractLocationIqLocality(address)
+    record.liq_country = address.country_code ? String(address.country_code).toUpperCase() : ''
+    record.liq_display_name = body.display_name ? String(body.display_name) : ''
+  }
+  if (!record.country) {
+    record.country = record.liq_country || offlineCountry || '??'
+  }
+
+  if (!liqOk) {
+    record.verdict = offlineName ? 'liq_empty' : 'both_empty'
+  } else if (!offlineName) {
+    record.verdict = 'offline_empty'
+  } else if (offlineCountry && record.liq_country && offlineCountry !== record.liq_country) {
+    record.verdict = 'country_mismatch'
+  } else {
+    var via = findLiqNameMatch(normalizeName(offlineName), address, record.liq_display_name)
+    if (via) {
+      record.verdict = 'agree'
+      record.match_via = via
+    } else {
+      record.verdict = 'name_mismatch'
+    }
+  }
+
+  return record
+}
+
+function mdEscape(value) {
+  return String(value === undefined || value === null ? '' : value).replace(/\|/g, '\\|')
+}
+
+function formatAnswer(name, country, fallback) {
+  if (name) return name + (country ? ' (' + country + ')' : '')
+  if (fallback) return fallback.length > 60 ? fallback.slice(0, 57) + '...' : fallback
+  return '(no result)'
+}
+
+function buildSweepReport(params) {
+  var records = params.records || []
+  var perCountry = Object.create(null)
+  var totals = { agree: 0, country_mismatch: 0, name_mismatch: 0, offline_empty: 0, liq_empty: 0, both_empty: 0 }
+
+  for (var i = 0; i < records.length; i++) {
+    var record = records[i]
+    var bucket = perCountry[record.country]
+    if (!bucket) {
+      bucket = perCountry[record.country] = {
+        country: record.country,
+        evaluated: 0,
+        agree: 0,
+        country_mismatch: 0,
+        name_mismatch: 0,
+        offline_empty: 0,
+        liq_empty: 0,
+        both_empty: 0
+      }
+    }
+    bucket.evaluated += 1
+    if (bucket[record.verdict] !== undefined) bucket[record.verdict] += 1
+    if (totals[record.verdict] !== undefined) totals[record.verdict] += 1
+  }
+
+  var countryRows = Object.keys(perCountry).map(function(code) {
+    var bucket = perCountry[code]
+    bucket.verifiable = bucket.agree + bucket.country_mismatch + bucket.name_mismatch + bucket.offline_empty
+    bucket.mismatchRate = bucket.verifiable > 0 ? (bucket.verifiable - bucket.agree) / bucket.verifiable : 0
+    return bucket
+  })
+  countryRows.sort(function(a, b) {
+    if (b.mismatchRate !== a.mismatchRate) return b.mismatchRate - a.mismatchRate
+    if (b.verifiable !== a.verifiable) return b.verifiable - a.verifiable
+    return a.country < b.country ? -1 : (a.country > b.country ? 1 : 0)
+  })
+
+  var verifiable = totals.agree + totals.country_mismatch + totals.name_mismatch + totals.offline_empty
+  var agreementPct = verifiable > 0 ? (totals.agree * 100) / verifiable : 0
+
+  var worst = records
+    .filter(function(record) { return SWEEP_SEVERITY[record.verdict] })
+    .sort(function(a, b) {
+      var severity = (SWEEP_SEVERITY[b.verdict] || 0) - (SWEEP_SEVERITY[a.verdict] || 0)
+      if (severity !== 0) return severity
+      if (a.country !== b.country) return a.country < b.country ? -1 : 1
+      return a.key < b.key ? -1 : 1
+    })
+    .slice(0, 10)
+
+  var lines = []
+  lines.push('# LocationIQ world validation sweep')
+  lines.push('')
+  lines.push('- Generated: ' + params.generatedAt)
+  lines.push('- Offline database: `' + params.databaseLabel + '`')
+  lines.push('- Points file: `' + params.pointsPath + '` (' + params.totalPoints + ' points; ' +
+    records.length + ' evaluated, ' + params.unfetched + ' awaiting fetch)')
+  lines.push('- Verifiable points: ' + verifiable + ' — agreement ' + totals.agree + '/' + verifiable +
+    ' (' + agreementPct.toFixed(1) + '%)')
+  lines.push('- Mismatches: ' + (verifiable - totals.agree) + ' (country ' + totals.country_mismatch +
+    ', name ' + totals.name_mismatch + ', offline empty ' + totals.offline_empty + ')')
+  lines.push('- Unverifiable: ' + (totals.liq_empty + totals.both_empty) +
+    ' (LocationIQ empty ' + totals.liq_empty + ', both empty ' + totals.both_empty + ')')
+  lines.push('- Requests used on ' + params.quota.date + ' (UTC): ' + params.quota.count + '/' + params.dailyCap)
+  if (params.stopReason) {
+    lines.push('- Run stopped early: ' + params.stopReason + (params.stopDetail ? ' (' + params.stopDetail + ')' : ''))
+  }
+  lines.push('')
+  lines.push('## Countries ranked by mismatch rate (worst first)')
+  lines.push('')
+  lines.push('| Country | Points | Verifiable | Agreement | Country mismatch | Name mismatch | Offline empty | LIQ empty |')
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
+  for (var c = 0; c < countryRows.length; c++) {
+    var row = countryRows[c]
+    var pct = row.verifiable > 0 ? ((row.agree * 100) / row.verifiable).toFixed(1) + '%' : '-'
+    lines.push('| ' + mdEscape(row.country) + ' | ' + row.evaluated + ' | ' + row.verifiable + ' | ' + pct +
+      ' | ' + row.country_mismatch + ' | ' + row.name_mismatch + ' | ' + row.offline_empty + ' | ' + row.liq_empty + ' |')
+  }
+  lines.push('')
+  lines.push('## Worst examples')
+  lines.push('')
+  if (worst.length) {
+    lines.push('| Lat | Lon | Sampled place | Offline answer | LocationIQ answer | Verdict |')
+    lines.push('| ---: | ---: | --- | --- | --- | --- |')
+    for (var w = 0; w < worst.length; w++) {
+      var bad = worst[w]
+      lines.push('| ' + bad.lat + ' | ' + bad.lon +
+        ' | ' + mdEscape(formatAnswer(bad.sample_name, bad.country)) +
+        ' | ' + mdEscape(formatAnswer(bad.offline_name, bad.offline_country)) +
+        ' | ' + mdEscape(formatAnswer(bad.liq_name, bad.liq_country, bad.liq_display_name)) +
+        ' | ' + bad.verdict + ' |')
+    }
+  } else {
+    lines.push('No mismatches recorded.')
+  }
+  lines.push('')
+  lines.push('## Verdicts')
+  lines.push('')
+  lines.push('- `agree`: countries match and the offline name matches a LocationIQ locality/county/state field (or a display-name segment) after case/diacritics-insensitive normalization')
+  lines.push('- `country_mismatch` (severe): the two geocoders disagree on the country')
+  lines.push('- `name_mismatch`: countries match but no LocationIQ field matches the offline name')
+  lines.push('- `offline_empty`: LocationIQ answered but the offline geocoder returned nothing')
+  lines.push('- `liq_empty` / `both_empty`: LocationIQ had no answer — excluded from agreement figures')
+  lines.push('')
+  return lines.join('\n')
+}
+
+function writeSweepMismatches(mismatchesPath, records) {
+  var lines = []
+  for (var i = 0; i < records.length; i++) {
+    if (SWEEP_SEVERITY[records[i].verdict]) {
+      lines.push(JSON.stringify(records[i]))
+    }
+  }
+  fs.mkdirSync(path.dirname(mismatchesPath), { recursive: true })
+  fs.writeFileSync(mismatchesPath, lines.length ? lines.join('\n') + '\n' : '', 'utf8')
+  return lines.length
+}
+
+async function runSweep(opts, deps) {
+  var log = (deps && deps.log) || console.log
+  var sleepImpl = (deps && deps.sleep) || sleep
+  var nowImpl = (deps && deps.now) || function() { return new Date() }
+
+  if (!deps || typeof deps.fetchJson !== 'function') throw new Error('runSweep requires deps.fetchJson')
+  if (typeof deps.reverse !== 'function') throw new Error('runSweep requires deps.reverse')
+
+  var loaded = loadPointsFile(opts.pointsPath)
+  var points = loaded.points
+  if (!points.length) {
+    throw new Error('No usable points in ' + opts.pointsPath)
+  }
+  if (loaded.skipped || loaded.duplicates) {
+    log('Points file: skipped ' + loaded.skipped + ' invalid and ' + loaded.duplicates + ' duplicate rows')
+  }
+
+  fs.mkdirSync(path.dirname(opts.cachePath), { recursive: true })
+  var cache = loadSweepCache(opts.cachePath)
+  var todayUtc = utcDateString(nowImpl())
+  var state = loadQuotaState(opts.statePath, todayUtc)
+
+  var stopReason = null
+  var stopDetail = ''
+  var requestsThisRun = 0
+  var delayMs = Math.ceil(1000 / (opts.rps > 0 ? opts.rps : 1))
+  var lastRequestAt = 0
+
+  if (!opts.dryRun) {
+    for (var i = 0; i < points.length; i++) {
+      var point = points[i]
+      if (cache[point.key]) continue
+
+      if (state.count >= opts.dailyCap) {
+        stopReason = 'daily_cap'
+        break
+      }
+      if (opts.maxRequests !== null && opts.maxRequests !== undefined && requestsThisRun >= opts.maxRequests) {
+        stopReason = 'max_requests'
+        break
+      }
+
+      var waitMs = lastRequestAt + delayMs - Date.now()
+      if (waitMs > 0) await sleepImpl(waitMs)
+
+      // Count the attempt before it happens so a crash mid-request can only
+      // over-count, never let a later run exceed the cap.
+      state.count += 1
+      saveQuotaState(opts.statePath, state)
+      requestsThisRun += 1
+      lastRequestAt = Date.now()
+
+      var url = buildLocationIqUrl(opts.endpoint, opts.apiKey, point.lat, point.lon, opts.acceptLanguage)
+      var response
+      try {
+        response = await deps.fetchJson(url, SWEEP_TIMEOUT_MS)
+      } catch (err) {
+        stopReason = 'fetch_error'
+        stopDetail = String(err && err.message ? err.message : err)
+        break
+      }
+
+      var status = Number(response && response.status)
+      if (status === 200 || status === 400 || status === 404) {
+        // 200 is an answer; 404 is LocationIQ's definitive "unable to geocode"
+        // (e.g. open ocean) and 400 a definitive rejection of the coordinates —
+        // all cacheable so they are never asked again.
+        var entry = {
+          key: point.key,
+          lat: point.lat,
+          lon: point.lon,
+          status: status,
+          body: response.json,
+          fetched_at: new Date().toISOString()
+        }
+        appendSweepCache(opts.cachePath, entry)
+        cache[point.key] = entry
+      } else if (status === 401 || status === 403) {
+        stopReason = 'auth_error'
+        stopDetail = 'HTTP ' + status
+        break
+      } else if (status === 429) {
+        stopReason = 'rate_limited'
+        stopDetail = 'HTTP 429'
+        break
+      } else {
+        stopReason = 'server_error'
+        stopDetail = 'HTTP ' + status
+        break
+      }
+    }
+  }
+
+  var records = []
+  var verdictCounts = Object.create(null)
+  var unfetched = 0
+  for (var j = 0; j < points.length; j++) {
+    var entryForPoint = cache[points[j].key]
+    if (!entryForPoint) {
+      unfetched += 1
+      continue
+    }
+    var offlineResult = await deps.reverse(points[j].lat, points[j].lon)
+    var record = comparePoint(points[j], offlineResult || null, entryForPoint)
+    verdictCounts[record.verdict] = (verdictCounts[record.verdict] || 0) + 1
+    records.push(record)
+  }
+
+  var report = buildSweepReport({
+    generatedAt: new Date().toISOString(),
+    databaseLabel: opts.databaseLabel,
+    pointsPath: opts.pointsPath,
+    totalPoints: points.length,
+    unfetched: unfetched,
+    records: records,
+    quota: state,
+    dailyCap: opts.dailyCap,
+    stopReason: stopReason,
+    stopDetail: stopDetail
+  })
+  fs.mkdirSync(path.dirname(opts.reportPath), { recursive: true })
+  fs.writeFileSync(opts.reportPath, report, 'utf8')
+  var mismatchCount = writeSweepMismatches(opts.mismatchesPath, records)
+
+  log('Points: ' + points.length + ' total, ' + records.length + ' evaluated, ' + unfetched + ' awaiting fetch')
+  log('LocationIQ requests this run: ' + requestsThisRun + ' (today ' + state.date + ' UTC: ' + state.count + '/' + opts.dailyCap + ')')
+  log('Report: ' + opts.reportPath)
+  log('Mismatches: ' + opts.mismatchesPath + ' (' + mismatchCount + ' rows)')
+
+  if (stopReason === 'daily_cap') {
+    log('Daily request cap reached (' + state.count + '/' + opts.dailyCap + ' for ' + state.date + ' UTC). ' +
+      unfetched + ' points still unfetched. Re-run the same command after the next UTC day starts to resume; cached points are never re-queried.')
+  } else if (stopReason === 'rate_limited') {
+    log('LocationIQ returned HTTP 429 (rate limited). Backing off and stopping this run cleanly; all fetched responses are cached. Wait for the quota window to reset, then re-run the same command to resume.')
+  } else if (stopReason === 'auth_error') {
+    log('LocationIQ rejected the API key (' + stopDetail + '). Check LOCATIONIQ_API_KEY / --api-key, then re-run to resume.')
+  } else if (stopReason === 'fetch_error' || stopReason === 'server_error') {
+    log('Request failed (' + stopDetail + '). Stopping this run cleanly; re-run the same command to resume from the cache.')
+  } else if (stopReason === 'max_requests') {
+    log('Per-run request limit reached (--max-requests ' + opts.maxRequests + '). Re-run to continue.')
+  } else if (opts.dryRun && unfetched > 0) {
+    log('Dry run: ' + unfetched + ' points have no cached response yet; run without --dry-run to fetch them.')
+  } else if (unfetched === 0) {
+    log('All points have cached LocationIQ responses.')
+  }
+
+  return {
+    totalPoints: points.length,
+    evaluated: records.length,
+    unfetched: unfetched,
+    requestsThisRun: requestsThisRun,
+    quota: { date: state.date, count: state.count },
+    stopReason: stopReason,
+    stopDetail: stopDetail,
+    verdictCounts: verdictCounts,
+    mismatchCount: mismatchCount
+  }
+}
+
+function parseSweepArgs(argv) {
+  var opts = {
+    pointsPath: null,
+    database: null,
+    workdir: path.resolve(SWEEP_DEFAULT_WORKDIR),
+    cachePath: null,
+    statePath: null,
+    reportPath: null,
+    mismatchesPath: null,
+    apiKey: process.env.LOCATIONIQ_API_KEY || '',
+    endpoint: 'https://us1.locationiq.com/v1/reverse',
+    acceptLanguage: 'en',
+    dailyCap: 4500,
+    rps: 1,
+    maxRequests: null,
+    reverseMode: 'boundary',
+    basePrecision: 4,
+    maxPrecision: 7,
+    dryRun: false,
+    help: false
+  }
+
+  for (var i = 0; i < argv.length; i++) {
+    var arg = argv[i]
+
+    if (arg === '--points') {
+      opts.pointsPath = path.resolve(argv[++i])
+    } else if (arg === '--database' || arg === '-d') {
+      opts.database = path.resolve(argv[++i])
+    } else if (arg === '--workdir') {
+      opts.workdir = path.resolve(argv[++i])
+    } else if (arg === '--cache') {
+      opts.cachePath = path.resolve(argv[++i])
+    } else if (arg === '--state') {
+      opts.statePath = path.resolve(argv[++i])
+    } else if (arg === '--report') {
+      opts.reportPath = path.resolve(argv[++i])
+    } else if (arg === '--mismatches') {
+      opts.mismatchesPath = path.resolve(argv[++i])
+    } else if (arg === '--api-key') {
+      opts.apiKey = String(argv[++i] || '')
+    } else if (arg === '--endpoint') {
+      opts.endpoint = String(argv[++i] || opts.endpoint)
+    } else if (arg === '--accept-language') {
+      opts.acceptLanguage = String(argv[++i] || '')
+    } else if (arg === '--daily-cap') {
+      opts.dailyCap = Math.max(0, Math.trunc(Number(argv[++i])))
+    } else if (arg === '--rps') {
+      opts.rps = Math.max(0.1, Number(argv[++i]))
+    } else if (arg === '--max-requests') {
+      var maxRequests = Number(argv[++i])
+      opts.maxRequests = Number.isFinite(maxRequests) && maxRequests >= 0 ? Math.trunc(maxRequests) : null
+    } else if (arg === '--reverse-mode') {
+      opts.reverseMode = String(argv[++i] || 'boundary').toLowerCase()
+    } else if (arg === '--base-precision') {
+      opts.basePrecision = Math.max(1, Math.trunc(Number(argv[++i])))
+    } else if (arg === '--max-precision') {
+      opts.maxPrecision = Math.max(opts.basePrecision, Math.trunc(Number(argv[++i])))
+    } else if (arg === '--dry-run') {
+      opts.dryRun = true
+    } else if (arg === '--help' || arg === '-h') {
+      opts.help = true
+    } else {
+      throw new Error('Unknown sweep argument: ' + arg)
+    }
+  }
+
+  if (!opts.cachePath) opts.cachePath = path.join(opts.workdir, 'cache.jsonl')
+  if (!opts.statePath) opts.statePath = path.join(opts.workdir, 'quota.json')
+  if (!opts.reportPath) opts.reportPath = path.join(opts.workdir, 'report.md')
+  if (!opts.mismatchesPath) opts.mismatchesPath = path.join(opts.workdir, 'mismatches.jsonl')
+
+  return opts
+}
+
+async function sweepMain(argv) {
+  var opts = parseSweepArgs(argv)
+  if (opts.help) {
+    console.log(sweepUsage())
+    return
+  }
+
+  if (!opts.pointsPath) {
+    throw new Error('Missing required --points (see `sweep --help`; the sample subcommand builds one)')
+  }
+  if (!fs.existsSync(opts.pointsPath)) {
+    throw new Error('Points file not found: ' + opts.pointsPath)
+  }
+  if (!opts.database) {
+    throw new Error('Missing required --database')
+  }
+  if (!fs.existsSync(opts.database)) {
+    throw new Error('Database not found: ' + opts.database)
+  }
+  if (!opts.dryRun && !opts.apiKey) {
+    throw new Error('Missing LocationIQ API key (--api-key or LOCATIONIQ_API_KEY); use --dry-run to evaluate the cache without network')
+  }
+
+  fs.mkdirSync(opts.workdir, { recursive: true })
+
+  var geocoder = createGeocoder({
+    database: opts.database,
+    reverseMode: opts.reverseMode === 'centroid' ? 'centroid' : 'boundary',
+    boundary: {
+      basePrecision: opts.basePrecision,
+      maxPrecision: opts.maxPrecision
+    }
+  })
+
+  try {
+    opts.databaseLabel = opts.database
+    await runSweep(opts, {
+      fetchJson: fetchJson,
+      reverse: function(latitude, longitude) {
+        return geocoder.reverse(latitude, longitude)
+      },
+      sleep: sleep,
+      log: console.log
+    })
+  } finally {
+    if (geocoder && geocoder.db && typeof geocoder.db.close === 'function') {
+      await new Promise(function(resolve) {
+        geocoder.db.close(function() { resolve() })
+      })
+    }
+  }
+}
+
+function dispatch() {
+  var argv = process.argv.slice(2)
+  if (argv[0] === 'sample') return sampleMain(argv.slice(1))
+  if (argv[0] === 'sweep') return sweepMain(argv.slice(1))
+  if (argv.length && argv[0].charAt(0) !== '-') {
+    return Promise.reject(new Error('Unknown subcommand: ' + argv[0] + ' (expected sample, sweep or legacy options; see --help)'))
+  }
+  return main()
+}
+
+module.exports = {
+  normalizeName: normalizeName,
+  namesMatch: namesMatch,
+  extractLocationIqLocality: extractLocationIqLocality,
+  buildLocationIqUrl: buildLocationIqUrl,
+  parseGeonamesLine: parseGeonamesLine,
+  selectTopPlaces: selectTopPlaces,
+  buildSamplePoints: buildSamplePoints,
+  sweepCoordKey: sweepCoordKey,
+  utcDateString: utcDateString,
+  loadPointsFile: loadPointsFile,
+  loadQuotaState: loadQuotaState,
+  comparePoint: comparePoint,
+  buildSweepReport: buildSweepReport,
+  runSweep: runSweep
+}
+
+if (require.main === module) {
+  dispatch().catch(function(err) {
+    console.error(err.message || err)
+    process.exit(1)
+  })
+}

@@ -316,6 +316,36 @@ It creates/updates:
 
 Cache DB path is automatic (default behavior): `tmp/locationiq-validation-<database-basename>.sqlite`.
 
+### World Validation Sweep (LocationIQ)
+
+The same script also runs a quota-aware, resumable sweep over a world-wide
+points file and ranks countries by mismatch rate, so data work can be aimed at
+the worst areas first:
+
+```bash
+# 1. Build a points file from a GeoNames-style TSV (e.g. cities1000.txt):
+#    the top 25 most populous places per country. Not committed to the repo.
+node scripts/validate_with_locationiq.js sample \
+  --geonames tmp/cities1000.txt --per-country 25
+
+# 2. Run the sweep. Stays inside LocationIQ's free tier by default:
+#    max 4500 requests per UTC day (persisted across invocations) at 1 req/s.
+LOCATIONIQ_API_KEY=... node scripts/validate_with_locationiq.js sweep \
+  --points tmp/locationiq-sweep/points.jsonl --database tmp/world.sqlite
+
+# 3. Rebuild the report from cache only, no network:
+node scripts/validate_with_locationiq.js sweep \
+  --points tmp/locationiq-sweep/points.jsonl --database tmp/world.sqlite --dry-run
+```
+
+Every LocationIQ response is cached as JSONL keyed by coordinates rounded to
+four decimals, so re-running the same command never re-queries a cached point —
+if a run stops at the daily cap or on HTTP 429, just run it again later to
+resume. Outputs land under `--workdir` (default `tmp/locationiq-sweep/`):
+`report.md` (per-country point counts, agreement %, country mismatches, worst
+examples) and `mismatches.jsonl` (machine-readable list of all mismatches).
+See `sweep --help` and `sample --help` for all options.
+
 ## License
 
 This library is licensed under [the MIT license](https://github.com/lucaspiller/offline-geocoder/blob/master/LICENSE).
