@@ -151,6 +151,21 @@ function baseDoc() {
   };
 }
 
+// Minimal structurally-valid entry for conflict-validation tests, which fail
+// before any probe runs.
+function conflictEntry(into, absorb) {
+  return {
+    op: 'merge',
+    into: into,
+    absorb: absorb,
+    minPrecision: 5,
+    rationale: 'Synthetic entry for cross-entry conflict validation tests.',
+    probes: [
+      { lat: points.city.lat, lon: points.city.lon, expect: 'Big City' }
+    ]
+  };
+}
+
 function writeDoc(dir, name, doc) {
   const docPath = path.join(dir, name);
   fs.writeFileSync(docPath, typeof doc === 'string' ? doc : JSON.stringify(doc, null, 2));
@@ -385,11 +400,12 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
-  it('fails verification with a nonzero exit when a probe mismatches', async () => {
+  it('rolls back the overlay and exits nonzero when a probe mismatches', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
     try {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
 
       const doc = baseDoc();
       doc.entries[0].probes = [
@@ -401,6 +417,177 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       expect(result.status).toEqual(1);
       expect(result.stderr).toContain('FAIL');
       expect(result.stderr).toContain('expected "Big City", got "Bystander County"');
+      expect(result.stderr).toContain('rolled back');
+
+      // The failed overlay must not survive: absorbed cells keep their owners.
+      const after = await lookupSnapshot(dbPath);
+      expect(after).toEqual(before);
+
+      // On a database where all merge sources and the expected place own
+      // cells, a mismatch is genuine and must fail even with the escape flag.
+      const lenient = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(lenient.status).toEqual(1);
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('defers failing probes when a merge source owns no cells yet, only with --skip-unresolvable', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // The shipped-Guatemala situation: the merge target ('Big City') already
+      // owns cells elsewhere, but an absorbed place (Ghost Town) owns none, so
+      // a probe describing the post-rebuild end state cannot pass yet.
+      const doc = baseDoc();
+      doc.entries[0].absorb = [EAST, WEST, GHOST];
+      doc.entries[0].probes.push({
+        lat: points.bystander.lat,
+        lon: points.bystander.lon,
+        expect: 'Big City',
+        note: 'cannot pass until the absorbed place owns cells'
+      });
+      const docPath = writeDoc(dir, 'tc.json', doc);
+
+      const deferred = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(deferred.status).toEqual(0);
+      expect(deferred.stderr).toContain(`merge source(s) ${GHOST} own no cells in this database yet`);
+      expect(deferred.stdout).toContain('Probes passed: 3, skipped: 1, failed: 0');
+
+      const strict = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(strict.status).toEqual(1);
+      expect(strict.stderr).toContain('--skip-unresolvable');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('derives the verification precision range from the database', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      // A database built entirely outside the library's default 4..7 range:
+      // the only lookup row is a precision-8 cell. Verification must derive
+      // the range from the data or it will never query this row.
+      const dbPath = path.join(dir, 'fine.sqlite');
+      const fineCell = geohash.encode(points.east.lat, points.east.lon, 8);
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `
+          CREATE TABLE compact_places(
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            country_id TEXT NOT NULL,
+            admin1_id INTEGER,
+            placetype_code INTEGER NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL
+          );
+
+          CREATE TABLE compact_geohash_lookup(
+            geohash TEXT PRIMARY KEY,
+            place_id INTEGER NOT NULL,
+            FOREIGN KEY (place_id) REFERENCES compact_places(id)
+          );
+
+          INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude) VALUES
+            (${CITY}, 'Big City', 'US', 5, 0, ${points.city.lat}, ${points.city.lon}),
+            (${EAST}, 'East County', 'US', 5, 3, ${points.east.lat}, ${points.east.lon});
+
+          INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES
+            ('${fineCell}', ${EAST});
+        `);
+      } finally {
+        await close(db);
+      }
+
+      const doc = {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 8,
+            rationale: 'Synthetic: exercise verification on a precision-8 database.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'precision-8 cell' }
+            ]
+          }
+        ]
+      };
+      const docPath = writeDoc(dir, 'fine.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(result.status).toEqual(0);
+      expect(result.stdout).toContain('Probes passed: 1, skipped: 0, failed: 0');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects two entries absorbing the same place into different targets', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      const doc = {
+        country: 'US',
+        entries: [conflictEntry(CITY, [EAST]), conflictEntry(BYSTANDER, [EAST])]
+      };
+      const docPath = writeDoc(dir, 'conflict.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('conflicting "into" targets');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects merge chains where a target is itself absorbed by another entry', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      const doc = {
+        country: 'US',
+        entries: [conflictEntry(CITY, [EAST]), conflictEntry(EAST, [WEST])]
+      };
+      const docPath = writeDoc(dir, 'chain.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('merge chains are not allowed');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects duplicate absorption of the same place across files', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      const curationDir = path.join(dir, 'curation');
+      fs.mkdirSync(curationDir);
+      writeDoc(curationDir, 'aa.json', { country: 'US', entries: [conflictEntry(CITY, [EAST])] });
+      writeDoc(curationDir, 'bb.json', { country: 'US', entries: [conflictEntry(CITY, [EAST, WEST])] });
+
+      const result = runCurate(['--database', dbPath, '--curation', curationDir]);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('duplicate absorption');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

@@ -96,6 +96,10 @@ WHERE place_id IN (<absorb...>) AND LENGTH(geohash) >= <minPrecision>
   relabeled.
 - The operation is **idempotent by construction**: relabeled cells leave the
   absorbed set, so a second apply changes nothing.
+- Application order is **deterministic and irrelevant**: files are applied in
+  sorted path order and entries in file order, and cross-entry conflict
+  validation (see the conflict policy below) guarantees that every lookup row
+  is touched by at most one entry, so the final state never depends on order.
 
 ## Applying
 
@@ -112,8 +116,10 @@ npm run curate -- --database data/geocoder.sqlite --curation curation/ --dry-run
 
 All files are validated before anything is written: malformed JSON, unknown
 fields, ids missing from `compact_places`, and an id appearing as both `into`
-and `absorb` all abort with a clear message and a nonzero exit. The apply runs
-in a single transaction.
+and `absorb` all abort with a clear message and a nonzero exit. Validation is
+also **global across every loaded file** — conflicting or chained entries are
+rejected as a set (see the conflict policy below). The apply runs in a single
+transaction.
 
 Note that validation requires every referenced id to exist, so apply only the
 files for countries included in your build (a worldwide build can use the whole
@@ -125,13 +131,21 @@ directory).
 npm run curate -- --database data/geocoder.sqlite --curation curation/gt.json --verify
 ```
 
-`--verify` applies the entries, then runs each probe through the library's
-boundary reverse lookup and compares `result.name` to `expect`, exiting
-nonzero on any mismatch.
+`--verify` applies the entries and runs each probe through the library's
+boundary reverse lookup **inside the same transaction**, comparing
+`result.name` to `expect`. If any probe fails, the whole overlay is rolled
+back and the command exits nonzero with the database unchanged — a bad entry
+can never leave a half-curated database behind, and automation can rely on
+"nonzero exit means nothing was applied". The reverse lookup's precision range
+is derived from the geohash lengths actually present in the database, so
+verification works on databases built outside the library's default range.
 
-`--skip-unresolvable` skips (with a warning) probes whose expected place
-currently owns no cells in the database. This lets a curation file ship ahead
-of the data build that makes it effective — see below.
+`--skip-unresolvable` downgrades a failing probe to a warning when the
+database visibly predates the entry's inputs: the expected place owns no
+lookup cells, or one of the entry's absorbed places owns no cells. This lets a
+curation file ship ahead of the data build that makes it effective — see
+below. On a fully built database, where every merge source and expected place
+owns cells, mismatches fail even with the flag.
 
 ### A note on the Guatemala probes
 
@@ -140,6 +154,42 @@ database is rebuilt with county boundaries indexed at precision 5**. On the
 currently shipped database, Santa Catarina Pinula owns no cells at all, so the
 merge is a no-op there — the mechanism still validates and applies cleanly,
 and `--verify --skip-unresolvable` defers the probes that cannot resolve yet.
+
+## Contributing and conflict policy
+
+Curation files are community-editable opinions about places, so the rules for
+changing them are strict by design:
+
+- **One country per file.** A change to Guatemala lives in `gt.json` and
+  nowhere else. This keeps review focused and keeps two contributors from
+  editing the same judgment in different places.
+- **Every entry carries a `rationale` and `probes`.** Entries without them are
+  rejected by validation, not just by review.
+- **Existing probes are permanent regression guards.** Once an entry's probes
+  are merged, they document settled behavior — including the guard probes that
+  pin down where a curation must *not* reach. A new entry that flips an
+  established probe fails `--verify` and will not be accepted; if you believe
+  a settled probe is wrong, change the probe in the same PR and argue the case
+  in the entry's rationale.
+- **Conflicting entries are rejected as a set**, before anything is written,
+  across all loaded files:
+  - the same place id absorbed by two entries with **different `into`
+    targets** (the two entries disagree about where the place belongs);
+  - a place id that is any entry's `into` being absorbed by another entry
+    (**merge chains** — `A -> B` plus `C -> A` would make the result depend on
+    application order and break idempotence);
+  - the same place id absorbed by two entries with the **same target**
+    (duplicate absorption). This is mechanically harmless but is rejected as
+    an error anyway: duplicated judgment drifts when someone later edits one
+    copy and not the other. Keep one entry per absorbed place.
+- **Curation never touches the schema.** Schema-level backwards compatibility
+  is governed by [`COMPATIBILITY.md`](../COMPATIBILITY.md); curation only
+  relabels `compact_geohash_lookup` rows within whatever schema the database
+  already has. Absorbed places intentionally remain in `compact_places`, so
+  place ids stored by old readers and forward lookups keep resolving.
+- **The maintainer arbitrates judgment disputes.** When two contributors
+  disagree about what a place should be called, probes and rationales are the
+  evidence, and the maintainer makes the call.
 
 ## Current entries
 

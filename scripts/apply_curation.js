@@ -57,8 +57,8 @@ function usage() {
     '  --database, -d       Compact boundary SQLite database to curate (required)',
     '  --curation, -c       Curation JSON file, or directory containing *.json files (repeatable, required)',
     '  --dry-run            Report per-entry affected row counts without writing',
-    '  --verify             After applying, run each entry\'s probes through the reverse geocoder',
-    '  --skip-unresolvable  With --verify: skip (with a warning) probes whose expected place owns no cells yet',
+    '  --verify             Run each entry\'s probes through the reverse geocoder inside the apply transaction; any mismatch rolls the overlay back',
+    '  --skip-unresolvable  With --verify: downgrade a failing probe to a warning when the expected place or one of the entry\'s merge sources owns no cells yet',
     '  --help, -h           Show this help message'
   ].join('\n')
 }
@@ -252,6 +252,66 @@ function loadCurationEntries(files) {
   return entries
 }
 
+// Cross-entry validation over ALL loaded curation files. Guarantees that
+// every lookup row is touched by at most one entry, which makes application
+// order irrelevant and keeps the overall apply idempotent.
+function validateAcrossEntries(entries) {
+  var absorbClaims = Object.create(null)
+  var intoClaims = Object.create(null)
+
+  entries.forEach(function(entry) {
+    var label = entry.source + ' entry ' + entry.index
+
+    if (!intoClaims[entry.into]) {
+      intoClaims[entry.into] = []
+    }
+    intoClaims[entry.into].push(label)
+
+    entry.absorb.forEach(function(id) {
+      if (!absorbClaims[id]) {
+        absorbClaims[id] = []
+      }
+      absorbClaims[id].push({ label: label, into: entry.into })
+    })
+  })
+
+  var problems = []
+
+  Object.keys(absorbClaims).forEach(function(id) {
+    var claims = absorbClaims[id]
+    if (claims.length < 2) {
+      return
+    }
+
+    var targets = Object.create(null)
+    claims.forEach(function(claim) {
+      targets[claim.into] = true
+    })
+
+    var descriptor = Object.keys(targets).length > 1
+      ? 'is absorbed by multiple entries with conflicting "into" targets'
+      : 'is absorbed by multiple entries with the same target (duplicate absorption; keep one entry per absorbed place)'
+
+    problems.push('place id ' + id + ' ' + descriptor + ': ' +
+      claims.map(function(claim) { return claim.label + ' -> ' + claim.into }).join('; '))
+  })
+
+  Object.keys(intoClaims).forEach(function(id) {
+    if (!absorbClaims[id]) {
+      return
+    }
+
+    problems.push('place id ' + id + ' is a merge target (' + intoClaims[id].join('; ') +
+      ') and is also absorbed (' +
+      absorbClaims[id].map(function(claim) { return claim.label }).join('; ') +
+      '); merge chains are not allowed')
+  })
+
+  if (problems.length) {
+    throw new Error('Curation conflict validation failed:\n  ' + problems.join('\n  '))
+  }
+}
+
 function dbAll(db, sql, params) {
   return new Promise(function(resolve, reject) {
     db.all(sql, params || [], function(err, rows) {
@@ -382,61 +442,124 @@ async function expectedPlaceOwnsCells(db, name) {
   return Boolean(rows.length && rows[0].count > 0)
 }
 
-async function verifyEntries(databasePath, entries, skipUnresolvable) {
+async function placeOwnsCellsById(db, placeId) {
+  var rows = await dbAll(db, `
+    SELECT COUNT(*) AS count
+    FROM compact_geohash_lookup
+    WHERE place_id = ?
+  `, [placeId])
+
+  return Boolean(rows.length && rows[0].count > 0)
+}
+
+// The reverse lookup only queries geohash lengths inside its configured
+// precision range, so derive that range from the database being curated
+// instead of relying on the library defaults (base 4, max 7).
+async function deriveBoundaryPrecision(db) {
+  var rows = await dbAll(db, `
+    SELECT MIN(LENGTH(geohash)) AS minLength, MAX(LENGTH(geohash)) AS maxLength
+    FROM compact_geohash_lookup
+  `)
+
+  var min = rows.length ? rows[0].minLength : null
+  var max = rows.length ? rows[0].maxLength : null
+
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 1 || max < min) {
+    return { basePrecision: 4, maxPrecision: 7 }
+  }
+
+  return { basePrecision: min, maxPrecision: max }
+}
+
+// Snapshot, before anything is written, which of each entry's inputs the
+// database can currently express: absorbed places that own no lookup cells,
+// and whether each probe's expected name owns any cells. Verification uses
+// this to tell a genuine mismatch from a curation file that shipped ahead of
+// the data build that makes it effective.
+async function computeResolvability(db, entries) {
+  var missingSourcesByEntry = Object.create(null)
+  var expectOwnsByName = Object.create(null)
+
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i]
+    var missing = []
+
+    for (var j = 0; j < entry.absorb.length; j++) {
+      if (!(await placeOwnsCellsById(db, entry.absorb[j]))) {
+        missing.push(entry.absorb[j])
+      }
+    }
+    missingSourcesByEntry[entry.source + '#' + entry.index] = missing
+
+    for (var k = 0; k < entry.probes.length; k++) {
+      var name = entry.probes[k].expect
+      if (expectOwnsByName[name] === undefined) {
+        expectOwnsByName[name] = await expectedPlaceOwnsCells(db, name)
+      }
+    }
+  }
+
+  return {
+    missingSourcesByEntry: missingSourcesByEntry,
+    expectOwnsByName: expectOwnsByName
+  }
+}
+
+// Runs probes on the shared connection so they see the uncommitted overlay;
+// the caller decides whether to commit or roll back based on the verdict.
+async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvability) {
   var createGeocoder = require('../src/index.js')
   var geocoder = createGeocoder({
-    database: databasePath,
-    reverseMode: 'boundary'
+    db: db,
+    reverseMode: 'boundary',
+    boundary: boundary
   })
 
   var passed = 0
   var skipped = 0
   var failures = []
 
-  try {
-    for (var i = 0; i < entries.length; i++) {
-      var entry = entries[i]
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i]
+    var missingSources = resolvability.missingSourcesByEntry[entry.source + '#' + entry.index] || []
 
-      for (var j = 0; j < entry.probes.length; j++) {
-        var probe = entry.probes[j]
-        var context = entry.source + ' entry ' + entry.index +
-          ' probe (' + probe.lat + ', ' + probe.lon + ')' +
-          (probe.note ? ' [' + probe.note + ']' : '')
+    for (var j = 0; j < entry.probes.length; j++) {
+      var probe = entry.probes[j]
+      var context = entry.source + ' entry ' + entry.index +
+        ' probe (' + probe.lat + ', ' + probe.lon + ')' +
+        (probe.note ? ' [' + probe.note + ']' : '')
 
-        var resolvable = await expectedPlaceOwnsCells(geocoder.db, probe.expect)
-        if (!resolvable && skipUnresolvable) {
-          console.warn('SKIP ' + context + ': expected place "' + probe.expect + '" owns no cells in this database yet')
-          skipped += 1
-          continue
-        }
+      var result = await geocoder.reverse(probe.lat, probe.lon)
+      var actual = result && result.name
 
-        var result = await geocoder.reverse(probe.lat, probe.lon)
-        var actual = result && result.name
-
-        if (actual === probe.expect) {
-          console.log('PASS ' + context + ' -> "' + actual + '"')
-          passed += 1
-        } else {
-          var hint = resolvable ? '' : ' (expected place owns no cells; rerun with --skip-unresolvable to defer this probe)'
-          failures.push('FAIL ' + context + ': expected "' + probe.expect + '", got "' + (actual || '<nothing>') + '"' + hint)
-        }
+      if (actual === probe.expect) {
+        console.log('PASS ' + context + ' -> "' + actual + '"')
+        passed += 1
+        continue
       }
-    }
-  } finally {
-    if (geocoder.db && typeof geocoder.db.close === 'function') {
-      await dbClose(geocoder.db)
+
+      var reasons = []
+      if (!resolvability.expectOwnsByName[probe.expect]) {
+        reasons.push('expected place "' + probe.expect + '" owns no cells in this database yet')
+      }
+      if (missingSources.length) {
+        reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells in this database yet')
+      }
+
+      if (reasons.length && skipUnresolvable) {
+        console.warn('SKIP ' + context + ': ' + reasons.join('; '))
+        skipped += 1
+        continue
+      }
+
+      var hint = reasons.length
+        ? ' (' + reasons.join('; ') + '; rerun with --skip-unresolvable to defer this probe)'
+        : ''
+      failures.push('FAIL ' + context + ': expected "' + probe.expect + '", got "' + (actual || '<nothing>') + '"' + hint)
     }
   }
 
-  failures.forEach(function(line) {
-    console.error(line)
-  })
-
-  console.log('Probes passed: ' + passed + ', skipped: ' + skipped + ', failed: ' + failures.length)
-
-  if (failures.length) {
-    throw new Error('Probe verification failed: ' + failures.length + ' probe(s) did not match')
-  }
+  return { passed: passed, skipped: skipped, failures: failures }
 }
 
 async function main() {
@@ -466,6 +589,7 @@ async function main() {
 
   var files = collectCurationFiles(options.curation)
   var entries = loadCurationEntries(files)
+  validateAcrossEntries(entries)
 
   var db = new sqlite3.Database(databasePath)
   var totalRelabeled = 0
@@ -483,6 +607,13 @@ async function main() {
         console.log('[dry-run] ' + entryLabel(entry, intoName) + ': would relabel ' + count + ' cell(s)')
       }
     } else {
+      var boundary = null
+      var resolvability = null
+      if (options.verify) {
+        boundary = await deriveBoundaryPrecision(db)
+        resolvability = await computeResolvability(db, entries)
+      }
+
       await dbExec(db, 'BEGIN')
       try {
         for (var j = 0; j < entries.length; j++) {
@@ -492,6 +623,21 @@ async function main() {
           totalRelabeled += changes
           console.log(entryLabel(applied, appliedIntoName) + ': relabeled ' + changes + ' cell(s)')
         }
+
+        if (options.verify) {
+          var verdict = await verifyEntries(db, entries, options.skipUnresolvable, boundary, resolvability)
+
+          verdict.failures.forEach(function(line) {
+            console.error(line)
+          })
+          console.log('Probes passed: ' + verdict.passed + ', skipped: ' + verdict.skipped + ', failed: ' + verdict.failures.length)
+
+          if (verdict.failures.length) {
+            throw new Error('Probe verification failed: ' + verdict.failures.length +
+              ' probe(s) did not match; rolled back all curation changes, the database is unchanged')
+          }
+        }
+
         await dbExec(db, 'COMMIT')
       } catch (err) {
         await dbExec(db, 'ROLLBACK')
@@ -507,17 +653,14 @@ async function main() {
   console.log('Curation files: ' + files.length)
   console.log('Entries: ' + entries.length)
   console.log((options.dryRun ? 'Cells that would be relabeled: ' : 'Cells relabeled: ') + totalRelabeled)
-
-  if (options.verify) {
-    await verifyEntries(databasePath, entries, options.skipUnresolvable)
-  }
 }
 
 module.exports = {
   parseArgs: parseArgs,
   usage: usage,
   collectCurationFiles: collectCurationFiles,
-  validateCurationDocument: validateCurationDocument
+  validateCurationDocument: validateCurationDocument,
+  validateAcrossEntries: validateAcrossEntries
 }
 
 if (require.main === module) {
