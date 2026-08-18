@@ -4,7 +4,6 @@
 const fs = require('fs')
 const path = require('path')
 const https = require('https')
-const sqlite3 = require('sqlite3')
 
 const createGeocoder = require('../src/index')
 const geohash = require('../src/geohash')
@@ -53,6 +52,14 @@ function parseBool(value, defaultValue) {
     return false
   }
   return defaultValue
+}
+
+function requireNumericArg(flag, raw) {
+  var value = Number(raw)
+  if (raw === undefined || raw === null || String(raw).trim() === '' || !Number.isFinite(value)) {
+    throw new Error(flag + ' requires a numeric value, got: ' + (raw === undefined ? '(missing)' : raw))
+  }
+  return value
 }
 
 function parseArgs(argv) {
@@ -134,6 +141,9 @@ function mulberry32(seed) {
 }
 
 function dbOpen(dbPath) {
+  // Lazy so TSV-only commands (sample) work when the optional sqlite3 peer
+  // dependency is not installed.
+  var sqlite3 = require('sqlite3')
   return new sqlite3.Database(dbPath)
 }
 
@@ -406,9 +416,14 @@ function normalizeName(value) {
   if (!value) return ''
   return String(value)
     .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
+    // Strip only marks that are optional spelling variants: Latin combining
+    // diacritics (U+0300-U+036F), Hebrew niqqud/cantillation (U+0591-U+05C7)
+    // and Arabic harakat (U+064B-U+065F, U+0670). Marks in other scripts,
+    // e.g. Devanagari vowel signs, are essential letters and are preserved
+    // by \p{M} below.
+    .replace(/[\u0300-\u036f\u0591-\u05c7\u064b-\u065f\u0670]/g, '')
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}]+/gu, ' ')
     .trim()
     .replace(/\s+/g, ' ')
 }
@@ -1106,10 +1121,13 @@ function parseSampleArgs(argv) {
     } else if (arg === '--out') {
       opts.out = path.resolve(argv[++i])
     } else if (arg === '--per-country') {
-      opts.perCountry = Math.max(1, Math.trunc(Number(argv[++i])))
+      opts.perCountry = Math.max(1, Math.trunc(requireNumericArg('--per-country', argv[++i])))
     } else if (arg === '--max-points') {
-      var maxPoints = Number(argv[++i])
-      opts.maxPoints = Number.isFinite(maxPoints) && maxPoints > 0 ? Math.trunc(maxPoints) : null
+      var maxPoints = Math.trunc(requireNumericArg('--max-points', argv[++i]))
+      if (maxPoints <= 0) {
+        throw new Error('--max-points must be > 0, got: ' + maxPoints)
+      }
+      opts.maxPoints = maxPoints
     } else if (arg === '--help' || arg === '-h') {
       opts.help = true
     } else {
@@ -1223,24 +1241,68 @@ function loadSweepCache(cachePath) {
 }
 
 function appendSweepCache(cachePath, entry) {
-  fs.appendFileSync(cachePath, JSON.stringify(entry) + '\n', 'utf8')
+  // If an interrupted append left a torn final line without a newline,
+  // appending directly would glue the new entry onto the fragment, making
+  // both unreadable and re-spending a request on that point every run.
+  // Start a fresh line whenever the file does not already end with one.
+  var prefix = ''
+  try {
+    var stat = fs.statSync(cachePath)
+    if (stat.size > 0) {
+      var fd = fs.openSync(cachePath, 'r')
+      var lastByte = Buffer.alloc(1)
+      try {
+        fs.readSync(fd, lastByte, 0, 1, stat.size - 1)
+      } finally {
+        fs.closeSync(fd)
+      }
+      if (lastByte.toString('utf8') !== '\n') prefix = '\n'
+    }
+  } catch (err) {
+    // Missing file: the append below creates it.
+  }
+  fs.appendFileSync(cachePath, prefix + JSON.stringify(entry) + '\n', 'utf8')
 }
 
 function loadQuotaState(statePath, todayUtc) {
+  var raw
   try {
-    var raw = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-    if (raw && raw.date === todayUtc && Number.isFinite(Number(raw.count))) {
-      return { date: todayUtc, count: Math.max(0, Math.trunc(Number(raw.count))) }
-    }
+    raw = fs.readFileSync(statePath, 'utf8')
   } catch (err) {
-    // Missing or unreadable state resets to zero for today.
+    if (err && err.code === 'ENOENT') {
+      return { date: todayUtc, count: 0 }
+    }
+    throw err
   }
-  return { date: todayUtc, count: 0 }
+
+  var parsed = null
+  try {
+    parsed = JSON.parse(raw)
+  } catch (err) {
+    parsed = null
+  }
+
+  // Fail closed: an existing-but-unreadable state file must not silently
+  // reset today's count to zero, or a corrupted file would allow a fresh
+  // full daily cap of requests.
+  if (!parsed || typeof parsed.date !== 'string' || !Number.isFinite(Number(parsed.count))) {
+    throw new Error('Quota state file ' + statePath + ' exists but is unreadable; refusing to guess the request count. ' +
+      'Inspect it and, only if you are sure no requests were made today (UTC), delete it to reset.')
+  }
+
+  if (parsed.date !== todayUtc) {
+    return { date: todayUtc, count: 0 }
+  }
+  return { date: todayUtc, count: Math.max(0, Math.trunc(Number(parsed.count))) }
 }
 
 function saveQuotaState(statePath, state) {
+  // Write-then-rename so an interrupted save can never leave a truncated
+  // state file behind (which loadQuotaState would refuse to read).
   fs.mkdirSync(path.dirname(statePath), { recursive: true })
-  fs.writeFileSync(statePath, JSON.stringify({ date: state.date, count: state.count }) + '\n', 'utf8')
+  var tmpPath = statePath + '.tmp'
+  fs.writeFileSync(tmpPath, JSON.stringify({ date: state.date, count: state.count }) + '\n', 'utf8')
+  fs.renameSync(tmpPath, statePath)
 }
 
 function findLiqNameMatch(normalizedOfflineName, address, displayName) {
@@ -1449,6 +1511,19 @@ async function runSweep(opts, deps) {
   if (!deps || typeof deps.fetchJson !== 'function') throw new Error('runSweep requires deps.fetchJson')
   if (typeof deps.reverse !== 'function') throw new Error('runSweep requires deps.reverse')
 
+  // Guard the quota knobs: a NaN cap would make every comparison false and
+  // silently disable the daily limit.
+  if (!Number.isFinite(opts.dailyCap) || opts.dailyCap < 0) {
+    throw new Error('dailyCap must be a finite number >= 0, got: ' + opts.dailyCap)
+  }
+  if (!Number.isFinite(opts.rps) || opts.rps <= 0) {
+    throw new Error('rps must be a finite number > 0, got: ' + opts.rps)
+  }
+  if (opts.maxRequests !== null && opts.maxRequests !== undefined &&
+      (!Number.isFinite(opts.maxRequests) || opts.maxRequests < 0)) {
+    throw new Error('maxRequests must be a finite number >= 0 when set, got: ' + opts.maxRequests)
+  }
+
   var loaded = loadPointsFile(opts.pointsPath)
   var points = loaded.points
   if (!points.length) {
@@ -1473,6 +1548,16 @@ async function runSweep(opts, deps) {
     for (var i = 0; i < points.length; i++) {
       var point = points[i]
       if (cache[point.key]) continue
+
+      // A long run can cross midnight UTC: roll the state over so requests
+      // are attributed to the day they are actually made in, otherwise a
+      // later invocation would reset the stale date and allow nearly twice
+      // the cap within the new UTC day.
+      var attemptDate = utcDateString(nowImpl())
+      if (attemptDate !== state.date) {
+        state = { date: attemptDate, count: 0 }
+        saveQuotaState(opts.statePath, state)
+      }
 
       if (state.count >= opts.dailyCap) {
         stopReason = 'daily_cap'
@@ -1646,18 +1731,19 @@ function parseSweepArgs(argv) {
     } else if (arg === '--accept-language') {
       opts.acceptLanguage = String(argv[++i] || '')
     } else if (arg === '--daily-cap') {
-      opts.dailyCap = Math.max(0, Math.trunc(Number(argv[++i])))
+      // Reject non-numeric values outright: a NaN here would silently
+      // disable the daily quota instead of enforcing it.
+      opts.dailyCap = Math.max(0, Math.trunc(requireNumericArg('--daily-cap', argv[++i])))
     } else if (arg === '--rps') {
-      opts.rps = Math.max(0.1, Number(argv[++i]))
+      opts.rps = Math.max(0.1, requireNumericArg('--rps', argv[++i]))
     } else if (arg === '--max-requests') {
-      var maxRequests = Number(argv[++i])
-      opts.maxRequests = Number.isFinite(maxRequests) && maxRequests >= 0 ? Math.trunc(maxRequests) : null
+      opts.maxRequests = Math.max(0, Math.trunc(requireNumericArg('--max-requests', argv[++i])))
     } else if (arg === '--reverse-mode') {
       opts.reverseMode = String(argv[++i] || 'boundary').toLowerCase()
     } else if (arg === '--base-precision') {
-      opts.basePrecision = Math.max(1, Math.trunc(Number(argv[++i])))
+      opts.basePrecision = Math.max(1, Math.trunc(requireNumericArg('--base-precision', argv[++i])))
     } else if (arg === '--max-precision') {
-      opts.maxPrecision = Math.max(opts.basePrecision, Math.trunc(Number(argv[++i])))
+      opts.maxPrecision = Math.max(opts.basePrecision, Math.trunc(requireNumericArg('--max-precision', argv[++i])))
     } else if (arg === '--dry-run') {
       opts.dryRun = true
     } else if (arg === '--help' || arg === '-h') {
@@ -1746,10 +1832,13 @@ module.exports = {
   parseGeonamesLine: parseGeonamesLine,
   selectTopPlaces: selectTopPlaces,
   buildSamplePoints: buildSamplePoints,
+  parseSampleArgs: parseSampleArgs,
+  sampleMain: sampleMain,
   sweepCoordKey: sweepCoordKey,
   utcDateString: utcDateString,
   loadPointsFile: loadPointsFile,
   loadQuotaState: loadQuotaState,
+  parseSweepArgs: parseSweepArgs,
   comparePoint: comparePoint,
   buildSweepReport: buildSweepReport,
   runSweep: runSweep

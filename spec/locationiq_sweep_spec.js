@@ -1,6 +1,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const liq = require('../scripts/validate_with_locationiq');
 
@@ -160,6 +161,17 @@ describe('locationiq sweep', () => {
       expect(liq.normalizeName('MÜNCHEN')).toEqual('munchen');
       expect(liq.normalizeName('São Paulo')).toEqual('sao paulo');
       expect(liq.normalizeName('Москва')).toEqual('москва');
+    });
+
+    it('preserves essential Unicode marks while stripping optional vocalization', () => {
+      // Devanagari vowel signs are combining marks but essential: stripping
+      // them would collapse different names into false agreements.
+      expect(liq.normalizeName('किला')).toEqual('किला');
+      expect(liq.normalizeName('किला')).not.toEqual(liq.normalizeName('कुल'));
+      // Arabic harakat and Hebrew niqqud are optional vocalization: the same
+      // name with and without them must compare equal.
+      expect(liq.normalizeName('مُحَمَّد')).toEqual(liq.normalizeName('محمد'));
+      expect(liq.normalizeName('יְרוּשָׁלַיִם')).toEqual(liq.normalizeName('ירושלים'));
     });
 
     it('agrees when the offline name matches a locality field after normalization', () => {
@@ -412,6 +424,156 @@ describe('locationiq sweep', () => {
         const severe = mismatches.find((m) => m.verdict === 'country_mismatch');
         expect(severe.offline_name).toEqual('Tapachula');
         expect(severe.liq_name).toEqual('Guatemala City');
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed without spending requests when the quota state file is unreadable', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        // A truncated write (e.g. the process died mid-save) leaves invalid
+        // JSON behind. Resetting to zero here would allow a fresh full cap.
+        fs.writeFileSync(path.join(dir, 'quota.json'), '{"date":"2026-');
+
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/quota state/i);
+        expect(deps.calls.length).toEqual(0);
+
+        // Same for structurally invalid but parseable content.
+        fs.writeFileSync(path.join(dir, 'quota.json'), JSON.stringify({ foo: 1 }));
+        await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/quota state/i);
+        expect(deps.calls.length).toEqual(0);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects invalid quota options instead of running uncapped', async () => {
+      expect(() => liq.parseSweepArgs(['--daily-cap', 'lots'])).toThrowError(/--daily-cap/);
+      expect(() => liq.parseSweepArgs(['--daily-cap'])).toThrowError(/--daily-cap/);
+      expect(() => liq.parseSweepArgs(['--rps', 'fast'])).toThrowError(/--rps/);
+      expect(() => liq.parseSweepArgs(['--max-requests', 'many'])).toThrowError(/--max-requests/);
+
+      // Defense in depth: runSweep itself refuses a NaN cap before fetching.
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        await expectAsync(liq.runSweep(sweepOpts(dir, { dailyCap: NaN }), deps)).toBeRejectedWithError(/dailyCap/);
+        expect(deps.calls.length).toEqual(0);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('rolls quota state over when the UTC day changes mid-run', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        // now() is called once at startup, then once per attempt: the first
+        // two attempts happen before midnight UTC, the last three after.
+        let nowCalls = 0;
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        deps.now = () => {
+          nowCalls += 1;
+          return nowCalls <= 3
+            ? new Date('2026-01-01T23:59:00Z')
+            : new Date('2026-01-02T00:00:30Z');
+        };
+
+        const summary = await liq.runSweep(sweepOpts(dir), deps);
+
+        expect(deps.calls.length).toEqual(5);
+        expect(summary.stopReason).toBeNull();
+        // Requests made after midnight are attributed to the new UTC day, so
+        // a later invocation cannot reset a stale date and double the cap.
+        const state = readState(dir);
+        expect(state.date).toEqual('2026-01-02');
+        expect(state.count).toEqual(3);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('repairs a torn cache tail so new entries are never glued onto a fragment', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const seeded = {
+          key: liq.sweepCoordKey(WORLD_POINTS[0].lat, WORLD_POINTS[0].lon),
+          lat: WORLD_POINTS[0].lat,
+          lon: WORLD_POINTS[0].lon,
+          status: 200,
+          body: { display_name: '', address: { city: 'San Salvador', country_code: 'sv' } }
+        };
+        // Valid entry followed by a torn final line with no newline, as an
+        // interrupted append would leave it.
+        fs.writeFileSync(path.join(dir, 'cache.jsonl'), JSON.stringify(seeded) + '\n' + '{"key":"13.4767');
+
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const summary = await liq.runSweep(sweepOpts(dir), deps);
+
+        expect(deps.calls.length).toEqual(4);
+        expect(summary.evaluated).toEqual(5);
+        const parseable = cacheLines(dir).filter((line) => {
+          try {
+            JSON.parse(line);
+            return true;
+          } catch (err) {
+            return false;
+          }
+        });
+        expect(parseable.length).toEqual(5);
+
+        // The repaired cache must fully satisfy a second run: zero requests.
+        const again = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const summary2 = await liq.runSweep(sweepOpts(dir), again);
+        expect(again.calls.length).toEqual(0);
+        expect(summary2.evaluated).toEqual(5);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('optional sqlite3 dependency', () => {
+    it('runs the TSV-only sample command without sqlite3 installed', () => {
+      const dir = makeTmpDir();
+      try {
+        const tsvPath = path.join(dir, 'cities.tsv');
+        const outPath = path.join(dir, 'points.jsonl');
+        fs.writeFileSync(tsvPath, geonamesRow(1, 'Testville', 40.0, -100.0, 'P', 'US', 1000) + '\n');
+
+        const script = path.join(__dirname, '..', 'scripts', 'validate_with_locationiq.js');
+        const shim = [
+          "const Module = require('module');",
+          'const originalLoad = Module._load;',
+          'Module._load = function(request, ...rest) {',
+          "  if (request === 'sqlite3') {",
+          '    const err = new Error("Cannot find module \'sqlite3\'");',
+          "    err.code = 'MODULE_NOT_FOUND';",
+          '    throw err;',
+          '  }',
+          '  return originalLoad.call(this, request, ...rest);',
+          '};',
+          'const liq = require(process.env.LIQ_SCRIPT);',
+          "liq.sampleMain(['--geonames', process.env.LIQ_TSV, '--out', process.env.LIQ_OUT])",
+          "  .then(() => console.log('SAMPLE_OK'))",
+          '  .catch((err) => { console.error(err.message); process.exit(1); });'
+        ].join('\n');
+
+        const result = spawnSync('node', ['-e', shim], {
+          encoding: 'utf8',
+          env: Object.assign({}, process.env, { LIQ_SCRIPT: script, LIQ_TSV: tsvPath, LIQ_OUT: outPath })
+        });
+
+        expect(result.status).toEqual(0);
+        expect(result.stdout).toContain('SAMPLE_OK');
+        const written = fs.readFileSync(outPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+        expect(written.length).toEqual(1);
+        expect(written[0].name).toEqual('Testville');
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
