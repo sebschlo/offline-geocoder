@@ -1,6 +1,6 @@
 ### Unreleased
 
-- Add optional dense-county precision rule (`--county-dense-max-precision` / `--county-dense-max-area-km2`, env `WOF_COUNTY_DENSE_MAX_PRECISION` / `WOF_COUNTY_DENSE_MAX_AREA_KM2`): small county polygons get a finer geohash cap so municipality-sized counties are not swallowed by neighbors in coarse cells
+- Add optional dense-county precision rule (`--county-dense-max-precision` / `--county-dense-max-area-km2`, env `WOF_COUNTY_DENSE_MAX_PRECISION` / `WOF_COUNTY_DENSE_MAX_AREA_KM2`): small county polygons get a finer geohash cap so municipality-sized counties are not swallowed by neighbors in coarse cells; enabling the rule via env without an explicit `WOF_COUNTY_MAX_PRECISION` defaults the regular county cap to one below the dense precision so the area threshold actually differentiates
 
 ### 1.0.0 - 2018-08-02
 

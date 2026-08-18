@@ -16,7 +16,9 @@ set -euo pipefail
 #   WOF_MAX_PRECISION              Geohash max precision (default: 5)
 #   WOF_LOCALITY_MAX_PRECISION     Locality max precision override (default: WOF_MAX_PRECISION)
 #   WOF_LOCALADMIN_MAX_PRECISION   Localadmin max precision override (default: WOF_MAX_PRECISION)
-#   WOF_COUNTY_MAX_PRECISION       County max precision override (default: WOF_MAX_PRECISION)
+#   WOF_COUNTY_MAX_PRECISION       County max precision override (default: WOF_MAX_PRECISION,
+#                                  or one below WOF_COUNTY_DENSE_MAX_PRECISION when the dense
+#                                  county rule is enabled and no explicit value is given)
 #   WOF_COUNTY_DENSE_MAX_PRECISION Dense small-county precision (default: empty = rule off)
 #   WOF_COUNTY_DENSE_MAX_AREA_KM2  Bbox area threshold to apply dense county precision (default: empty = rule off)
 #   WOF_REGION_MAX_PRECISION       Region max precision override (default: 4)
@@ -52,9 +54,20 @@ WOF_BASE_PRECISION="${WOF_BASE_PRECISION:-4}"
 WOF_MAX_PRECISION="${WOF_MAX_PRECISION:-5}"
 WOF_LOCALITY_MAX_PRECISION="${WOF_LOCALITY_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
 WOF_LOCALADMIN_MAX_PRECISION="${WOF_LOCALADMIN_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
-WOF_COUNTY_MAX_PRECISION="${WOF_COUNTY_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
 WOF_COUNTY_DENSE_MAX_PRECISION="${WOF_COUNTY_DENSE_MAX_PRECISION:-}"
 WOF_COUNTY_DENSE_MAX_AREA_KM2="${WOF_COUNTY_DENSE_MAX_AREA_KM2:-}"
+if [[ -z "${WOF_COUNTY_MAX_PRECISION:-}" && -n "${WOF_COUNTY_DENSE_MAX_PRECISION}" && -n "${WOF_COUNTY_DENSE_MAX_AREA_KM2}" ]]; then
+  # Enabling the dense rule only makes sense with a coarser regular county
+  # cap; otherwise every county already builds at the dense precision and the
+  # area threshold is a no-op. Default the cap to one below the dense
+  # precision (never below the base precision). An explicit
+  # WOF_COUNTY_MAX_PRECISION always wins.
+  WOF_COUNTY_MAX_PRECISION=$(( WOF_COUNTY_DENSE_MAX_PRECISION - 1 ))
+  if (( WOF_COUNTY_MAX_PRECISION < WOF_BASE_PRECISION )); then
+    WOF_COUNTY_MAX_PRECISION="${WOF_BASE_PRECISION}"
+  fi
+fi
+WOF_COUNTY_MAX_PRECISION="${WOF_COUNTY_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
 WOF_REGION_MAX_PRECISION="${WOF_REGION_MAX_PRECISION:-4}"
 WOF_REGION_SPARSE_MAX_PRECISION="${WOF_REGION_SPARSE_MAX_PRECISION:-3}"
 WOF_REGION_SPARSE_MIN_AREA_KM2="${WOF_REGION_SPARSE_MIN_AREA_KM2:-80000}"
