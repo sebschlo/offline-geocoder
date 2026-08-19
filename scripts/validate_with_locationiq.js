@@ -1094,8 +1094,13 @@ function parseGeonamesLine(line) {
   var cols = line.split('\t')
   if (cols.length < 15) return null
 
-  var latitude = Number(cols[4])
-  var longitude = Number(cols[5])
+  // Blank columns must not coerce to coordinate (0, 0): Number('') is 0,
+  // which would pass the range checks below.
+  var latRaw = String(cols[4] || '').trim()
+  var lonRaw = String(cols[5] || '').trim()
+  if (!latRaw || !lonRaw) return null
+  var latitude = Number(latRaw)
+  var longitude = Number(lonRaw)
   var featureClass = String(cols[6] || '').trim()
   var country = String(cols[8] || '').trim().toUpperCase()
   var population = Number(cols[14])
@@ -1274,6 +1279,15 @@ async function sampleMain(argv) {
 
 // --- sweep: cache, quota state, comparison, report -------------------------
 
+function coerceCoord(value) {
+  // Number(null), Number(true) and Number('') are all finite (0/1/0), so a
+  // missing or blank coordinate would otherwise pass the range checks as a
+  // real point at (0, 0).
+  if (value === null || value === undefined || typeof value === 'boolean') return NaN
+  if (typeof value === 'string' && !value.trim()) return NaN
+  return Number(value)
+}
+
 function loadPointsFile(pointsPath) {
   var lines = fs.readFileSync(pointsPath, 'utf8').split(/\r?\n/)
   var points = []
@@ -1292,8 +1306,15 @@ function loadPointsFile(pointsPath) {
       continue
     }
 
-    var lat = Number(row.lat !== undefined ? row.lat : row.latitude)
-    var lon = Number(row.lon !== undefined ? row.lon : row.longitude)
+    // Valid JSON is not necessarily a point: `null` (or any non-object)
+    // must count as a skipped row, not crash the whole sweep.
+    if (!row || typeof row !== 'object') {
+      skipped += 1
+      continue
+    }
+
+    var lat = coerceCoord(row.lat !== undefined ? row.lat : row.latitude)
+    var lon = coerceCoord(row.lon !== undefined ? row.lon : row.longitude)
     if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180) {
       skipped += 1
       continue
@@ -1417,7 +1438,10 @@ function loadQuotaState(statePath, todayUtc) {
   // Fail closed: an existing-but-unreadable state file must not silently
   // reset today's count to zero, or a corrupted file would allow a fresh
   // full daily cap of requests.
-  if (!parsed || typeof parsed.date !== 'string' || !Number.isFinite(Number(parsed.count))) {
+  // The count must BE a number, not merely coerce to one: Number(null),
+  // Number(true) and Number('') are all finite, so a structurally damaged
+  // state file would otherwise reset the day's count and re-open the cap.
+  if (!parsed || typeof parsed.date !== 'string' || typeof parsed.count !== 'number' || !Number.isFinite(parsed.count)) {
     throw new Error('Quota state file ' + statePath + ' exists but is unreadable; refusing to guess the request count. ' +
       'Inspect it and, only if you are sure no requests were made today (UTC), delete it to reset.')
   }
@@ -1425,7 +1449,7 @@ function loadQuotaState(statePath, todayUtc) {
   if (parsed.date !== todayUtc) {
     return { date: todayUtc, count: 0 }
   }
-  return { date: todayUtc, count: Math.max(0, Math.trunc(Number(parsed.count))) }
+  return { date: todayUtc, count: Math.max(0, Math.trunc(parsed.count)) }
 }
 
 function saveQuotaState(statePath, state) {
@@ -1902,6 +1926,7 @@ function parseSweepArgs(argv) {
     dryRun: false,
     help: false
   }
+  var maxPrecisionSet = false
 
   for (var i = 0; i < argv.length; i++) {
     var arg = argv[i]
@@ -1947,7 +1972,8 @@ function parseSweepArgs(argv) {
     } else if (arg === '--base-precision') {
       opts.basePrecision = Math.max(1, Math.trunc(requireNumericArg('--base-precision', argv[++i])))
     } else if (arg === '--max-precision') {
-      opts.maxPrecision = Math.max(opts.basePrecision, Math.trunc(requireNumericArg('--max-precision', argv[++i])))
+      opts.maxPrecision = Math.max(1, Math.trunc(requireNumericArg('--max-precision', argv[++i])))
+      maxPrecisionSet = true
     } else if (arg === '--dry-run') {
       opts.dryRun = true
     } else if (arg === '--help' || arg === '-h') {
@@ -1955,6 +1981,15 @@ function parseSweepArgs(argv) {
     } else {
       throw new Error('Unknown sweep argument: ' + arg)
     }
+  }
+
+  // Cross-field constraints are checked only after the whole argument list
+  // is parsed, so option order cannot change the experiment configuration.
+  if (!maxPrecisionSet && opts.maxPrecision < opts.basePrecision) {
+    opts.maxPrecision = opts.basePrecision
+  }
+  if (opts.maxPrecision < opts.basePrecision) {
+    throw new Error('--max-precision (' + opts.maxPrecision + ') must be >= --base-precision (' + opts.basePrecision + ')')
   }
 
   if (!opts.cachePath) opts.cachePath = path.join(opts.workdir, 'cache.jsonl')

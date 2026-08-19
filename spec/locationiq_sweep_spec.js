@@ -186,6 +186,39 @@ describe('locationiq sweep', () => {
       expect(result.skipped).toEqual(3);
       expect(result.points.map((p) => p.name)).toEqual(['Cityville']);
     });
+
+    it('rejects GeoNames rows with blank coordinate columns', () => {
+      // Number('') is 0, so a blank column would otherwise pass the range
+      // checks as coordinate (0, 0) and displace a valid place from the top-N.
+      const blankLat = geonamesRow(1, 'Ghost Town', '', -100.0, 'P', 'US', 999999);
+      const valid = geonamesRow(2, 'Realville', 40.0, -100.0, 'P', 'US', 100);
+
+      const result = liq.buildSamplePoints([blankLat, valid].join('\n'), 1, null);
+
+      expect(result.parsed).toEqual(1);
+      expect(result.skipped).toEqual(1);
+      expect(result.points.map((p) => p.name)).toEqual(['Realville']);
+    });
+
+    it('skips valid-JSON non-object rows in the points file instead of aborting', () => {
+      const dir = makeTmpDir();
+      try {
+        const file = path.join(dir, 'points.jsonl');
+        fs.writeFileSync(file, [
+          JSON.stringify({ lat: 1, lon: 2, country: 'US' }),
+          'null',
+          '5',
+          JSON.stringify({ lat: null, lon: null, country: 'US' })
+        ].join('\n') + '\n');
+
+        const loaded = liq.loadPointsFile(file);
+
+        expect(loaded.points.length).toEqual(1);
+        expect(loaded.skipped).toEqual(3);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('name comparison', () => {
@@ -620,6 +653,35 @@ describe('locationiq sweep', () => {
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
+    });
+
+    it('fails closed when the quota count is present but not a number', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        // Number(null), Number(true) and Number('') are all finite, so a
+        // coercion-based check would load these as a fresh count of 0/1.
+        for (const badCount of [null, true, '']) {
+          fs.writeFileSync(
+            path.join(dir, 'quota.json'),
+            JSON.stringify({ date: liq.utcDateString(new Date()), count: badCount })
+          );
+          await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/quota state/i);
+        }
+        expect(deps.calls.length).toEqual(0);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('validates precision bounds after all arguments are parsed', () => {
+      // Option order must not change the experiment configuration.
+      expect(() => liq.parseSweepArgs(['--max-precision', '5', '--base-precision', '6'])).toThrowError(/--max-precision/);
+      expect(() => liq.parseSweepArgs(['--base-precision', '6', '--max-precision', '5'])).toThrowError(/--max-precision/);
+      // The default maximum rises with an explicit base; explicit pairs hold.
+      expect(liq.parseSweepArgs(['--base-precision', '8']).maxPrecision).toEqual(8);
+      expect(liq.parseSweepArgs(['--base-precision', '5', '--max-precision', '5']).maxPrecision).toEqual(5);
     });
 
     it('rejects invalid quota options instead of running uncapped', async () => {
