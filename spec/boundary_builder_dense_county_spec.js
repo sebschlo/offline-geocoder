@@ -85,8 +85,7 @@ function runBuilder(inputPath, dbPath, extraArgs) {
     '--index-mode', 'compact',
     '--include-county', 'true',
     '--base-precision', '4',
-    '--max-precision', '5',
-    '--county-max-precision', '4'
+    '--max-precision', '5'
   ].concat(extraArgs), { encoding: 'utf8' });
 }
 
@@ -103,12 +102,46 @@ describe('boundary builder dense county precision', () => {
       writeCountiesFixture(inputPath);
 
       const result = runBuilder(inputPath, dbPath, [
+        '--county-max-precision', '4',
         '--county-dense-max-precision', '5',
         '--county-dense-max-area-km2', '300'
       ]);
 
       expect(result.status).toEqual(0);
       expect(result.stdout).toContain('Dense county rule: area_km2<=300 => max_precision=5');
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const smallLengths = await lookupLengths(db, SMALL_COUNTY_ID);
+        expect(smallLengths).toEqual([{ len: 5 }]);
+
+        const largeLengths = await lookupLengths(db, LARGE_COUNTY_ID);
+        expect(largeLengths).toEqual([{ len: 4 }]);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('derives a coarser county cap when only the dense flags are given', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-dense-county-'));
+    try {
+      const inputPath = path.join(dir, 'counties.geojson');
+      const dbPath = path.join(dir, 'derived.sqlite');
+      writeCountiesFixture(inputPath);
+
+      // No --county-max-precision: the cap must default to one below the
+      // dense precision (4), not the global max, or the area threshold
+      // would be a no-op.
+      const result = runBuilder(inputPath, dbPath, [
+        '--county-dense-max-precision', '5',
+        '--county-dense-max-area-km2', '300'
+      ]);
+
+      expect(result.status).toEqual(0);
+      expect(result.stdout).toContain('county=4');
 
       const db = new sqlite3.Database(dbPath);
       try {
@@ -132,7 +165,7 @@ describe('boundary builder dense county precision', () => {
       const dbPath = path.join(dir, 'plain.sqlite');
       writeCountiesFixture(inputPath);
 
-      const result = runBuilder(inputPath, dbPath, []);
+      const result = runBuilder(inputPath, dbPath, ['--county-max-precision', '4']);
 
       expect(result.status).toEqual(0);
       expect(result.stdout).not.toContain('Dense county rule');

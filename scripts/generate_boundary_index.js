@@ -176,7 +176,9 @@ function usage() {
     '  --locality-max-precision       Max precision override for locality placetype',
     '  --localadmin-max-precision     Max precision override for localadmin placetype',
     '  --county-max-precision         Max precision override for county placetype',
-    '  --county-dense-max-precision   Optional precision for very small county polygons (for example 5)',
+    '  --county-dense-max-precision   Optional precision for very small county polygons (for example 5).',
+    '                                 When set together with the area threshold and no explicit',
+    '                                 --county-max-precision, the county cap defaults to one below this',
     '  --county-dense-max-area-km2    Bbox area threshold to apply dense county precision',
     '  --region-max-precision         Max precision override for region placetype',
     '  --region-sparse-max-precision  Optional precision for very large region polygons (for example 3)',
@@ -1698,6 +1700,26 @@ async function main() {
     throw new Error('--index-mode must be either compact or full')
   }
 
+  if (options.countyDenseMaxPrecision !== null) {
+    if (!Number.isFinite(options.countyDenseMaxPrecision) || options.countyDenseMaxPrecision < 1) {
+      options.countyDenseMaxPrecision = null
+    } else {
+      options.countyDenseMaxPrecision = Math.trunc(options.countyDenseMaxPrecision)
+      if (options.countyDenseMaxPrecision > options.maxPrecision) {
+        options.countyDenseMaxPrecision = options.maxPrecision
+      }
+    }
+  }
+  if (options.countyMaxPrecision === null &&
+    Number.isFinite(options.countyDenseMaxPrecision) &&
+    Number.isFinite(options.countyDenseMaxAreaKm2)) {
+    // The dense rule only differentiates when the regular county cap is
+    // coarser than the dense precision. Without an explicit
+    // --county-max-precision, default the cap to one below the (clamped)
+    // dense precision instead of the global max.
+    options.countyMaxPrecision = Math.max(options.basePrecision, options.countyDenseMaxPrecision - 1)
+  }
+
   options.localityMaxPrecision = clampPrecision(options.localityMaxPrecision, options.basePrecision, options.maxPrecision)
   options.localadminMaxPrecision = clampPrecision(options.localadminMaxPrecision, options.basePrecision, options.maxPrecision)
   options.countyMaxPrecision = clampPrecision(options.countyMaxPrecision, options.basePrecision, options.maxPrecision)
@@ -1728,17 +1750,6 @@ async function main() {
       }
     }
   }
-  if (options.countyDenseMaxPrecision !== null) {
-    if (!Number.isFinite(options.countyDenseMaxPrecision) || options.countyDenseMaxPrecision < 1) {
-      options.countyDenseMaxPrecision = null
-    } else {
-      options.countyDenseMaxPrecision = Math.trunc(options.countyDenseMaxPrecision)
-      if (options.countyDenseMaxPrecision > options.maxPrecision) {
-        options.countyDenseMaxPrecision = options.maxPrecision
-      }
-    }
-  }
-
   var files = collectInputFiles(options)
   if (!files.length) {
     throw new Error('No input files were found after filtering')
