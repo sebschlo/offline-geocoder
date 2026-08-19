@@ -675,6 +675,112 @@ describe('locationiq sweep', () => {
       }
     });
 
+    it('fails closed on a negative or fractional persisted quota count', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        // Clamping these to zero would hand out another full daily cap.
+        for (const badCount of [-1, -4500, 2.5]) {
+          fs.writeFileSync(
+            path.join(dir, 'quota.json'),
+            JSON.stringify({ date: liq.utcDateString(new Date()), count: badCount })
+          );
+          await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/quota state/i);
+        }
+        expect(deps.calls.length).toEqual(0);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('stops without caching when a 404 rejects the route rather than the coordinate', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps((url, callNumber) => {
+          if (callNumber === 1) return okResponse({ city: 'Testville', country_code: 'us' });
+          // A route-level 404 (mistyped endpoint, proxy) carries no
+          // coordinate-level error shape.
+          return { status: 404, json: { message: 'Not Found' } };
+        });
+
+        const summary = await liq.runSweep(sweepOpts(dir), deps);
+
+        expect(deps.calls.length).toEqual(2);
+        expect(summary.stopReason).toEqual('bad_endpoint');
+        expect(cacheEntries(dir).length).toEqual(1);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('still caches a genuine coordinate-level 404 as an unverifiable answer', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(() => ({ status: 404, json: { error: 'Unable to geocode' } }));
+
+        const summary = await liq.runSweep(sweepOpts(dir), deps);
+
+        expect(deps.calls.length).toEqual(5);
+        expect(summary.stopReason).toBeNull();
+        expect(cacheEntries(dir).length).toEqual(5);
+        expect(summary.verdictCounts.liq_empty).toEqual(5);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('preflights the offline database before spending any request', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(
+          () => okResponse({ city: 'Testville', country_code: 'us' }),
+          () => {
+            throw new Error('SQLITE_ERROR: no such table: compact_places');
+          }
+        );
+
+        await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/no such table/);
+        // A wrong-schema database must not cost a single request.
+        expect(deps.calls.length).toEqual(0);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('honors the rate limit across resumed invocations', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const opts = () => sweepOpts(dir, { rps: 1, maxRequests: 1 });
+
+        const first = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const waits = [];
+        first.sleep = async (ms) => { waits.push(ms); };
+        await liq.runSweep(opts(), first);
+        expect(first.calls.length).toEqual(1);
+        const persisted = readState(dir);
+        expect(persisted.lastRequestAt).toBeGreaterThan(0);
+
+        // A new process resumes immediately: its first request must still be
+        // paced against the previous invocation's last request.
+        const second = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const secondWaits = [];
+        second.sleep = async (ms) => { secondWaits.push(ms); };
+        await liq.runSweep(opts(), second);
+
+        expect(second.calls.length).toEqual(1);
+        expect(secondWaits.length).toEqual(1);
+        expect(secondWaits[0]).toBeGreaterThan(0);
+        expect(secondWaits[0]).toBeLessThanOrEqual(1000);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it('validates precision bounds after all arguments are parsed', () => {
       // Option order must not change the experiment configuration.
       expect(() => liq.parseSweepArgs(['--max-precision', '5', '--base-precision', '6'])).toThrowError(/--max-precision/);
@@ -709,8 +815,14 @@ describe('locationiq sweep', () => {
       expect(() => liq.parseSweepArgs(['--endpoint'])).toThrowError(/--endpoint/);
       expect(() => liq.parseSweepArgs(['--api-key', '--points', 'x.jsonl'])).toThrowError(/--api-key/);
       expect(() => liq.parseSampleArgs(['--geonames', '--out'])).toThrowError(/--geonames/);
-      // The documented empty value still works.
+      // Documented short flags are option tokens too: swallowing -h would
+      // start a network sweep instead of printing help.
+      expect(() => liq.parseSweepArgs(['--accept-language', '-h'])).toThrowError(/--accept-language/);
+      expect(() => liq.parseSweepArgs(['--endpoint', '-d'])).toThrowError(/--endpoint/);
+      // The documented empty value still works, and values that merely look
+      // dash-ish are accepted.
       expect(liq.parseSweepArgs(['--accept-language', '']).acceptLanguage).toEqual('');
+      expect(liq.parseSweepArgs(['--api-key', '-secret-']).apiKey).toEqual('-secret-');
     });
 
     it('rejects unsupported --reverse-mode values instead of silently mapping them', () => {

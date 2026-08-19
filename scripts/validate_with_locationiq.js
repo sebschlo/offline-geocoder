@@ -62,11 +62,16 @@ function requireNumericArg(flag, raw) {
   return value
 }
 
+var SHORT_OPTION_TOKENS = { '-h': true, '-d': true, '-i': true }
+
 function requireValueArg(flag, raw) {
   // A following option token means the value was accidentally omitted;
   // consuming it would silently change behavior (e.g. --accept-language
-  // swallowing --dry-run turns a cache-only command into a network run).
-  if (raw === undefined || (typeof raw === 'string' && raw.slice(0, 2) === '--')) {
+  // swallowing --dry-run turns a cache-only command into a network run, and
+  // swallowing -h starts a sweep instead of printing help).
+  var isOptionToken = typeof raw === 'string' &&
+    (raw.slice(0, 2) === '--' || SHORT_OPTION_TOKENS[raw] === true)
+  if (raw === undefined || isOptionToken) {
     throw new Error(flag + ' requires a value, got: ' + (raw === undefined ? '(missing)' : raw))
   }
   return String(raw)
@@ -1279,6 +1284,15 @@ async function sampleMain(argv) {
 
 // --- sweep: cache, quota state, comparison, report -------------------------
 
+function isCoordinateLevelNotFound(body) {
+  // LocationIQ answers an un-geocodable coordinate with a JSON error body
+  // ({"error": "Unable to geocode"}). A 404 without that shape means the
+  // route itself is missing, which is a configuration problem.
+  if (!body || typeof body !== 'object') return false
+  if (typeof body.error !== 'string') return false
+  return /unable to geocode|no results? found/i.test(body.error)
+}
+
 function coerceCoord(value) {
   // Number(null), Number(true) and Number('') are all finite (0/1/0), so a
   // missing or blank coordinate would otherwise pass the range checks as a
@@ -1437,19 +1451,26 @@ function loadQuotaState(statePath, todayUtc) {
 
   // Fail closed: an existing-but-unreadable state file must not silently
   // reset today's count to zero, or a corrupted file would allow a fresh
-  // full daily cap of requests.
-  // The count must BE a number, not merely coerce to one: Number(null),
-  // Number(true) and Number('') are all finite, so a structurally damaged
-  // state file would otherwise reset the day's count and re-open the cap.
-  if (!parsed || typeof parsed.date !== 'string' || typeof parsed.count !== 'number' || !Number.isFinite(parsed.count)) {
-    throw new Error('Quota state file ' + statePath + ' exists but is unreadable; refusing to guess the request count. ' +
+  // full daily cap of requests. The count must BE a nonnegative integer,
+  // not merely coerce to one: Number(null)/Number(true)/Number('') are all
+  // finite, and clamping a negative count would equally re-open the cap.
+  var countIsValid = Boolean(parsed) && typeof parsed.count === 'number' &&
+    Number.isInteger(parsed.count) && parsed.count >= 0
+  if (!parsed || typeof parsed.date !== 'string' || !countIsValid) {
+    throw new Error('Quota state file ' + statePath + ' exists but is damaged; refusing to guess the request count. ' +
       'Inspect it and, only if you are sure no requests were made today (UTC), delete it to reset.')
   }
 
+  // The last-attempt time is advisory (it only delays the next request), so
+  // an absent or unusable value degrades to "no wait" rather than failing.
+  var lastRequestAt = typeof parsed.lastRequestAt === 'number' && Number.isFinite(parsed.lastRequestAt) && parsed.lastRequestAt > 0
+    ? parsed.lastRequestAt
+    : 0
+
   if (parsed.date !== todayUtc) {
-    return { date: todayUtc, count: 0 }
+    return { date: todayUtc, count: 0, lastRequestAt: lastRequestAt }
   }
-  return { date: todayUtc, count: Math.max(0, Math.trunc(parsed.count)) }
+  return { date: todayUtc, count: parsed.count, lastRequestAt: lastRequestAt }
 }
 
 function saveQuotaState(statePath, state) {
@@ -1457,7 +1478,9 @@ function saveQuotaState(statePath, state) {
   // state file behind (which loadQuotaState would refuse to read).
   fs.mkdirSync(path.dirname(statePath), { recursive: true })
   var tmpPath = statePath + '.tmp'
-  fs.writeFileSync(tmpPath, JSON.stringify({ date: state.date, count: state.count }) + '\n', 'utf8')
+  var payload = { date: state.date, count: state.count }
+  if (state.lastRequestAt) payload.lastRequestAt = state.lastRequestAt
+  fs.writeFileSync(tmpPath, JSON.stringify(payload) + '\n', 'utf8')
   fs.renameSync(tmpPath, statePath)
 }
 
@@ -1724,6 +1747,19 @@ async function runSweep(opts, deps) {
     log('Points file: skipped ' + loaded.skipped + ' invalid and ' + loaded.duplicates + ' duplicate rows')
   }
 
+  if (!opts.dryRun) {
+    // Preflight the offline database before spending a single request: a
+    // wrong-schema or unreadable database would otherwise only surface at
+    // report time, after the network loop had consumed the daily cap.
+    try {
+      await deps.reverse(points[0].lat, points[0].lon)
+    } catch (err) {
+      throw new Error('Offline geocoder lookup failed before any request was made (' +
+        String(err && err.message ? err.message : err) +
+        '). Check --database points at a geocoder database built for --reverse-mode ' + (opts.reverseMode || 'boundary') + '.')
+    }
+  }
+
   fs.mkdirSync(path.dirname(opts.cachePath), { recursive: true })
   if (!opts.dryRun) {
     // Dry runs only evaluate what is already cached, so the request-shaping
@@ -1749,7 +1785,9 @@ async function runSweep(opts, deps) {
   var stopDetail = ''
   var requestsThisRun = 0
   var delayMs = Math.ceil(1000 / (opts.rps > 0 ? opts.rps : 1))
-  var lastRequestAt = 0
+  // Seeded from the persisted state so a sweep resumed immediately in a new
+  // process still honors the configured rate limit for its first request.
+  var lastRequestAt = state.lastRequestAt || 0
 
   if (!opts.dryRun) {
     for (var i = 0; i < points.length; i++) {
@@ -1771,7 +1809,8 @@ async function runSweep(opts, deps) {
       // nearly twice the cap within the new UTC day.
       var attemptDate = utcDateString(nowImpl())
       if (attemptDate !== state.date) {
-        state = { date: attemptDate, count: 0 }
+        // The count resets per UTC day; the pacing timestamp does not.
+        state = { date: attemptDate, count: 0, lastRequestAt: state.lastRequestAt || 0 }
         saveQuotaState(opts.statePath, state)
       }
 
@@ -1781,11 +1820,13 @@ async function runSweep(opts, deps) {
       }
 
       // Count the attempt before it happens so a crash mid-request can only
-      // over-count, never let a later run exceed the cap.
+      // over-count, never let a later run exceed the cap. The attempt time
+      // is persisted with it so the next process paces from this request.
+      lastRequestAt = Date.now()
       state.count += 1
+      state.lastRequestAt = lastRequestAt
       saveQuotaState(opts.statePath, state)
       requestsThisRun += 1
-      lastRequestAt = Date.now()
 
       var url = buildLocationIqUrl(opts.endpoint, opts.apiKey, point.lat, point.lon, opts.acceptLanguage)
       var response
@@ -1798,10 +1839,21 @@ async function runSweep(opts, deps) {
       }
 
       var status = Number(response && response.status)
+      if (status === 404 && !isCoordinateLevelNotFound(response.json)) {
+        // A 404 that does not carry LocationIQ's per-coordinate "unable to
+        // geocode" shape is the ROUTE being missing (mistyped --endpoint, a
+        // proxy, an API change), not a fact about this point. Treat it like
+        // the 400 case: stop immediately and cache nothing, instead of
+        // spending the whole daily cap and poisoning the cache.
+        stopReason = 'bad_endpoint'
+        stopDetail = 'HTTP 404 without a coordinate-level error body'
+        break
+      }
+
       if (status === 200 || status === 404) {
-        // 200 is an answer and 404 is LocationIQ's definitive, coordinate-
-        // specific "unable to geocode" (e.g. open ocean) — both cacheable so
-        // they are never asked again.
+        // 200 is an answer and a coordinate-level 404 is LocationIQ's
+        // definitive "unable to geocode" (e.g. open ocean) — both cacheable
+        // so they are never asked again.
         var entry = {
           key: point.key,
           lat: point.lat,
@@ -1878,6 +1930,8 @@ async function runSweep(opts, deps) {
       unfetched + ' points still unfetched. Re-run the same command after the next UTC day starts to resume; cached points are never re-queried.')
   } else if (stopReason === 'rate_limited') {
     log('LocationIQ returned HTTP 429 (rate limited). Backing off and stopping this run cleanly; all fetched responses are cached. Wait for the quota window to reset, then re-run the same command to resume.')
+  } else if (stopReason === 'bad_endpoint') {
+    log('LocationIQ returned HTTP 404 for the route itself, not for the coordinate (' + stopDetail + '). This usually means --endpoint is wrong or a proxy intercepted the request, so the response was not cached and the run stopped before spending more quota. Fix the endpoint, then re-run to resume.')
   } else if (stopReason === 'bad_request') {
     log('LocationIQ rejected the request shape (HTTP 400). This is a configuration problem (endpoint or parameters), so the response was not cached and the run stopped before spending more quota. Fix the configuration, then re-run to resume.')
   } else if (stopReason === 'auth_error') {
