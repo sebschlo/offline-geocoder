@@ -1,5 +1,14 @@
 ### Unreleased
 
+- Fix `--append` builds handing contested geohash cells to whichever batch ran
+  last. Cells that already belong to a better-ranked place (by placetype, then
+  population, then centroid distance) now keep their existing owner, so border
+  cities no longer resolve to the neighbouring country that happened to be
+  processed later (for example Tijuana resolving to San Diego).
+- Store `population` and `area` in `compact_places` so append batches can rank
+  candidates against previously written places. Existing databases are
+  upgraded in place when appending; the new columns are nullable and readers
+  are unaffected.
 - Add curation overlay mechanism (`curation/`, `scripts/apply_curation.js`, `npm run curate`) for judgment calls the build rules cannot derive from data, with cross-file conflict validation, transactional probe verification, and the first entry: Guatemala City absorbs the Carretera a El Salvador corridor municipalities at fine precision only
 
 ### 1.0.0 - 2018-08-02
