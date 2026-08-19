@@ -40,6 +40,9 @@ set -euo pipefail
 #
 # Notes:
 #   - This helper always builds `--index-mode compact` (geohash -> place only).
+#   - Batches merge by match quality: a border cell written by an earlier
+#     country batch is only overwritten when the later candidate outranks the
+#     existing place (placetype, then population, then centroid distance).
 
 WOF_COUNTRIES="${WOF_COUNTRIES:-FR,IT}"
 WOF_WORKDIR="${WOF_WORKDIR:-$(pwd)/tmp/wof-build}"
