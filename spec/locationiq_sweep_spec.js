@@ -694,6 +694,30 @@ describe('locationiq sweep', () => {
       }
     });
 
+    it('fails closed on a damaged persisted quota date', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        // Any string that is not a real canonical UTC date would otherwise
+        // read as "an earlier day" and reset a fully spent count to zero.
+        for (const badDate of ['', 'yesterday', '2026-8-19', '2026-02-30', '20260819']) {
+          fs.writeFileSync(path.join(dir, 'quota.json'), JSON.stringify({ date: badDate, count: 4500 }));
+          await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/quota state/i);
+        }
+        expect(deps.calls.length).toEqual(0);
+
+        // A genuine earlier day still rolls the count over.
+        fs.writeFileSync(path.join(dir, 'quota.json'), JSON.stringify({ date: '2000-01-01', count: 4500 }));
+        const summary = await liq.runSweep(sweepOpts(dir), deps);
+        expect(deps.calls.length).toEqual(5);
+        expect(summary.stopReason).toBeNull();
+        expect(readState(dir).date).toEqual(liq.utcDateString(new Date()));
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it('stops without caching when a 404 rejects the route rather than the coordinate', async () => {
       const dir = makeTmpDir();
       try {

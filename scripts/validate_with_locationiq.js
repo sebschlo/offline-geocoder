@@ -1087,6 +1087,16 @@ function utcDateString(date) {
   return date.toISOString().slice(0, 10)
 }
 
+function isCanonicalUtcDateString(value) {
+  // Must be YYYY-MM-DD *and* a real calendar date: the round-trip rejects
+  // both malformed strings and impossible dates like 2026-02-30, either of
+  // which would otherwise read as "an earlier day" and reset the count.
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  var parsedMs = Date.parse(value + 'T00:00:00Z')
+  if (!Number.isFinite(parsedMs)) return false
+  return utcDateString(new Date(parsedMs)) === value
+}
+
 function sweepCoordKey(latitude, longitude) {
   return Number(latitude).toFixed(SWEEP_CACHE_DECIMALS) + ',' + Number(longitude).toFixed(SWEEP_CACHE_DECIMALS)
 }
@@ -1454,9 +1464,11 @@ function loadQuotaState(statePath, todayUtc) {
   // full daily cap of requests. The count must BE a nonnegative integer,
   // not merely coerce to one: Number(null)/Number(true)/Number('') are all
   // finite, and clamping a negative count would equally re-open the cap.
+  // The date must be a real canonical UTC date for the same reason: any
+  // other string would look like "an earlier day" and reset the count.
   var countIsValid = Boolean(parsed) && typeof parsed.count === 'number' &&
     Number.isInteger(parsed.count) && parsed.count >= 0
-  if (!parsed || typeof parsed.date !== 'string' || !countIsValid) {
+  if (!parsed || !isCanonicalUtcDateString(parsed.date) || !countIsValid) {
     throw new Error('Quota state file ' + statePath + ' exists but is damaged; refusing to guess the request count. ' +
       'Inspect it and, only if you are sure no requests were made today (UTC), delete it to reset.')
   }
