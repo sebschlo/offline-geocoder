@@ -698,16 +698,9 @@ describe('reader compatibility: compact v2 schema generation (shipped)', () => {
   expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.compactV2);
 });
 
-// Generation 4 (PENDING, gated on PR #3): compact v2 schema with nullable
-// population/area columns. The append/merge work in
-// https://github.com/sebschlo/offline-geocoder/pull/3 adds these columns
-// and upgrades older databases in place with ALTER TABLE ... ADD COLUMN;
-// no released builder produces them yet.
-//
-// Until #3 ships, this block pins the general contract rule that additive
-// nullable columns on compact_places are invisible to readers; it may be
-// amended if #3's final shape differs, and becomes immutable once that
-// generation ships.
+// Generation 4: compact v2 schema with nullable population/area columns,
+// added by the append/merge work (#3), which upgrades older databases in
+// place with ALTER TABLE ... ADD COLUMN.
 //
 // Same tables as generation 3 plus two nullable REAL columns that the
 // reader does not select. The fixture stores values on one locality and
@@ -851,11 +844,11 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
     const built = build('compact');
     try {
       expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
-      // Generation 4's population/area columns are deliberately NOT
-      // required here: that generation is still pending on PR #3, so no
-      // released builder produces them yet. Add them to this assertion
-      // when it ships.
+      // Generation 3 first: those seven columns are what readers shipped
+      // before population/area existed, and they must survive every
+      // future widening of this table.
       await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactV2);
+      await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactV2Population);
     } finally {
       built.cleanup();
     }
