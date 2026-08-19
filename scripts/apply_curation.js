@@ -535,6 +535,21 @@ async function countReturnableCells(db, entry, journalTrusted) {
   return rows.length ? rows[0].count : 0
 }
 
+// Restorable orphan cells this entry will immediately take back: their
+// source is one this entry absorbs (it was previously merged into a
+// different target), and they sit at or above this entry's minPrecision.
+// Reconciliation hands them to the source, then this entry drains them.
+function countReclaimableOrphans(restorableOrphans, entry) {
+  var absorbed = Object.create(null)
+  entry.absorb.forEach(function(id) {
+    absorbed[id] = true
+  })
+
+  return restorableOrphans.filter(function(row) {
+    return absorbed[row.absorbed_id] && String(row.geohash).length >= entry.minPrecision
+  }).length
+}
+
 // One UPDATE per source (sources are disjoint after conflict validation, so
 // this is equivalent to a single IN-list update) so each drained cell can be
 // journaled with its original owner. Verification uses the per-cell records
@@ -648,14 +663,24 @@ async function findOrphanedJournalCells(db, entries) {
 
   var rows = await dbAll(db, `
     SELECT c.geohash AS geohash, c.into_id AS into_id, c.absorbed_id AS absorbed_id,
-      UPPER(p.country_id) AS country
+      UPPER(p.country_id) AS country,
+      l.place_id AS current_owner
     FROM curation_journal_cells c
     JOIN compact_places p ON p.id = c.into_id
+    LEFT JOIN compact_geohash_lookup l ON l.geohash = c.geohash
   `)
 
   return rows.filter(function(row) {
     if (!countries[row.country]) return false
     return !declared[row.into_id + '|' + row.absorbed_id]
+  }).map(function(row) {
+    // Only cells the old target still owns can actually be given back; a
+    // cell that was deleted or taken over by a third place merely has its
+    // journal record retired.
+    row.restorable = row.current_owner !== null &&
+      row.current_owner !== undefined &&
+      Number(row.current_owner) === Number(row.into_id)
+    return row
   })
 }
 
@@ -1187,33 +1212,37 @@ async function main() {
 
     if (options.dryRun) {
       var dryRunJournal = await journalState(db)
+
+      // A real apply reconciles first, so orphaned cells the old target
+      // still owns are back with their original owner before the merges
+      // run. Cells an entry will immediately reclaim therefore belong in
+      // that entry's count; only the rest are reported as released.
+      var restorableOrphans = dryRunJournal.trusted
+        ? (await findOrphanedJournalCells(db, entries)).filter(function(row) { return row.restorable })
+        : []
+      var reclaimedOrphans = 0
+
       for (var i = 0; i < entries.length; i++) {
         var entry = entries[i]
         var intoName = await describePlace(db, entry.into)
-        var count = await countAffectedRows(db, entry)
+        var reclaimable = countReclaimableOrphans(restorableOrphans, entry)
+        var count = (await countAffectedRows(db, entry)) + reclaimable
         var returnable = await countReturnableCells(db, entry, dryRunJournal.trusted)
+        reclaimedOrphans += reclaimable
         totalRelabeled += count
         console.log('[dry-run] ' + entryLabel(entry, intoName) + ': would relabel ' + count + ' cell(s)' +
           (returnable ? ' and return ' + returnable + ' coarse cell(s) to their original owners' : ''))
       }
 
-      // A real apply also reconciles journal rows the files no longer
-      // declare, which can change more cells than the entries themselves.
-      if (dryRunJournal.trusted) {
-        var orphaned = await findOrphanedJournalCells(db, entries)
-        if (orphaned.length) {
-          console.log('[dry-run] would restore ' + orphaned.length +
-            ' cell(s) from source(s) no longer absorbed by any loaded entry')
-        }
+      var released = restorableOrphans.length - reclaimedOrphans
+      if (released > 0) {
+        console.log('[dry-run] would restore ' + released +
+          ' cell(s) from source(s) no longer absorbed by any loaded entry')
       }
     } else {
       var journal = await journalState(db)
       var boundary = null
       var resolvability = null
-      if (options.verify) {
-        boundary = await deriveBoundaryPrecision(db)
-        resolvability = await computeResolvability(db, entries)
-      }
 
       await dbExec(db, 'BEGIN')
       try {
@@ -1223,6 +1252,15 @@ async function main() {
         // `into` still has its cells parked on the old target, and they must
         // be released before the new merge can pick them up.
         await reconcileOrphanedJournal(db, entries)
+
+        // Measure source availability HERE: after reconciliation has handed
+        // restored cells back to their original owners, and before the
+        // merges drain them again. This is the only moment the database
+        // shows what the data build actually provides for these entries.
+        if (options.verify) {
+          boundary = await deriveBoundaryPrecision(db)
+          resolvability = await computeResolvability(db, entries)
+        }
 
         for (var j = 0; j < entries.length; j++) {
           var applied = entries[j]

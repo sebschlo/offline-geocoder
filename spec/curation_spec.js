@@ -1525,6 +1525,170 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
+  it('measures source availability after reconciling a retargeted source', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: initial target.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      expect(runCurate(['--database', dbPath, '--curation', docPath]).status).toEqual(0);
+
+      // Retarget East County to Bystander County. Its cells sit on Big City
+      // at snapshot time, but reconciliation restores them and the merge
+      // drains them, so the source is NOT unavailable: an unrelated failing
+      // positive probe must not be excused by a stale missing-source verdict.
+      writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: BYSTANDER,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: revised entry retargets East County.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Bystander County', note: 'positive on the restored cell' },
+              { lat: points.west.lat, lon: points.west.lon, expect: 'Bystander County', note: 'positive that genuinely fails: West County owns this cell' },
+              { lat: points.city.lat, lon: points.city.lon, expect: 'Big City', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('expected "Bystander County", got "West County"');
+      expect(result.stdout).not.toContain('skipped: 1');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('counts cells a retargeted entry will reclaim in dry-run output', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: initial target.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      expect(runCurate(['--database', dbPath, '--curation', docPath]).status).toEqual(0);
+
+      writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: BYSTANDER,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: revised entry retargets East County.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Bystander County', note: 'positive' },
+              { lat: points.city.lat, lon: points.city.lon, expect: 'Big City', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const snapshot = await lookupSnapshot(dbPath);
+      const dryRun = runCurate(['--database', dbPath, '--curation', docPath, '--dry-run']);
+      expect(dryRun.status).toEqual(0);
+
+      // The cell is restored from the old target and immediately drained by
+      // the revised entry, so it belongs in the entry's own count and must
+      // not be double-reported as a release.
+      expect(dryRun.stdout).toContain('would relabel 1 cell(s)');
+      expect(dryRun.stdout).toContain('Cells that would be relabeled: 1');
+      expect(dryRun.stdout).not.toContain('would restore');
+      expect(await lookupSnapshot(dbPath)).toEqual(snapshot);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('excludes orphan cells taken over by a third place from the dry-run restore count', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
+
+      expect(runCurate(['--database', dbPath, '--curation', docPath]).status).toEqual(0);
+
+      // Drop West County from absorb, then let a third place take over the
+      // orphaned cell: the real apply only retires the journal record, so
+      // the preview must not claim it would restore anything.
+      writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: revised entry no longer absorbs West County.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `UPDATE compact_geohash_lookup SET place_id = ${BYSTANDER} WHERE geohash = '${cells.westFine}'`);
+      } finally {
+        await close(db);
+      }
+
+      const snapshot = await lookupSnapshot(dbPath);
+      const dryRun = runCurate(['--database', dbPath, '--curation', docPath, '--dry-run']);
+      expect(dryRun.status).toEqual(0);
+      expect(dryRun.stdout).not.toContain('would restore');
+      expect(await lookupSnapshot(dbPath)).toEqual(snapshot);
+
+      // The real apply agrees: nothing is restored, the record is retired.
+      const applied = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(applied.status).toEqual(0);
+      expect(applied.stdout).not.toContain('returned 1 cell(s) from source(s) no longer absorbed');
+      expect(ownerOf(await lookupSnapshot(dbPath), cells.westFine)).toEqual(BYSTANDER);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('ships a structurally valid Guatemala curation file', () => {
     const gtPath = path.join(__dirname, '..', 'curation', 'gt.json');
     const doc = JSON.parse(fs.readFileSync(gtPath, 'utf8'));
