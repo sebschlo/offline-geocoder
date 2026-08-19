@@ -26,7 +26,9 @@ Because these entries are opinions, they carry obligations:
   enough detail that a reviewer without local knowledge can evaluate it.
 - **Every entry must have `probes`** — coordinates with expected labels,
   including *guard* probes that pin down where the curation must **not**
-  reach.
+  reach. Validation enforces this: at least one probe must expect a label
+  other than the merge target's name, so an entry cannot ship with positive
+  probes only.
 - Entries should be few. A country file with dozens of entries is a sign the
   build rules need generalizing instead.
 
@@ -69,7 +71,7 @@ country it is named for.
 | `entries[].absorb` | array of integers | Place ids whose reverse-lookup cells are relabeled to `into`. Must exist in `compact_places`; must not include `into`. |
 | `entries[].minPrecision` | integer (1–12) | Only geohash cells of at least this length are relabeled. Coarser cells keep their original owner. |
 | `entries[].rationale` | string | Required. The reviewable justification for the entry. |
-| `entries[].probes` | array | Required. Coordinates with expected reverse-lookup labels, checked by `--verify`. |
+| `entries[].probes` | array | Required. Coordinates with expected reverse-lookup labels, checked by `--verify`. Must include at least one guard probe whose `expect` is not the merge target's name. |
 | `probes[].lat`, `probes[].lon` | number | Probe coordinate. |
 | `probes[].expect` | string | Expected `result.name` from a reverse lookup at that coordinate. |
 | `probes[].note` | string | Optional human context (what the coordinate is, or which guard it enforces). |
@@ -107,6 +109,11 @@ WHERE place_id IN (<absorb...>) AND LENGTH(geohash) >= <minPrecision>
   absorbed place, cumulative relabeled-cell counts). Verification uses it to
   distinguish a source the data build never had (probes may be deferred) from
   a source a previous apply already consumed (probes stay strict).
+- The journal is **tied to the current compact-table generation**: an inert
+  marker trigger on `compact_geohash_lookup` is dropped by SQLite together
+  with the table, so a replace-mode rebuild automatically invalidates the old
+  drain evidence and the next apply starts a fresh journal. In-place edits do
+  not drop the table, so evidence about the current generation survives them.
 
 ## Applying
 

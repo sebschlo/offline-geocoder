@@ -426,6 +426,37 @@ async function describePlace(db, placeId) {
   return rows.length ? rows[0].name : String(placeId)
 }
 
+// Probes that only expect the merge target prove nothing about where the
+// merge must NOT reach: a typo'd absorb id relabeling an unrelated
+// municipality would sail through verification. Every entry must carry at
+// least one guard probe — a probe whose expected label differs from the
+// merge target's name.
+async function assertGuardProbes(db, entries) {
+  var problems = []
+
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i]
+    var intoName = await describePlace(db, entry.into)
+    var hasGuard = false
+
+    for (var j = 0; j < entry.probes.length; j++) {
+      if (entry.probes[j].expect !== intoName) {
+        hasGuard = true
+        break
+      }
+    }
+
+    if (!hasGuard) {
+      problems.push(entry.source + ' entry ' + entry.index + ': every probe expects the merge target "' +
+        intoName + '"; add at least one guard probe pinning down where the merge must not reach')
+    }
+  }
+
+  if (problems.length) {
+    throw new Error('Curation validation failed:\n  ' + problems.join('\n  '))
+  }
+}
+
 async function countAffectedRows(db, entry) {
   var placeholders = entry.absorb.map(function() { return '?' }).join(', ')
   var rows = await dbAll(db, `
@@ -529,17 +560,40 @@ async function deriveBoundaryPrecision(db) {
 // or a previous apply already moved them to the target (stay strict). The
 // journal disambiguates the two so re-verification of an already-curated
 // database cannot become vacuous.
-async function hasCurationJournal(db) {
+//
+// The journal is tied to the current compact-table generation through an
+// inert marker trigger on compact_geohash_lookup: SQLite drops a table's
+// triggers with the table, so a replace-mode rebuild (which drops and
+// recreates the compact tables) kills the marker while leaving the journal.
+// Journal present + marker gone therefore means the drain evidence describes
+// a previous database generation and must not be trusted; the next apply
+// clears it and re-creates the marker. In-place edits (including cell
+// corruption, which verification must stay strict about) never drop the
+// table, so the marker survives them.
+var JOURNAL_MARKER_TRIGGER = 'curation_journal_generation_marker'
+
+async function journalState(db) {
   var rows = await dbAll(db, `
-    SELECT name
+    SELECT name, type
     FROM sqlite_master
-    WHERE type='table'
-      AND name='curation_journal'
+    WHERE (type='table' AND name='curation_journal')
+       OR (type='trigger' AND name='${JOURNAL_MARKER_TRIGGER}')
   `)
-  return rows.length > 0
+
+  var present = false
+  var markerPresent = false
+  rows.forEach(function(row) {
+    if (row.type === 'table') present = true
+    if (row.type === 'trigger') markerPresent = true
+  })
+
+  return {
+    present: present,
+    trusted: present && markerPresent
+  }
 }
 
-async function ensureCurationJournal(db) {
+async function ensureCurationJournal(db, journal) {
   await dbExec(db, `
     CREATE TABLE IF NOT EXISTS curation_journal(
       into_id INTEGER NOT NULL,
@@ -550,10 +604,26 @@ async function ensureCurationJournal(db) {
       PRIMARY KEY (into_id, absorbed_id)
     )
   `)
+
+  if (journal.present && !journal.trusted) {
+    await dbRun(db, 'DELETE FROM curation_journal')
+  }
+
+  // Inert by design: compact_geohash_lookup rows are never deleted by the
+  // library or by curation, and the generator's append mode deletes are
+  // harmless no-ops through this trigger. Its only job is to die with the
+  // table on a replace-mode rebuild.
+  await dbExec(db, `
+    CREATE TRIGGER IF NOT EXISTS ${JOURNAL_MARKER_TRIGGER}
+    AFTER DELETE ON compact_geohash_lookup
+    BEGIN
+      SELECT 1;
+    END
+  `)
 }
 
-async function sourcePreviouslyDrained(db, journalPresent, intoId, sourceId) {
-  if (!journalPresent) {
+async function sourcePreviouslyDrained(db, journalTrusted, intoId, sourceId) {
+  if (!journalTrusted) {
     return false
   }
 
@@ -576,7 +646,7 @@ async function sourcePreviouslyDrained(db, journalPresent, intoId, sourceId) {
 // shipped ahead of the data build that makes it effective.
 async function computeResolvability(db, entries) {
   var missingSourcesByEntry = Object.create(null)
-  var journalPresent = await hasCurationJournal(db)
+  var journal = await journalState(db)
 
   for (var i = 0; i < entries.length; i++) {
     var entry = entries[i]
@@ -587,7 +657,7 @@ async function computeResolvability(db, entries) {
       if (await placeOwnsRelabelableCells(db, sourceId, entry.minPrecision)) {
         continue
       }
-      if (await sourcePreviouslyDrained(db, journalPresent, entry.into, sourceId)) {
+      if (await sourcePreviouslyDrained(db, journal.trusted, entry.into, sourceId)) {
         continue
       }
       missing.push(sourceId)
@@ -709,6 +779,7 @@ async function main() {
   try {
     await assertCompactSchema(db, databasePath)
     await assertPlaceIdsExist(db, entries)
+    await assertGuardProbes(db, entries)
 
     if (options.dryRun) {
       for (var i = 0; i < entries.length; i++) {
@@ -719,6 +790,7 @@ async function main() {
         console.log('[dry-run] ' + entryLabel(entry, intoName) + ': would relabel ' + count + ' cell(s)')
       }
     } else {
+      var journal = await journalState(db)
       var boundary = null
       var resolvability = null
       if (options.verify) {
@@ -728,7 +800,7 @@ async function main() {
 
       await dbExec(db, 'BEGIN')
       try {
-        await ensureCurationJournal(db)
+        await ensureCurationJournal(db, journal)
 
         for (var j = 0; j < entries.length; j++) {
           var applied = entries[j]
