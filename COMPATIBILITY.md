@@ -10,8 +10,16 @@ document is the contract that makes that possible.
 
 Schema changes must be **additive only**:
 
-- **Never** rename, repurpose, drop, or change the meaning, type, or
-  nullability of an existing shipped column or table.
+- **Never** rename, repurpose, drop, or change the meaning or declared
+  type of an existing shipped column or table. Type affinity is
+  reader-visible: flipping `latitude REAL` to `TEXT` hands arithmetic a
+  string.
+- **Never relax** a shipped `NOT NULL` column to nullable — readers may
+  rely on a value always being present. Tightening a nullable column to
+  `NOT NULL` is reader-safe (`scripts/schema.sql` has already done this to
+  `features.name` and `features.country_id` relative to v1.0.0) but
+  constrains every builder that writes the table, so treat it as a
+  builder-side breaking change.
 - New columns must be nullable (or have a default) and may only be added to
   the end of a table with `ALTER TABLE ... ADD COLUMN`.
 - New tables are always allowed.
@@ -72,16 +80,22 @@ frozen rather than recomputed:
   while real databases became unreadable. A conformance spec pins the
   encoder against published geohash reference vectors and against every
   literal the fixtures store.
-- **Each generation's exact column set is asserted** (`PRAGMA
-  table_info`), so a fixture cannot be quietly widened to make a new
-  reader pass.
+- **Each generation's exact column signature is asserted** (`PRAGMA
+  table_info`: name, type, `NOT NULL`, default, primary-key flag), so a
+  fixture cannot be quietly widened, retyped or relaxed to make a new
+  reader pass. Column *order* is deliberately not asserted — readers
+  select by name.
 - **Freshly generated databases are asserted to be supersets** of the
-  frozen column set of every generation their mode has shipped. The
-  builder is run for real (`--index-mode compact` and `--index-mode
-  full`) and its output inspected, which covers the contract's opposite
-  direction — a builder dropping or renaming a column that older readers
-  still need — even while the current reader happens to support both
-  layouts.
+  frozen columns of every generation they have shipped, by name **and
+  declared type**. This covers the contract's opposite direction — a
+  builder dropping, renaming or retyping a column that older readers still
+  need — even while the current reader happens to support both layouts.
+  All the generators are exercised: `generate_boundary_index.js` in
+  `--index-mode compact` and `--index-mode full`, and `scripts/schema.sql`
+  (applied verbatim by `generate_geonames.sh`), including the output
+  columns of the `everything` view that centroid, forward and id-lookup
+  readers select from. Nullability and defaults are not required to match
+  there, because tightening them is reader-safe; see the contract above.
 
 Rules for contributors:
 

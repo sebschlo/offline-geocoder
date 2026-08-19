@@ -57,60 +57,107 @@ const FROZEN_GEOHASH = {
   '47.3,-3.7': 'gbmm5'
 };
 
-// Frozen column sets, in declaration order, for every generation.
+// Frozen column signatures, in declaration order, for every generation.
+//
+// Each entry is `name TYPE [NOT NULL] [DEFAULT x] [PK]` — the fields of
+// PRAGMA table_info that are part of the compatibility contract:
+//
+// - `name` and `type` are asserted everywhere. Affinity is reader-visible:
+//   flipping `latitude REAL` to TEXT hands arithmetic a string.
+// - `NOT NULL`, `DEFAULT` and `PK` are asserted on fixtures (frozen
+//   history, nothing legitimately changes them) but NOT on generated
+//   databases, where only name+type are required. That is deliberate:
+//   relaxing a shipped NOT NULL column is reader-visible (a value readers
+//   always had can arrive null), while tightening one only constrains
+//   builders — and the current scripts/schema.sql legitimately tightened
+//   `features.name` / `features.country_id` to NOT NULL relative to the
+//   v1.0.0 schema without breaking any reader.
+// - `cid` (ordinal position) is deliberately excluded: the contract
+//   requires readers to select by name, so column order is not binding.
+//   These lists are written in declaration order purely for legibility.
 //
 // Two jobs: each fixture asserts its own tables match EXACTLY (so a
 // fixture cannot be quietly widened to make a new reader pass), and the
-// builder block at the bottom asserts freshly generated databases are a
-// SUPERSET of the shipped sets (so a builder that drops or renames a
-// shipped column fails here, even while the current reader still happens
-// to support both layouts).
+// generated-database block at the bottom asserts freshly built databases
+// are a SUPERSET of the shipped sets (so a builder that drops, renames or
+// retypes a shipped column fails here, even while the current reader still
+// happens to support both layouts).
 const FROZEN_COLUMNS = {
+  // Generation 0 as v1.0.0 actually declared it: no NOT NULL anywhere.
+  // scripts/schema.sql has since tightened several of these columns, which
+  // is why the generated-database check compares name+type only.
   centroid: {
-    coordinates: ['feature_id', 'latitude', 'longitude'],
-    features: ['id', 'name', 'country_id', 'admin1_id'],
-    admin1: ['country_id', 'id', 'name'],
-    countries: ['id', 'name']
+    coordinates: ['feature_id INTEGER PK', 'latitude REAL', 'longitude REAL'],
+    features: ['id INTEGER PK', 'name TEXT', 'country_id TEXT', 'admin1_id INTEGER'],
+    admin1: ['country_id TEXT PK', 'id INTEGER PK', 'name TEXT'],
+    countries: ['id TEXT PK', 'name TEXT']
   },
   full: {
-    countries: ['id', 'name'],
-    admin1: ['country_id', 'id', 'name'],
+    countries: ['id TEXT PK', 'name TEXT NOT NULL'],
+    admin1: ['country_id TEXT NOT NULL PK', 'id INTEGER NOT NULL PK', 'name TEXT NOT NULL'],
     places: [
-      'id', 'name', 'country_id', 'admin1_id', 'placetype',
-      'centroid_lat', 'centroid_lon',
-      'bbox_min_lat', 'bbox_min_lon', 'bbox_max_lat', 'bbox_max_lon',
-      'priority_rank', 'area', 'country_name', 'admin1_name'
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype TEXT NOT NULL',
+      'centroid_lat REAL NOT NULL', 'centroid_lon REAL NOT NULL',
+      'bbox_min_lat REAL NOT NULL', 'bbox_min_lon REAL NOT NULL',
+      'bbox_max_lat REAL NOT NULL', 'bbox_max_lon REAL NOT NULL',
+      'priority_rank INTEGER NOT NULL DEFAULT 0', 'area REAL NOT NULL DEFAULT 0',
+      'country_name TEXT', 'admin1_name TEXT'
     ],
-    place_geohash_cover: ['geohash', 'precision', 'place_id', 'coverage_type'],
-    place_geometry: ['place_id', 'encoding', 'geometry'],
-    place_geohash_lookup: ['geohash', 'place_id']
+    place_geohash_cover: [
+      'geohash TEXT NOT NULL PK', 'precision INTEGER NOT NULL PK',
+      'place_id INTEGER NOT NULL PK', 'coverage_type TEXT NOT NULL'
+    ],
+    place_geometry: [
+      'place_id INTEGER PK', "encoding TEXT NOT NULL DEFAULT 'json'",
+      'geometry BLOB NOT NULL'
+    ],
+    place_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
   },
   compactLegacy: {
-    countries: ['id', 'name'],
-    admin1: ['country_id', 'id', 'name'],
+    countries: ['id TEXT PK', 'name TEXT NOT NULL'],
+    admin1: ['country_id TEXT NOT NULL PK', 'id INTEGER NOT NULL PK', 'name TEXT NOT NULL'],
     places: [
-      'id', 'name', 'country_id', 'admin1_id', 'placetype',
-      'centroid_lat', 'centroid_lon',
-      'bbox_min_lat', 'bbox_min_lon', 'bbox_max_lat', 'bbox_max_lon',
-      'priority_rank', 'area', 'country_name', 'admin1_name'
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype TEXT NOT NULL',
+      'centroid_lat REAL NOT NULL', 'centroid_lon REAL NOT NULL',
+      'bbox_min_lat REAL NOT NULL', 'bbox_min_lon REAL NOT NULL',
+      'bbox_max_lat REAL NOT NULL', 'bbox_max_lon REAL NOT NULL',
+      'priority_rank INTEGER NOT NULL DEFAULT 0', 'area REAL NOT NULL DEFAULT 0',
+      'country_name TEXT', 'admin1_name TEXT'
     ],
-    place_geohash_lookup: ['geohash', 'place_id']
+    place_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
   },
   compactV2: {
     compact_places: [
-      'id', 'name', 'country_id', 'admin1_id', 'placetype_code',
-      'latitude', 'longitude'
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype_code INTEGER NOT NULL',
+      'latitude REAL NOT NULL', 'longitude REAL NOT NULL'
     ],
-    compact_geohash_lookup: ['geohash', 'place_id']
+    compact_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
   },
   compactV2Population: {
     compact_places: [
-      'id', 'name', 'country_id', 'admin1_id', 'placetype_code',
-      'latitude', 'longitude', 'population', 'area'
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype_code INTEGER NOT NULL',
+      'latitude REAL NOT NULL', 'longitude REAL NOT NULL',
+      'population REAL', 'area REAL'
     ],
-    compact_geohash_lookup: ['geohash', 'place_id']
+    compact_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
   }
 };
+
+// Output columns of the `everything` view as generation 0 exposed them.
+// Readers select from this view and read fields by name, so its output
+// column set is contract surface even though no table declares it.
+//
+// Names only: a view's reported column affinity is derived from the
+// underlying expression and varies with the SQLite version, so pinning
+// types here would test the host, not the schema.
+const FROZEN_EVERYTHING_COLUMNS = [
+  'id', 'name', 'admin1_id', 'admin1_name',
+  'country_id', 'country_name', 'latitude', 'longitude'
+];
 
 function exec(db, sql) {
   return new Promise((resolve, reject) => {
@@ -136,27 +183,58 @@ function close(db) {
   });
 }
 
-// Reads column names in declaration order via PRAGMA table_info.
-async function readColumns(databasePath, table) {
+// Renders one PRAGMA table_info row in the frozen-signature format.
+function formatSignature(row, typeOnly) {
+  let signature = `${row.name} ${row.type}`;
+  if (typeOnly) {
+    return signature;
+  }
+  if (row.notnull) signature += ' NOT NULL';
+  if (row.dflt_value !== null && row.dflt_value !== undefined) {
+    signature += ` DEFAULT ${row.dflt_value}`;
+  }
+  if (row.pk) signature += ' PK';
+  return signature;
+}
+
+// Reads column signatures in declaration order via PRAGMA table_info.
+// typeOnly drops the fields that generated databases may legitimately
+// tighten (see FROZEN_COLUMNS).
+async function readSignatures(databasePath, table, typeOnly) {
   const db = new sqlite3.Database(databasePath);
   try {
     const rows = await all(db, `PRAGMA table_info(${table})`);
-    return rows.map((row) => row.name);
+    return rows.map((row) => formatSignature(row, typeOnly));
   } finally {
     await close(db);
   }
 }
 
-// Registers the exact-column-set assertion for one generation's fixture.
+// Registers the exact-signature assertion for one generation's fixture.
 function expectFrozenColumns(getDatabasePath, frozen) {
-  it('preserves the exact frozen column set of this generation', async () => {
+  it('preserves the exact frozen column signatures of this generation', async () => {
     for (const table of Object.keys(frozen)) {
-      const actual = await readColumns(getDatabasePath(), table);
+      const actual = await readSignatures(getDatabasePath(), table, false);
       // Compared as strings so a failure names the table and both lists.
       expect(`${table}: ${actual.join(', ')}`)
         .toEqual(`${table}: ${frozen[table].join(', ')}`);
     }
   });
+}
+
+// Asserts a generated database still carries every frozen column, by name
+// and declared type. Extra columns pass; drops, renames and retypes fail.
+async function expectSuperset(databasePath, frozen) {
+  for (const table of Object.keys(frozen)) {
+    const actual = await readSignatures(databasePath, table, true);
+    const required = frozen[table].map((entry) => {
+      const parts = entry.split(' ');
+      return `${parts[0]} ${parts[1]}`;
+    });
+    const missing = required.filter((entry) => actual.indexOf(entry) === -1);
+    // Compared as strings so a failure names the table and the columns.
+    expect(`${table} missing: ${missing.join(', ')}`).toEqual(`${table} missing: `);
+  }
 }
 
 function createTempDatabase(name) {
@@ -831,15 +909,6 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
     };
   }
 
-  async function expectSuperset(databasePath, frozen) {
-    for (const table of Object.keys(frozen)) {
-      const actual = await readColumns(databasePath, table);
-      const missing = frozen[table].filter((column) => actual.indexOf(column) === -1);
-      // Compared as strings so a failure names the table and the columns.
-      expect(`${table} missing: ${missing.join(', ')}`).toEqual(`${table} missing: `);
-    }
-  }
-
   it('keeps every shipped compact v2 column in --index-mode compact', async () => {
     const built = build('compact');
     try {
@@ -864,4 +933,37 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
       built.cleanup();
     }
   }, 30000);
+
+  // The GeoNames base schema has its own generator: scripts/schema.sql,
+  // applied verbatim by scripts/generate_geonames.sh. Without this case a
+  // dropped or renamed generation-0 column — or a narrowed `everything`
+  // view — would ship while every fixture above stayed green, because the
+  // fixtures hand-write their own historical DDL.
+  describe('GeoNames base schema (scripts/schema.sql)', () => {
+    let fixture;
+
+    beforeAll(async () => {
+      fixture = createTempDatabase('schema-sql');
+      const schemaSql = fs.readFileSync(
+        path.join(__dirname, '..', 'scripts', 'schema.sql'), 'utf8');
+      await exec(fixture.db, schemaSql);
+      await close(fixture.db);
+    });
+
+    afterAll(() => {
+      fixture.cleanup();
+    });
+
+    it('keeps every generation-0 table column', async () => {
+      await expectSuperset(fixture.databasePath, FROZEN_COLUMNS.centroid);
+    });
+
+    it('keeps every generation-0 output column of the everything view', async () => {
+      const actual = await readSignatures(fixture.databasePath, 'everything', true);
+      const names = actual.map((entry) => entry.split(' ')[0]);
+      const missing = FROZEN_EVERYTHING_COLUMNS.filter(
+        (column) => names.indexOf(column) === -1);
+      expect(`everything missing: ${missing.join(', ')}`).toEqual('everything missing: ');
+    });
+  });
 });
