@@ -26,9 +26,12 @@ Because these entries are opinions, they carry obligations:
   enough detail that a reviewer without local knowledge can evaluate it.
 - **Every entry must have `probes`** — coordinates with expected labels,
   including *guard* probes that pin down where the curation must **not**
-  reach. Validation enforces this: at least one probe must expect a label
-  other than the merge target's name, so an entry cannot ship with positive
-  probes only.
+  reach. Validation enforces both probe roles: at least one *positive* probe
+  expecting the merge target's label (so the intended relabeling is actually
+  exercised) and at least one *guard* probe expecting a different label (so
+  the merge's reach is pinned down). Positive probes are checked against the
+  target's place id, not just its name, so a same-named place cannot mask an
+  incomplete merge.
 - Entries should be few. A country file with dozens of entries is a sign the
   build rules need generalizing instead.
 
@@ -71,7 +74,7 @@ country it is named for.
 | `entries[].absorb` | array of integers | Place ids whose reverse-lookup cells are relabeled to `into`. Must exist in `compact_places`; must not include `into`. |
 | `entries[].minPrecision` | integer (1–12) | Only geohash cells of at least this length are relabeled. Coarser cells keep their original owner. |
 | `entries[].rationale` | string | Required. The reviewable justification for the entry. |
-| `entries[].probes` | array | Required. Coordinates with expected reverse-lookup labels, checked by `--verify`. Must include at least one guard probe whose `expect` is not the merge target's name. |
+| `entries[].probes` | array | Required. Coordinates with expected reverse-lookup labels, checked by `--verify`. Must include at least one positive probe (`expect` equals the merge target's name, verified against the target's place id) and at least one guard probe (`expect` differs). |
 | `probes[].lat`, `probes[].lon` | number | Probe coordinate. |
 | `probes[].expect` | string | Expected `result.name` from a reverse lookup at that coordinate. |
 | `probes[].note` | string | Optional human context (what the coordinate is, or which guard it enforces). |
@@ -104,11 +107,16 @@ WHERE place_id IN (<absorb...>) AND LENGTH(geohash) >= <minPrecision>
   sorted path order and entries in file order, and cross-entry conflict
   validation (see the conflict policy below) guarantees that every lookup row
   is touched by at most one entry, so the final state never depends on order.
-- The apply **journals what it drained** in a small `curation_journal`
-  bookkeeping table it creates inside the curated database (per target and
-  absorbed place, cumulative relabeled-cell counts). Verification uses it to
+- The apply **journals what it drained** in small bookkeeping tables it
+  creates inside the curated database: per-source summary counts in
+  `curation_journal`, and every drained cell with its original owner in
+  `curation_journal_cells`. Verification uses the per-cell records to
   distinguish a source the data build never had (probes may be deferred) from
-  a source a previous apply already consumed (probes stay strict).
+  a source a previous apply already consumed (probes stay strict) — scoped to
+  the entry's current `minPrecision`, so evidence from an earlier revision at
+  a coarser precision does not vouch for a finer one. `--revert` uses the
+  same records to restore original ownership (see the refresh workflow
+  below).
 - The journal is **tied to the current compact-table generation**: an inert
   marker trigger on `compact_geohash_lookup` is dropped by SQLite together
   with the table, so a replace-mode rebuild automatically invalidates the old
@@ -139,6 +147,28 @@ Note that validation requires every referenced id to exist, so apply only the
 files for countries included in your build (a worldwide build can use the whole
 directory).
 
+## Refreshing a curated database
+
+- **Replace-mode rebuild** (the generator's default): the compact tables are
+  dropped and recreated, which automatically invalidates the journal (see
+  above). Simply re-apply curation after the rebuild.
+- **Append-mode refresh** (`--append` / `WOF_APPEND=1`): the generator
+  removes a place's previous cells by their *current* ownership — which
+  curation has rewritten. Appending onto a curated database directly is
+  **not supported**: cells relabeled to a merge target could never be cleaned
+  up when their absorbed place is re-imported, leaving stale reverse results.
+  The supported lifecycle is revert, refresh, re-apply:
+
+  ```bash
+  npm run curate -- --database data/geocoder.sqlite --revert
+  WOF_APPEND=1 ./scripts/generate_wof_boundary.sh data/geocoder.sqlite
+  npm run curate -- --database data/geocoder.sqlite --curation curation/ --verify
+  ```
+
+  `--revert` restores every journaled cell that is still owned by its merge
+  target back to its original owner and clears the journal; cells something
+  else has since overwritten are left alone (and reported).
+
 ## Verifying
 
 ```bash
@@ -163,10 +193,12 @@ database visibly cannot express that probe's intended result yet:
   incomplete `absorb` set and still fails; or
 - the probe expects the merge target's name and one of the entry's absorbed
   places owns no cells the entry could actually relabel (at or above its
-  `minPrecision`) **and has never been drained by a previous apply of this
-  entry**. The apply journals what it drained (see below), so a source whose
+  `minPrecision`) **and has no journaled drained cells at or above that
+  precision**. The apply journals every cell it drains, so a source whose
   cells are gone because the overlay already consumed them excuses nothing:
-  re-verification of an already-curated database stays strict.
+  re-verification of an already-curated database stays strict, and evidence
+  from an earlier revision at a coarser precision does not vouch for a finer
+  one.
 
 Guard probes expecting any other name never inherit deferral from missing
 merge sources: a failing guard rolls the transaction back even with the flag.

@@ -14,6 +14,7 @@ const WEST = 8000003;
 const BYSTANDER = 8000004;
 const GHOST = 8000005;
 const HOMONYM = 8000006;
+const CITY_TWIN = 8000007;
 
 const points = {
   city: { lat: 10.2, lon: 10.2 },
@@ -21,7 +22,8 @@ const points = {
   west: { lat: 30.2, lon: 30.2 },
   bystander: { lat: -20.2, lon: -20.2 },
   ghost: { lat: 40.2, lon: 40.2 },
-  homonym: { lat: -40.2, lon: -160.2 }
+  homonym: { lat: -40.2, lon: -160.2 },
+  cityTwin: { lat: 50.2, lon: -50.2 }
 };
 
 // Cells owned by each place: one precision-4 (coarse fallback) cell and, for
@@ -31,7 +33,8 @@ const cells = {
   eastFine: geohash.encode(points.east.lat, points.east.lon, 5),
   westFine: geohash.encode(points.west.lat, points.west.lon, 5),
   bystanderFine: geohash.encode(points.bystander.lat, points.bystander.lon, 5),
-  homonymFine: geohash.encode(points.homonym.lat, points.homonym.lon, 5)
+  homonymFine: geohash.encode(points.homonym.lat, points.homonym.lon, 5),
+  cityTwinFine: geohash.encode(points.cityTwin.lat, points.cityTwin.lon, 5)
 };
 cells.eastCoarse = cells.eastFine.slice(0, 4);
 cells.westCoarse = cells.westFine.slice(0, 4);
@@ -105,7 +108,8 @@ async function seedCompactDb(dbPath) {
         (${WEST}, 'West County', 'US', 5, 3, ${points.west.lat}, ${points.west.lon}),
         (${BYSTANDER}, 'Bystander County', 'US', 5, 3, ${points.bystander.lat}, ${points.bystander.lon}),
         (${GHOST}, 'Ghost Town', 'US', 5, 0, ${points.ghost.lat}, ${points.ghost.lon}),
-        (${HOMONYM}, 'Ghost Town', 'CA', 9, 0, ${points.homonym.lat}, ${points.homonym.lon});
+        (${HOMONYM}, 'Ghost Town', 'CA', 9, 0, ${points.homonym.lat}, ${points.homonym.lon}),
+        (${CITY_TWIN}, 'Big City', 'US', 7, 0, ${points.cityTwin.lat}, ${points.cityTwin.lon});
 
       INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES
         ('${cells.cityCoarse}', ${CITY}),
@@ -115,7 +119,8 @@ async function seedCompactDb(dbPath) {
         ('${cells.westFine}', ${WEST}),
         ('${cells.bystanderCoarse}', ${BYSTANDER}),
         ('${cells.bystanderFine}', ${BYSTANDER}),
-        ('${cells.homonymFine}', ${HOMONYM});
+        ('${cells.homonymFine}', ${HOMONYM}),
+        ('${cells.cityTwinFine}', ${CITY_TWIN});
     `);
   } finally {
     await close(db);
@@ -983,6 +988,140 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(1);
       expect(result.stderr).toContain('guard probe');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reverts journaled cells to their original owners for append refreshes', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const seedSnapshot = await lookupSnapshot(dbPath);
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
+
+      const applied = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(applied.status).toEqual(0);
+
+      // A cell later overwritten by something else must not be clobbered by
+      // the revert — only cells still owned by the merge target are restored.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `UPDATE compact_geohash_lookup SET place_id = ${BYSTANDER} WHERE geohash = '${cells.westFine}'`);
+      } finally {
+        await close(db);
+      }
+
+      const reverted = runCurate(['--database', dbPath, '--revert']);
+      expect(reverted.status).toEqual(0);
+      expect(reverted.stdout).toContain('Cells restored: 1');
+      expect(reverted.stdout).toContain('Cells skipped (no longer owned by their merge target): 1');
+
+      const rows = await lookupSnapshot(dbPath);
+      expect(ownerOf(rows, cells.eastFine)).toEqual(EAST);
+      expect(ownerOf(rows, cells.westFine)).toEqual(BYSTANDER);
+
+      // After reverting the corrupted cell back by hand, the database matches
+      // the pre-curation seed again.
+      const db2 = new sqlite3.Database(dbPath);
+      try {
+        await exec(db2, `UPDATE compact_geohash_lookup SET place_id = ${WEST} WHERE geohash = '${cells.westFine}'`);
+      } finally {
+        await close(db2);
+      }
+      expect(await lookupSnapshot(dbPath)).toEqual(seedSnapshot);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('scopes drain evidence to the entry\'s current minPrecision', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
+
+      // First apply drains precision-5 cells and journals them.
+      const first = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(first.status).toEqual(0);
+
+      // A revised entry at precision 6: the database has never contained
+      // precision-6 cells, so the old precision-5 drain evidence must not
+      // vouch for it and its failing positive probe must defer.
+      writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 6,
+            rationale: 'Synthetic: revised entry at a precision the database never had.',
+            probes: [
+              { lat: coarseEastProbe.lat, lon: coarseEastProbe.lon, expect: 'Big City', note: 'needs precision-6 cells that never existed' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const second = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(second.status).toEqual(0);
+      expect(second.stderr).toContain(`merge source(s) ${EAST} own no cells at precision >= 6`);
+      expect(second.stdout).toContain('Probes passed: 1, skipped: 1, failed: 0');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an entry with no positive probe exercising the relabeling', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // Guards alone never test the intended relabeling: --verify could
+      // commit a merge that changed the wrong cells or none at all.
+      const doc = baseDoc();
+      doc.entries[0].probes = [
+        { lat: coarseEastProbe.lat, lon: coarseEastProbe.lon, expect: 'East County' },
+        { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County' }
+      ];
+      const docPath = writeDoc(dir, 'us.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('positive probe');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails a positive probe that resolves to a same-named place with a different id', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // The probe sits on the cell of ANOTHER US place also named 'Big City':
+      // a name-only comparison would pass even though the overlay never
+      // reached this location, masking an incomplete merge.
+      const doc = baseDoc();
+      doc.entries[0].probes = [
+        { lat: points.cityTwin.lat, lon: points.cityTwin.lon, expect: 'Big City', note: 'resolves to the homonym, not the merge target' },
+        { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+      ];
+      const docPath = writeDoc(dir, 'us.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain(`same-named place ${CITY_TWIN}`);
       expect(await lookupSnapshot(dbPath)).toEqual(before);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

@@ -19,7 +19,8 @@ function parseArgs(argv) {
     curation: [],
     dryRun: false,
     verify: false,
-    skipUnresolvable: false
+    skipUnresolvable: false,
+    revert: false
   }
 
   for (var i = 0; i < argv.length; i++) {
@@ -35,6 +36,8 @@ function parseArgs(argv) {
       opts.verify = true
     } else if (arg === '--skip-unresolvable') {
       opts.skipUnresolvable = true
+    } else if (arg === '--revert') {
+      opts.revert = true
     } else if (arg === '--help' || arg === '-h') {
       opts.help = true
     } else {
@@ -59,6 +62,7 @@ function usage() {
     '  --dry-run            Report per-entry affected row counts without writing',
     '  --verify             Run each entry\'s probes through the reverse geocoder inside the apply transaction; any mismatch rolls the overlay back',
     '  --skip-unresolvable  With --verify: downgrade a failing probe to a warning when the expected place or one of the entry\'s merge sources owns no cells yet',
+    '  --revert             Restore every journaled cell to its original owner and clear the journal (run before an append-mode refresh of a curated database)',
     '  --help, -h           Show this help message'
   ].join('\n')
 }
@@ -426,11 +430,11 @@ async function describePlace(db, placeId) {
   return rows.length ? rows[0].name : String(placeId)
 }
 
-// Probes that only expect the merge target prove nothing about where the
-// merge must NOT reach: a typo'd absorb id relabeling an unrelated
-// municipality would sail through verification. Every entry must carry at
-// least one guard probe — a probe whose expected label differs from the
-// merge target's name.
+// Every entry must carry both probe roles. Probes that only expect the merge
+// target prove nothing about where the merge must NOT reach: a typo'd absorb
+// id relabeling an unrelated municipality would sail through verification.
+// Probes that only guard other places never exercise the intended relabeling:
+// --verify could commit a merge that changed the wrong cells or none at all.
 async function assertGuardProbes(db, entries) {
   var problems = []
 
@@ -438,17 +442,23 @@ async function assertGuardProbes(db, entries) {
     var entry = entries[i]
     var intoName = await describePlace(db, entry.into)
     var hasGuard = false
+    var hasPositive = false
 
     for (var j = 0; j < entry.probes.length; j++) {
-      if (entry.probes[j].expect !== intoName) {
+      if (entry.probes[j].expect === intoName) {
+        hasPositive = true
+      } else {
         hasGuard = true
-        break
       }
     }
 
     if (!hasGuard) {
       problems.push(entry.source + ' entry ' + entry.index + ': every probe expects the merge target "' +
         intoName + '"; add at least one guard probe pinning down where the merge must not reach')
+    }
+    if (!hasPositive) {
+      problems.push(entry.source + ' entry ' + entry.index + ': no probe expects the merge target "' +
+        intoName + '"; add at least one positive probe that exercises the relabeling')
     }
   }
 
@@ -470,14 +480,31 @@ async function countAffectedRows(db, entry) {
 }
 
 // One UPDATE per source (sources are disjoint after conflict validation, so
-// this is equivalent to a single IN-list update) so the per-source relabel
-// count can be journaled: verification uses that record to distinguish a
-// source the build never had from one a previous apply already drained.
+// this is equivalent to a single IN-list update) so each drained cell can be
+// journaled with its original owner. Verification uses the per-cell records
+// to distinguish a source the build never had from one a previous apply
+// already drained — at the precision that actually matters — and --revert
+// uses them to restore original ownership before an append-mode refresh.
 async function applyEntry(db, entry) {
   var total = 0
 
   for (var i = 0; i < entry.absorb.length; i++) {
     var sourceId = entry.absorb[i]
+
+    var cellRows = await dbAll(db, `
+      SELECT geohash
+      FROM compact_geohash_lookup
+      WHERE place_id = ?
+        AND LENGTH(geohash) >= ?
+    `, [sourceId, entry.minPrecision])
+
+    for (var c = 0; c < cellRows.length; c++) {
+      await dbRun(db, `
+        INSERT OR REPLACE INTO curation_journal_cells(geohash, into_id, absorbed_id)
+        VALUES (?, ?, ?)
+      `, [cellRows[c].geohash, entry.into, sourceId])
+    }
+
     var result = await dbRun(db, `
       UPDATE compact_geohash_lookup
       SET place_id = ?
@@ -576,17 +603,18 @@ async function journalState(db) {
   var rows = await dbAll(db, `
     SELECT name, type
     FROM sqlite_master
-    WHERE (type='table' AND name='curation_journal')
+    WHERE (type='table' AND name IN ('curation_journal', 'curation_journal_cells'))
        OR (type='trigger' AND name='${JOURNAL_MARKER_TRIGGER}')
   `)
 
-  var present = false
+  var tables = 0
   var markerPresent = false
   rows.forEach(function(row) {
-    if (row.type === 'table') present = true
+    if (row.type === 'table') tables += 1
     if (row.type === 'trigger') markerPresent = true
   })
 
+  var present = tables === 2
   return {
     present: present,
     trusted: present && markerPresent
@@ -602,17 +630,24 @@ async function ensureCurationJournal(db, journal) {
       cells_relabeled INTEGER NOT NULL,
       applied_at TEXT NOT NULL,
       PRIMARY KEY (into_id, absorbed_id)
-    )
+    );
+
+    CREATE TABLE IF NOT EXISTS curation_journal_cells(
+      geohash TEXT PRIMARY KEY,
+      into_id INTEGER NOT NULL,
+      absorbed_id INTEGER NOT NULL
+    );
   `)
 
   if (journal.present && !journal.trusted) {
     await dbRun(db, 'DELETE FROM curation_journal')
+    await dbRun(db, 'DELETE FROM curation_journal_cells')
   }
 
-  // Inert by design: compact_geohash_lookup rows are never deleted by the
-  // library or by curation, and the generator's append mode deletes are
-  // harmless no-ops through this trigger. Its only job is to die with the
-  // table on a replace-mode rebuild.
+  // Inert by design: this trigger's body does nothing, and the deletes the
+  // generator's append mode performs pass through it harmlessly. Its only
+  // job is to die with the table on a replace-mode rebuild (SQLite drops a
+  // table's triggers with the table), marking the journal as stale.
   await dbExec(db, `
     CREATE TRIGGER IF NOT EXISTS ${JOURNAL_MARKER_TRIGGER}
     AFTER DELETE ON compact_geohash_lookup
@@ -622,19 +657,25 @@ async function ensureCurationJournal(db, journal) {
   `)
 }
 
-async function sourcePreviouslyDrained(db, journalTrusted, intoId, sourceId) {
+// Evidence is per drained cell, so it is scoped to the precision that
+// matters: cells drained by an earlier precision-5 revision of an entry do
+// not vouch for a precision-6 revision unless cells of length >= 6 were
+// actually among them.
+async function sourcePreviouslyDrained(db, journalTrusted, intoId, sourceId, minPrecision) {
   if (!journalTrusted) {
     return false
   }
 
   var rows = await dbAll(db, `
-    SELECT cells_relabeled
-    FROM curation_journal
+    SELECT geohash
+    FROM curation_journal_cells
     WHERE into_id = ?
       AND absorbed_id = ?
-  `, [intoId, sourceId])
+      AND LENGTH(geohash) >= ?
+    LIMIT 1
+  `, [intoId, sourceId, minPrecision])
 
-  return Boolean(rows.length && rows[0].cells_relabeled > 0)
+  return rows.length > 0
 }
 
 // Snapshot, before anything is written, which absorbed places own no cells
@@ -657,7 +698,7 @@ async function computeResolvability(db, entries) {
       if (await placeOwnsRelabelableCells(db, sourceId, entry.minPrecision)) {
         continue
       }
-      if (await sourcePreviouslyDrained(db, journal.trusted, entry.into, sourceId)) {
+      if (await sourcePreviouslyDrained(db, journal.trusted, entry.into, sourceId, entry.minPrecision)) {
         continue
       }
       missing.push(sourceId)
@@ -709,7 +750,13 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       var result = await geocoder.reverse(probe.lat, probe.lon)
       var actual = result && result.name
 
-      if (actual === probe.expect) {
+      // Positive probes (those expecting the merge target) must resolve to
+      // the target's actual place id, not merely a same-named place: with
+      // two homonymous places in one country, a name-only comparison would
+      // let a probe outside the relabeled cells mask an incomplete merge.
+      var idMatches = probe.expect !== intoName || Boolean(result && Number(result.id) === entry.into)
+
+      if (actual === probe.expect && idMatches) {
         console.log('PASS ' + context + ' -> "' + actual + '"')
         passed += 1
         continue
@@ -737,11 +784,76 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       var hint = reasons.length
         ? ' (' + reasons.join('; ') + '; rerun with --skip-unresolvable to defer this probe)'
         : ''
-      failures.push('FAIL ' + context + ': expected "' + probe.expect + '", got "' + (actual || '<nothing>') + '"' + hint)
+      var got = actual === probe.expect
+        ? '"' + actual + '" (same-named place ' + (result && result.id) + ', not the merge target ' + entry.into + ')'
+        : '"' + (actual || '<nothing>') + '"'
+      failures.push('FAIL ' + context + ': expected "' + probe.expect + '", got ' + got + hint)
     }
   }
 
   return { passed: passed, skipped: skipped, failures: failures }
+}
+
+// Restores every journaled cell that is still owned by its merge target back
+// to its original (absorbed) owner, then clears the journal. This is the
+// supported way to prepare a curated database for the generator's append
+// mode, whose per-place cleanup deletes cells by CURRENT ownership: without
+// the revert, cells curation relabeled to the target could never be cleaned
+// up when the absorbed place is re-imported, leaving stale reverse results.
+async function runRevert(databasePath) {
+  var db = new sqlite3.Database(databasePath)
+
+  try {
+    await assertCompactSchema(db, databasePath)
+
+    var journal = await journalState(db)
+    if (!journal.present) {
+      throw new Error('No curation journal found in ' + databasePath + '; nothing to revert')
+    }
+    if (!journal.trusted) {
+      throw new Error('The curation journal in ' + databasePath +
+        ' describes a previous database generation (the compact tables were rebuilt); nothing to revert - re-apply curation instead')
+    }
+
+    var restored = 0
+    var skippedCells = 0
+
+    await dbExec(db, 'BEGIN')
+    try {
+      var cellRows = await dbAll(db, 'SELECT geohash, into_id, absorbed_id FROM curation_journal_cells')
+
+      for (var i = 0; i < cellRows.length; i++) {
+        var cell = cellRows[i]
+        var result = await dbRun(db, `
+          UPDATE compact_geohash_lookup
+          SET place_id = ?
+          WHERE geohash = ?
+            AND place_id = ?
+        `, [cell.absorbed_id, cell.geohash, cell.into_id])
+
+        if (result.changes) {
+          restored += 1
+        } else {
+          skippedCells += 1
+        }
+      }
+
+      await dbRun(db, 'DELETE FROM curation_journal_cells')
+      await dbRun(db, 'DELETE FROM curation_journal')
+
+      await dbExec(db, 'COMMIT')
+    } catch (err) {
+      await dbExec(db, 'ROLLBACK')
+      throw err
+    }
+
+    console.log('Curation revert complete')
+    console.log('Database: ' + databasePath)
+    console.log('Cells restored: ' + restored)
+    console.log('Cells skipped (no longer owned by their merge target): ' + skippedCells)
+  } finally {
+    await dbClose(db)
+  }
 }
 
 async function main() {
@@ -754,6 +866,23 @@ async function main() {
 
   if (!options.database) {
     throw new Error('Missing required --database argument')
+  }
+
+  if (options.revert) {
+    if (options.curation.length) {
+      throw new Error('--revert restores from the journal and takes no --curation files')
+    }
+    if (options.dryRun || options.verify) {
+      throw new Error('--revert cannot be combined with --dry-run or --verify')
+    }
+
+    var revertDatabasePath = path.resolve(options.database)
+    if (!fs.existsSync(revertDatabasePath)) {
+      throw new Error('Database does not exist: ' + revertDatabasePath)
+    }
+
+    await runRevert(revertDatabasePath)
+    return
   }
 
   if (!options.curation.length) {
