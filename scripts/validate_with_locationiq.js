@@ -435,7 +435,15 @@ function normalizeName(value) {
       if (!lastBaseIsLatin) kept += ch
       continue
     }
-    if ((code >= 0x0591 && code <= 0x05c7) || (code >= 0x064b && code <= 0x0652) || code === 0x0670) {
+    // Hebrew: strip only the actual combining marks (cantillation, niqqud,
+    // rafe, shin/sin dots, upper/lower dots, qamats qatan). Punctuation in
+    // the same block — maqaf U+05BE, paseq U+05C0, sof pasuq U+05C3, nun
+    // hafukha U+05C6 — must survive to the separator normalization below,
+    // or hyphenated names would glue together into a different word.
+    var isHebrewOptionalMark = (code >= 0x0591 && code <= 0x05bd) || code === 0x05bf ||
+      code === 0x05c1 || code === 0x05c2 || code === 0x05c4 || code === 0x05c5 || code === 0x05c7
+    var isArabicHarakat = (code >= 0x064b && code <= 0x0652) || code === 0x0670
+    if (isHebrewOptionalMark || isArabicHarakat) {
       continue
     }
     kept += ch
@@ -449,11 +457,33 @@ function normalizeName(value) {
     .replace(/\s+/g, ' ')
 }
 
+function tokensContain(container, contained) {
+  var containerTokens = container.split(' ')
+  var containedTokens = contained.split(' ')
+  if (!containedTokens.length || containedTokens.length > containerTokens.length) {
+    return false
+  }
+  for (var start = 0; start + containedTokens.length <= containerTokens.length; start++) {
+    var matched = true
+    for (var i = 0; i < containedTokens.length; i++) {
+      if (containerTokens[start + i] !== containedTokens[i]) {
+        matched = false
+        break
+      }
+    }
+    if (matched) return true
+  }
+  return false
+}
+
 function namesMatch(left, right) {
   if (!left || !right) return false
   if (left === right) return true
-  if (left.indexOf(right) !== -1 || right.indexOf(left) !== -1) return true
-  return false
+  // Containment must respect token boundaries: a short name that is merely
+  // a substring of an unrelated word ("ham" inside "hamme") is not
+  // agreement, while "salvador" inside "san salvador" still matches as a
+  // whole-token qualifier relationship.
+  return tokensContain(left, right) || tokensContain(right, left)
 }
 
 function extractLocationIqLocality(address) {
@@ -948,6 +978,10 @@ async function main() {
 var SWEEP_CACHE_DECIMALS = 4
 var SWEEP_TIMEOUT_MS = 20000
 var SWEEP_DEFAULT_WORKDIR = 'tmp/locationiq-sweep'
+// The quota state deliberately lives OUTSIDE the workdir: separate workdirs
+// per endpoint/language configuration must still share one daily cap,
+// because they all spend requests against the same API key.
+var SWEEP_DEFAULT_STATE_PATH = 'tmp/locationiq-quota.json'
 // Fixed seed for the sampler's country-order shuffle: stable across runs, but
 // not alphabetical, so a small --max-points does not bias the world sample
 // toward alphabetically-early country codes.
@@ -1001,9 +1035,11 @@ function sweepUsage() {
     'Options:',
     '  --points <path>          JSONL points file (required; see the sample subcommand)',
     '  --database <path>        Offline geocoder SQLite database (required)',
-    '  --workdir <path>         Directory for cache/state/report files (default: ' + SWEEP_DEFAULT_WORKDIR + ')',
+    '  --workdir <path>         Directory for cache/report files (default: ' + SWEEP_DEFAULT_WORKDIR + ')',
     '  --cache <path>           LocationIQ response cache (default: <workdir>/cache.jsonl)',
-    '  --state <path>           Daily quota state file (default: <workdir>/quota.json)',
+    '  --state <path>           Daily quota state file (default: ' + SWEEP_DEFAULT_STATE_PATH + ').',
+    '                           Deliberately outside the workdir: all sweep configurations',
+    '                           share one daily cap because they spend the same API key.',
     '  --report <path>          Markdown report output (default: <workdir>/report.md)',
     '  --mismatches <path>      Mismatch JSONL output (default: <workdir>/mismatches.jsonl)',
     '  --api-key <key>          LocationIQ API key (or env LOCATIONIQ_API_KEY)',
@@ -1386,12 +1422,13 @@ function saveQuotaState(statePath, state) {
   fs.renameSync(tmpPath, statePath)
 }
 
+var LIQ_NAME_KEY_GROUPS = [LIQ_LOCALITY_KEYS, LIQ_COUNTY_KEYS, LIQ_STATE_KEYS]
+
 function findLiqNameMatch(normalizedOfflineName, address, displayName) {
   if (!normalizedOfflineName) return null
 
-  var groups = [LIQ_LOCALITY_KEYS, LIQ_COUNTY_KEYS, LIQ_STATE_KEYS]
-  for (var g = 0; g < groups.length; g++) {
-    var hit = matchAddressValue(normalizedOfflineName, address, groups[g])
+  for (var g = 0; g < LIQ_NAME_KEY_GROUPS.length; g++) {
+    var hit = matchAddressValue(normalizedOfflineName, address, LIQ_NAME_KEY_GROUPS[g])
     if (hit) return hit.key
   }
 
@@ -1400,6 +1437,17 @@ function findLiqNameMatch(normalizedOfflineName, address, displayName) {
   }
 
   return null
+}
+
+function liqHasComparableName(address) {
+  if (!address || typeof address !== 'object') return false
+  for (var g = 0; g < LIQ_NAME_KEY_GROUPS.length; g++) {
+    var keys = LIQ_NAME_KEY_GROUPS[g]
+    for (var i = 0; i < keys.length; i++) {
+      if (address[keys[i]]) return true
+    }
+  }
+  return false
 }
 
 function comparePoint(point, offlineResult, cacheEntry) {
@@ -1448,6 +1496,11 @@ function comparePoint(point, offlineResult, cacheEntry) {
     record.verdict = 'country_unknown'
   } else if (offlineCountry !== record.liq_country) {
     record.verdict = 'country_mismatch'
+  } else if (!liqHasComparableName(address)) {
+    // Countries agree, but LocationIQ supplied no locality/county/state name
+    // to compare against (common for sparse rural responses): unverifiable,
+    // not a name mismatch.
+    record.verdict = 'liq_name_missing'
   } else {
     var via = findLiqNameMatch(normalizeName(offlineName), address, record.liq_display_name)
     if (via) {
@@ -1474,7 +1527,7 @@ function formatAnswer(name, country, fallback) {
 function buildSweepReport(params) {
   var records = params.records || []
   var perCountry = Object.create(null)
-  var totals = { agree: 0, country_mismatch: 0, name_mismatch: 0, offline_empty: 0, liq_empty: 0, both_empty: 0, country_unknown: 0 }
+  var totals = { agree: 0, country_mismatch: 0, name_mismatch: 0, offline_empty: 0, liq_empty: 0, both_empty: 0, country_unknown: 0, liq_name_missing: 0 }
 
   for (var i = 0; i < records.length; i++) {
     var record = records[i]
@@ -1489,7 +1542,8 @@ function buildSweepReport(params) {
         offline_empty: 0,
         liq_empty: 0,
         both_empty: 0,
-        country_unknown: 0
+        country_unknown: 0,
+        liq_name_missing: 0
       }
     }
     bucket.evaluated += 1
@@ -1533,8 +1587,9 @@ function buildSweepReport(params) {
     ' (' + agreementPct.toFixed(1) + '%)')
   lines.push('- Mismatches: ' + (verifiable - totals.agree) + ' (country ' + totals.country_mismatch +
     ', name ' + totals.name_mismatch + ', offline empty ' + totals.offline_empty + ')')
-  lines.push('- Unverifiable: ' + (totals.liq_empty + totals.both_empty + totals.country_unknown) +
-    ' (LocationIQ empty ' + totals.liq_empty + ', both empty ' + totals.both_empty +
+  lines.push('- Unverifiable: ' + (totals.liq_empty + totals.both_empty + totals.country_unknown + totals.liq_name_missing) +
+    ' (LocationIQ empty ' + totals.liq_empty + ', no name ' + totals.liq_name_missing +
+    ', both empty ' + totals.both_empty +
     ', country unknown ' + totals.country_unknown + ')')
   var quotaCount = params.quota && params.quota.count !== null && params.quota.count !== undefined &&
     Number.isFinite(Number(params.quota.count)) ? Number(params.quota.count) : null
@@ -1546,14 +1601,14 @@ function buildSweepReport(params) {
   lines.push('')
   lines.push('## Countries ranked by mismatch rate (worst first)')
   lines.push('')
-  lines.push('| Country | Points | Verifiable | Agreement | Country mismatch | Name mismatch | Offline empty | LIQ empty | Country unknown |')
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
+  lines.push('| Country | Points | Verifiable | Agreement | Country mismatch | Name mismatch | Offline empty | LIQ empty | LIQ no name | Country unknown |')
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
   for (var c = 0; c < countryRows.length; c++) {
     var row = countryRows[c]
     var pct = row.verifiable > 0 ? ((row.agree * 100) / row.verifiable).toFixed(1) + '%' : '-'
     lines.push('| ' + mdEscape(row.country) + ' | ' + row.evaluated + ' | ' + row.verifiable + ' | ' + pct +
       ' | ' + row.country_mismatch + ' | ' + row.name_mismatch + ' | ' + row.offline_empty + ' | ' + row.liq_empty +
-      ' | ' + row.country_unknown + ' |')
+      ' | ' + row.liq_name_missing + ' | ' + row.country_unknown + ' |')
   }
   lines.push('')
   lines.push('## Worst examples')
@@ -1581,6 +1636,7 @@ function buildSweepReport(params) {
   lines.push('- `offline_empty`: LocationIQ answered but the offline geocoder returned nothing')
   lines.push('- `liq_empty` / `both_empty`: LocationIQ had no answer — excluded from agreement figures')
   lines.push('- `country_unknown`: one side answered without a country code, so the comparison cannot be verified — excluded from agreement figures (a name match, if any, is noted in `match_via`)')
+  lines.push('- `liq_name_missing`: countries agree but LocationIQ returned no locality/county/state name to compare against — excluded from agreement figures')
   lines.push('')
   return lines.join('\n')
 }
@@ -1701,10 +1757,10 @@ async function runSweep(opts, deps) {
       }
 
       var status = Number(response && response.status)
-      if (status === 200 || status === 400 || status === 404) {
-        // 200 is an answer; 404 is LocationIQ's definitive "unable to geocode"
-        // (e.g. open ocean) and 400 a definitive rejection of the coordinates —
-        // all cacheable so they are never asked again.
+      if (status === 200 || status === 404) {
+        // 200 is an answer and 404 is LocationIQ's definitive, coordinate-
+        // specific "unable to geocode" (e.g. open ocean) — both cacheable so
+        // they are never asked again.
         var entry = {
           key: point.key,
           lat: point.lat,
@@ -1715,6 +1771,14 @@ async function runSweep(opts, deps) {
         }
         appendSweepCache(opts.cachePath, entry)
         cache[point.key] = entry
+      } else if (status === 400) {
+        // A rejected request shape is a configuration problem, not a fact
+        // about the coordinates (the points loader already validates ranges).
+        // Caching it or continuing would burn the daily allowance on a
+        // systematically broken request: stop, and cache nothing.
+        stopReason = 'bad_request'
+        stopDetail = 'HTTP 400'
+        break
       } else if (status === 401 || status === 403) {
         stopReason = 'auth_error'
         stopDetail = 'HTTP ' + status
@@ -1773,6 +1837,8 @@ async function runSweep(opts, deps) {
       unfetched + ' points still unfetched. Re-run the same command after the next UTC day starts to resume; cached points are never re-queried.')
   } else if (stopReason === 'rate_limited') {
     log('LocationIQ returned HTTP 429 (rate limited). Backing off and stopping this run cleanly; all fetched responses are cached. Wait for the quota window to reset, then re-run the same command to resume.')
+  } else if (stopReason === 'bad_request') {
+    log('LocationIQ rejected the request shape (HTTP 400). This is a configuration problem (endpoint or parameters), so the response was not cached and the run stopped before spending more quota. Fix the configuration, then re-run to resume.')
   } else if (stopReason === 'auth_error') {
     log('LocationIQ rejected the API key (' + stopDetail + '). Check LOCATIONIQ_API_KEY / --api-key, then re-run to resume.')
   } else if (stopReason === 'fetch_error' || stopReason === 'server_error') {
@@ -1873,7 +1939,7 @@ function parseSweepArgs(argv) {
   }
 
   if (!opts.cachePath) opts.cachePath = path.join(opts.workdir, 'cache.jsonl')
-  if (!opts.statePath) opts.statePath = path.join(opts.workdir, 'quota.json')
+  if (!opts.statePath) opts.statePath = path.resolve(SWEEP_DEFAULT_STATE_PATH)
   if (!opts.reportPath) opts.reportPath = path.join(opts.workdir, 'report.md')
   if (!opts.mismatchesPath) opts.mismatchesPath = path.join(opts.workdir, 'mismatches.jsonl')
 

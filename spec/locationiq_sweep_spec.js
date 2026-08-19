@@ -232,6 +232,63 @@ describe('locationiq sweep', () => {
       expect(liq.normalizeName('مُحَمَّد')).toEqual(liq.normalizeName('محمد'));
     });
 
+    it('treats Hebrew maqaf as a separator instead of stripping it', () => {
+      // U+05BE MAQAF is punctuation, not a mark: stripping it glues the words
+      // together, so hyphenated and spaced spellings would falsely mismatch.
+      expect(liq.normalizeName('בית־שמש')).toEqual(liq.normalizeName('בית שמש'));
+      expect(liq.normalizeName('בית־שמש')).toEqual('בית שמש');
+      // Niqqud and cantillation are still stripped.
+      expect(liq.normalizeName('יְרוּשָׁלַיִם')).toEqual(liq.normalizeName('ירושלים'));
+    });
+
+    it('requires token boundaries for partial name matches', () => {
+      expect(liq.namesMatch('ham', 'hamme')).toBeFalse();
+      expect(liq.namesMatch('salvador', 'san salvador')).toBeTrue();
+      expect(liq.namesMatch('new york', 'york')).toBeTrue();
+
+      // Offline "Ham" against LocationIQ "Hamme" is a real disagreement, not
+      // agreement via substring.
+      const record = liq.comparePoint(
+        point({ name: 'Ham' }),
+        { name: 'Ham', country: { id: 'BE' } },
+        { status: 200, body: { display_name: 'Hamme, Belgium', address: { city: 'Hamme', country_code: 'be' } } }
+      );
+      expect(record.verdict).toEqual('name_mismatch');
+    });
+
+    it('treats a country-only LocationIQ answer as unverifiable, not a name mismatch', () => {
+      const record = liq.comparePoint(
+        point({ country: 'FR' }),
+        { name: 'Petite Ville', country: { id: 'FR' } },
+        { status: 200, body: { display_name: 'France', address: { country_code: 'fr' } } }
+      );
+      expect(record.verdict).toEqual('liq_name_missing');
+
+      // The severe country check still runs before the name-field check.
+      const mismatch = liq.comparePoint(
+        point({ country: 'FR' }),
+        { name: 'Petite Ville', country: { id: 'DE' } },
+        { status: 200, body: { display_name: 'France', address: { country_code: 'fr' } } }
+      );
+      expect(mismatch.verdict).toEqual('country_mismatch');
+
+      // Excluded from the verifiable denominator in the report.
+      const report = liq.buildSweepReport({
+        generatedAt: 'now',
+        databaseLabel: 'db',
+        pointsPath: 'points.jsonl',
+        totalPoints: 1,
+        unfetched: 0,
+        records: [record],
+        quota: { date: '2026-08-19', count: 0 },
+        dailyCap: 4500,
+        stopReason: null,
+        stopDetail: ''
+      });
+      expect(report).toContain('- Verifiable points: 0 — agreement 0/0 (0.0%)');
+      expect(report).toContain('no name 1');
+    });
+
     it('agrees when the offline name matches a locality field after normalization', () => {
       const record = liq.comparePoint(
         point({ name: 'Kilómetro 18' }),
@@ -723,6 +780,66 @@ describe('locationiq sweep', () => {
         const drySummary = await liq.runSweep(sweepOpts(dir, { acceptLanguage: 'fr', dryRun: true, apiKey: '' }), fifth);
         expect(fifth.calls.length).toEqual(0);
         expect(drySummary.evaluated).toEqual(5);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('shares one daily cap across configuration workdirs', async () => {
+      // The default state path is independent of --workdir, so per-config
+      // workdirs cannot each start a fresh quota.
+      const parsed = liq.parseSweepArgs(['--workdir', path.join(os.tmpdir(), 'liq-alt')]);
+      expect(parsed.statePath).toEqual(path.resolve('tmp/locationiq-quota.json'));
+      expect(parsed.cachePath).toEqual(path.join(path.resolve(os.tmpdir(), 'liq-alt'), 'cache.jsonl'));
+      expect(liq.parseSweepArgs(['--state', path.join(os.tmpdir(), 'q.json')]).statePath)
+        .toEqual(path.resolve(os.tmpdir(), 'q.json'));
+
+      // Two workdirs (separate caches/configs) sharing one state file must
+      // also share one daily cap.
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const perConfig = (name, extra) => sweepOpts(dir, Object.assign({
+          cachePath: path.join(dir, name, 'cache.jsonl'),
+          reportPath: path.join(dir, name, 'report.md'),
+          mismatchesPath: path.join(dir, name, 'mismatches.jsonl'),
+          statePath: path.join(dir, 'quota.json'),
+          dailyCap: 3
+        }, extra));
+
+        const first = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const s1 = await liq.runSweep(perConfig('en', {}), first);
+        expect(first.calls.length).toEqual(3);
+        expect(s1.stopReason).toEqual('daily_cap');
+
+        const second = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const s2 = await liq.runSweep(perConfig('fr', { acceptLanguage: 'fr' }), second);
+        expect(second.calls.length).toEqual(0);
+        expect(s2.stopReason).toEqual('daily_cap');
+        expect(readState(dir).count).toEqual(3);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('stops without caching when the endpoint rejects the request shape with HTTP 400', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps((url, callNumber) => {
+          if (callNumber === 1) return okResponse({ city: 'Testville', country_code: 'us' });
+          return { status: 400, json: { error: 'Invalid request' } };
+        });
+
+        const summary = await liq.runSweep(sweepOpts(dir), deps);
+
+        // A systemic 400 must stop immediately, not burn a request per point.
+        expect(deps.calls.length).toEqual(2);
+        expect(summary.stopReason).toEqual('bad_request');
+        // The rejection is not cached, so a fixed configuration can retry it.
+        expect(cacheEntries(dir).length).toEqual(1);
+        // The attempt still counts against the persisted quota.
+        expect(readState(dir).count).toEqual(2);
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
