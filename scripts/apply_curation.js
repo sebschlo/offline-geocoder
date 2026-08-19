@@ -244,6 +244,7 @@ function validateCurationDocument(doc, label) {
 
 function loadCurationEntries(files) {
   var entries = []
+  var fileByCountry = Object.create(null)
 
   for (var i = 0; i < files.length; i++) {
     var filePath = files[i]
@@ -266,6 +267,17 @@ function loadCurationEntries(files) {
         '" but is named "' + baseName + '"; one country per file, so it must be named ' +
         doc.country.toLowerCase() + '.json')
     }
+
+    // ONE file per country, not merely one country per file: a country's
+    // overlay must live in a single file, or applying one of them alone
+    // would look like the other's entries had been removed and silently
+    // undo them (see the journal reconciliation below).
+    if (fileByCountry[doc.country]) {
+      throw new Error('country ' + doc.country + ' is declared by more than one curation file: ' +
+        fileByCountry[doc.country] + ' and ' + filePath + '; merge them into a single ' +
+        doc.country.toLowerCase() + '.json')
+    }
+    fileByCountry[doc.country] = filePath
 
     entries = entries.concat(fileEntries)
   }
@@ -614,69 +626,78 @@ async function applyEntry(db, entry) {
   return { relabeled: relabeled, returned: returned }
 }
 
-// The other half of reconciliation: journaled cells whose SOURCE is no longer
-// absorbed by any current entry for that target are returned to their
-// original owners, so dropping a place from an entry's absorb list actually
-// undoes its absorption on the next apply. Grouped per target across all
-// loaded entries, because several entries may legitimately share one target.
-// (An entry removed entirely is invisible here — use --revert for that.)
-async function reconcileRemovedSources(db, entries) {
-  var absorbByInto = Object.create(null)
+// Journal rows that the loaded files no longer declare, restricted to the
+// countries being applied. Because one country lives in exactly one file,
+// "the countries in this run" is the precise scope in which the loaded files
+// are the whole truth: a GT run may reconcile GT rows and must never touch
+// FR rows left by an earlier run.
+//
+// This covers every structural revision uniformly — a source dropped from
+// `absorb`, and a source retargeted to a different `into` (whose cells are
+// still owned by the OLD target, which no current entry mentions). Both are
+// simply "(target, source) pairs the files no longer declare".
+async function findOrphanedJournalCells(db, entries) {
+  var declared = Object.create(null)
+  var countries = Object.create(null)
   entries.forEach(function(entry) {
-    if (!absorbByInto[entry.into]) {
-      absorbByInto[entry.into] = []
-    }
+    countries[entry.country] = true
     entry.absorb.forEach(function(id) {
-      absorbByInto[entry.into].push(id)
+      declared[entry.into + '|' + id] = true
     })
   })
 
-  var totalReturned = 0
-  var intoIds = Object.keys(absorbByInto)
+  var rows = await dbAll(db, `
+    SELECT c.geohash AS geohash, c.into_id AS into_id, c.absorbed_id AS absorbed_id,
+      UPPER(p.country_id) AS country
+    FROM curation_journal_cells c
+    JOIN compact_places p ON p.id = c.into_id
+  `)
 
-  for (var i = 0; i < intoIds.length; i++) {
-    var intoId = Number(intoIds[i])
-    var currentSources = absorbByInto[intoIds[i]]
-    var placeholders = currentSources.map(function() { return '?' }).join(', ')
+  return rows.filter(function(row) {
+    if (!countries[row.country]) return false
+    return !declared[row.into_id + '|' + row.absorbed_id]
+  })
+}
 
-    var orphaned = await dbAll(db, `
-      SELECT geohash, absorbed_id
-      FROM curation_journal_cells
-      WHERE into_id = ?
-        AND absorbed_id NOT IN (${placeholders})
-    `, [intoId].concat(currentSources))
+async function reconcileOrphanedJournal(db, entries) {
+  var orphaned = await findOrphanedJournalCells(db, entries)
+  if (!orphaned.length) {
+    return 0
+  }
 
-    var returned = 0
-    for (var c = 0; c < orphaned.length; c++) {
-      var restore = await dbRun(db, `
-        UPDATE compact_geohash_lookup
-        SET place_id = ?
-        WHERE geohash = ?
-          AND place_id = ?
-      `, [orphaned[c].absorbed_id, orphaned[c].geohash, intoId])
+  var returnedByTarget = Object.create(null)
+  var total = 0
 
-      if (restore.changes) {
-        returned += 1
-      }
+  for (var i = 0; i < orphaned.length; i++) {
+    var row = orphaned[i]
+    var restore = await dbRun(db, `
+      UPDATE compact_geohash_lookup
+      SET place_id = ?
+      WHERE geohash = ?
+        AND place_id = ?
+    `, [row.absorbed_id, row.geohash, row.into_id])
 
-      await dbRun(db, 'DELETE FROM curation_journal_cells WHERE geohash = ?', [orphaned[c].geohash])
+    if (restore.changes) {
+      returnedByTarget[row.into_id] = (returnedByTarget[row.into_id] || 0) + 1
+      total += 1
     }
 
+    await dbRun(db, 'DELETE FROM curation_journal_cells WHERE geohash = ?', [row.geohash])
     await dbRun(db, `
       DELETE FROM curation_journal
       WHERE into_id = ?
-        AND absorbed_id NOT IN (${placeholders})
-    `, [intoId].concat(currentSources))
-
-    if (orphaned.length) {
-      totalReturned += returned
-      var intoName = await describePlace(db, intoId)
-      console.log('reconciled target ' + intoId + ' (' + intoName + '): returned ' + returned +
-        ' cell(s) from source(s) no longer absorbed')
-    }
+        AND absorbed_id = ?
+    `, [row.into_id, row.absorbed_id])
   }
 
-  return totalReturned
+  var targets = Object.keys(returnedByTarget)
+  for (var t = 0; t < targets.length; t++) {
+    var intoName = await describePlace(db, Number(targets[t]))
+    console.log('reconciled target ' + targets[t] + ' (' + intoName + '): returned ' +
+      returnedByTarget[targets[t]] + ' cell(s) from source(s) no longer absorbed')
+  }
+
+  return total
 }
 
 function entryLabel(entry, intoName) {
@@ -862,33 +883,65 @@ async function computeResolvability(db, entries) {
   }
 }
 
-// Does one of the probe's enclosing geohashes (at the precisions this entry
-// relabels) appear among the entry's journaled drained cells? This defines
-// "the probe sits on territory this entry demonstrably absorbed", which is
-// the anchor for both strictness (failures there are never deferred) and
-// completeness (some passing positive probe must sit there).
-async function probeOnDrainedCells(db, entry, probe, maxPrecision) {
+// The lookup row the reverse geocoder actually matched for this coordinate:
+// the longest enclosing geohash present in the table, within the precision
+// range verification runs at. Geohashes are unique, so longest-wins is
+// deterministic and mirrors src/reverse.js.
+async function matchedLookupRow(db, probe, boundary) {
   var hashes = []
-  for (var precision = entry.minPrecision; precision <= maxPrecision; precision++) {
+  for (var precision = boundary.basePrecision; precision <= boundary.maxPrecision; precision++) {
     hashes.push(geohash.encode(probe.lat, probe.lon, precision))
   }
 
   if (!hashes.length) {
-    return false
+    return null
   }
 
-  var hashPlaceholders = hashes.map(function() { return '?' }).join(', ')
+  var placeholders = hashes.map(function() { return '?' }).join(', ')
+  var rows = await dbAll(db, `
+    SELECT geohash, place_id
+    FROM compact_geohash_lookup
+    WHERE geohash IN (${placeholders})
+    ORDER BY LENGTH(geohash) DESC
+    LIMIT 1
+  `, hashes)
+
+  return rows.length ? rows[0] : null
+}
+
+// Where a probe stands, relative to the cells this entry relabeled. Both
+// answers come from THE ROW THE LOOKUP ACTUALLY MATCHED rather than "some
+// enclosing hash is journaled", which matters when a curated fine cell is
+// lost while a coarser target-owned cell still covers the point: the probe
+// keeps resolving to the target, and only the matched row reveals the loss.
+//
+//   onDrainedCell — the matched row is one this entry drained. A failure
+//     here is a regression on the entry's own territory and is never
+//     deferred, whatever the cell's current owner is (a cell handed to a
+//     third place is exactly the case that must stay strict).
+//   throughDrainedCell — additionally, that row is still owned by the merge
+//     target, so a passing probe genuinely demonstrates this entry's effect.
+async function probeTerritory(db, entry, probe, boundary) {
+  var matched = await matchedLookupRow(db, probe, boundary)
+  if (!matched) {
+    return { onDrainedCell: false, throughDrainedCell: false }
+  }
+
   var absorbPlaceholders = entry.absorb.map(function() { return '?' }).join(', ')
   var rows = await dbAll(db, `
     SELECT geohash
     FROM curation_journal_cells
     WHERE into_id = ?
       AND absorbed_id IN (${absorbPlaceholders})
-      AND geohash IN (${hashPlaceholders})
+      AND geohash = ?
     LIMIT 1
-  `, [entry.into].concat(entry.absorb).concat(hashes))
+  `, [entry.into].concat(entry.absorb).concat([matched.geohash]))
 
-  return rows.length > 0
+  var journaled = rows.length > 0
+  return {
+    onDrainedCell: journaled,
+    throughDrainedCell: journaled && Number(matched.place_id) === entry.into
+  }
 }
 
 async function entryHasDrainedCells(db, entry) {
@@ -962,14 +1015,14 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       var isPositive = probe.expect === intoName
       var idMatches = !isPositive || Boolean(result && Number(result.id) === entry.into)
       var pathMatches = !isPositive || resolvedVia === 'geohash_lookup'
-      var onTerritory = isPositive
-        ? await probeOnDrainedCells(db, entry, probe, boundary.maxPrecision)
-        : false
+      var territory = isPositive
+        ? await probeTerritory(db, entry, probe, boundary)
+        : { onDrainedCell: false, throughDrainedCell: false }
 
       if (actual === probe.expect && idMatches && pathMatches) {
         console.log('PASS ' + context + ' -> "' + actual + '"')
         passed += 1
-        if (onTerritory) {
+        if (territory.throughDrainedCell) {
           entryExercised = true
         }
         continue
@@ -984,7 +1037,7 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       if (!expectOwnsCache[expectKey]) {
         reasons.push('expected place "' + probe.expect + '" (' + entry.country + ') owns no cells in this database yet')
       }
-      if (missingSources.length && isPositive && !onTerritory) {
+      if (missingSources.length && isPositive && !territory.onDrainedCell) {
         reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells at precision >= ' + entry.minPrecision + ' in this database yet')
       }
 
@@ -1143,6 +1196,16 @@ async function main() {
         console.log('[dry-run] ' + entryLabel(entry, intoName) + ': would relabel ' + count + ' cell(s)' +
           (returnable ? ' and return ' + returnable + ' coarse cell(s) to their original owners' : ''))
       }
+
+      // A real apply also reconciles journal rows the files no longer
+      // declare, which can change more cells than the entries themselves.
+      if (dryRunJournal.trusted) {
+        var orphaned = await findOrphanedJournalCells(db, entries)
+        if (orphaned.length) {
+          console.log('[dry-run] would restore ' + orphaned.length +
+            ' cell(s) from source(s) no longer absorbed by any loaded entry')
+        }
+      }
     } else {
       var journal = await journalState(db)
       var boundary = null
@@ -1156,6 +1219,11 @@ async function main() {
       try {
         await ensureCurationJournal(db, journal)
 
+        // Reconcile BEFORE applying: a source retargeted to a different
+        // `into` still has its cells parked on the old target, and they must
+        // be released before the new merge can pick them up.
+        await reconcileOrphanedJournal(db, entries)
+
         for (var j = 0; j < entries.length; j++) {
           var applied = entries[j]
           var appliedIntoName = await describePlace(db, applied.into)
@@ -1164,8 +1232,6 @@ async function main() {
           console.log(entryLabel(applied, appliedIntoName) + ': relabeled ' + changes.relabeled + ' cell(s)' +
             (changes.returned ? ', returned ' + changes.returned + ' coarse cell(s) to their original owners' : ''))
         }
-
-        await reconcileRemovedSources(db, entries)
 
         if (options.verify) {
           var verdict = await verifyEntries(db, entries, options.skipUnresolvable, boundary, resolvability)

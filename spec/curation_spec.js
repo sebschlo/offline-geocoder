@@ -1356,6 +1356,175 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
+  it('reconciles the old target when a revision moves a source to a different target', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: initial target.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const first = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(first.status).toEqual(0);
+      expect(ownerOf(await lookupSnapshot(dbPath), cells.eastFine)).toEqual(CITY);
+
+      // The revision moves East County from Big City to Bystander County. The
+      // source owns no cells anymore (the first apply drained them to Big
+      // City), so without reconciling the historical target the new merge
+      // would relabel nothing and the cells would stay with Big City.
+      writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: BYSTANDER,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: revised entry retargets East County.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Bystander County', note: 'positive on the new target' },
+              { lat: points.city.lat, lon: points.city.lon, expect: 'Big City', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const second = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(second.status).toEqual(0);
+
+      const rows = await lookupSnapshot(dbPath);
+      expect(ownerOf(rows, cells.eastFine)).toEqual(BYSTANDER);
+      expect(ownerOf(rows, cells.eastCoarse)).toEqual(EAST);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not count a lost curated cell as exercised via a coarser target-owned cell', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: single-source merge for the lost-cell scenario.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const first = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(first.status).toEqual(0);
+
+      // The curated fine cell is lost, while its enclosing coarse cell now
+      // belongs to the target: the probe still resolves to Big City via
+      // geohash_lookup, but through a cell this entry never relabeled.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `
+          DELETE FROM compact_geohash_lookup WHERE geohash = '${cells.eastFine}';
+          UPDATE compact_geohash_lookup SET place_id = ${CITY} WHERE geohash = '${cells.eastCoarse}';
+        `);
+      } finally {
+        await close(db);
+      }
+
+      const second = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(second.status).toEqual(1);
+      expect(second.stderr).toContain('no positive probe resolved from the cells this entry relabeled');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects two curation files declaring the same country', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      const dirA = path.join(dir, 'a');
+      const dirB = path.join(dir, 'b');
+      fs.mkdirSync(dirA);
+      fs.mkdirSync(dirB);
+      const docA = writeDoc(dirA, 'us.json', baseDoc());
+      const docB = writeDoc(dirB, 'us.json', {
+        country: 'US',
+        entries: [conflictEntry(CITY, [BYSTANDER])]
+      });
+
+      const result = runCurate(['--database', dbPath, '--curation', docA, '--curation', docB]);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('country US is declared by more than one curation file');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('previews removed-source restorations in dry-run output', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
+
+      const first = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(first.status).toEqual(0);
+
+      // Drop West County from absorb: a dry run must disclose that a real
+      // apply would restore its journaled cell, not report zero changes.
+      writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: revised entry no longer absorbs West County.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const snapshot = await lookupSnapshot(dbPath);
+      const dryRun = runCurate(['--database', dbPath, '--curation', docPath, '--dry-run']);
+      expect(dryRun.status).toEqual(0);
+      expect(dryRun.stdout).toContain('would restore 1 cell(s) from source(s) no longer absorbed');
+      expect(await lookupSnapshot(dbPath)).toEqual(snapshot);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('ships a structurally valid Guatemala curation file', () => {
     const gtPath = path.join(__dirname, '..', 'curation', 'gt.json');
     const doc = JSON.parse(fs.readFileSync(gtPath, 'utf8'));
@@ -1370,6 +1539,15 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     expect(entries[0].into).toEqual(421169087);
     expect(entries[0].absorb).toEqual([421191461, 1108695621, 421185999]);
     expect(entries[0].minPrecision).toEqual(5);
-    expect(entries[0].probes.length).toEqual(5);
+    expect(entries[0].probes.length).toEqual(6);
+
+    // Probe coordinates were validated empirically against the world build:
+    // both roles are present, and the positives cover each absorbed
+    // municipality that actually owns cells (Santa Catarina Pinula's two
+    // cells and Fraijanes' one) plus Guatemala City's own territory.
+    const positives = entries[0].probes.filter((probe) => probe.expect === 'Guatemala City');
+    const guards = entries[0].probes.filter((probe) => probe.expect !== 'Guatemala City');
+    expect(positives.length).toEqual(4);
+    expect(guards.map((probe) => probe.expect).sort()).toEqual(['Antigua Guatemala', 'Mixco']);
   });
 });

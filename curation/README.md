@@ -41,10 +41,11 @@ request, with the rationale in the entry itself and, ideally, the output of a
 
 ## File format
 
-One JSON file per country, named by lowercase ISO 3166-1 alpha-2 code
-(`gt.json`, `fr.json`, ...). The filename must match the declared `country`
-(validation enforces it), so applying a file by name can only ever change the
-country it is named for.
+Exactly one JSON file per country, named by lowercase ISO 3166-1 alpha-2 code
+(`gt.json`, `fr.json`, ...). The filename must match the declared `country`,
+and no two loaded files may declare the same country — validation enforces
+both — so applying a file by name can only ever change the country it is
+named for, and a country's whole overlay always travels in one file.
 
 ```json
 {
@@ -103,15 +104,20 @@ WHERE place_id IN (<absorb...>) AND LENGTH(geohash) >= <minPrecision>
   relabeled.
 - The operation is **idempotent by construction**: relabeled cells leave the
   absorbed set, so a second apply changes nothing.
-- Applying **reconciles the database to the entry as written**: if a revision
-  raises `minPrecision`, cells drained by the earlier revision that the new
-  threshold defines as coarse are returned to their original owners (from the
-  per-cell journal) in the same apply — and if a revision removes a place
-  from `absorb`, that source's journaled cells are likewise returned — so an
-  old, broader merge cannot silently linger. Cells something else has since
-  overwritten are left alone and their journal records retired. The one
-  structural change apply cannot see is deleting an entire entry: for that,
-  run `--revert` and re-apply.
+- Applying **reconciles the database to the files as written**, for the
+  countries in the run. Any journaled cell whose `(target, source)` pair the
+  loaded files no longer declare is returned to its original owner before the
+  merges are applied, and cells the current `minPrecision` now defines as
+  coarse are returned too. That one rule covers every structural revision:
+  raising `minPrecision`, dropping a place from `absorb`, and moving a source
+  to a different `into` (its cells sit on the old target, which no entry
+  mentions anymore, so they are released first and the new merge picks them
+  up). Reconciliation is scoped to the countries being applied, so a Guatemala
+  run never disturbs overlays applied earlier for other countries. Cells
+  something else has since overwritten are left alone and their journal
+  records retired. The one structural change apply cannot see is deleting an
+  entire entry — it is indistinguishable from not passing that file: for
+  that, run `--revert` and re-apply.
 - Application order is **deterministic and irrelevant**: files are applied in
   sorted path order and entries in file order, and cross-entry conflict
   validation (see the conflict policy below) guarantees that every lookup row
@@ -194,9 +200,13 @@ the target's **place id** (a same-named place does not count) **from a
 matching lookup cell** — a nearest-centroid fallback result never satisfies a
 positive probe, because the fallback can return the target for a coordinate
 the overlay never reached. In addition, when an entry relabeled any cells,
-**at least one passing positive probe must have resolved from those relabeled
-cells**: positive probes sitting only on cells the target owned all along
-prove nothing about the entry's own effect. If any probe fails, the whole
+**at least one passing positive probe must have resolved through one of those
+relabeled cells** — the exact lookup row the reverse geocoder matched must be
+a cell this entry drained and must still belong to the target. Positive
+probes sitting only on cells the target owned all along prove nothing about
+the entry's own effect, and a curated fine cell that goes missing cannot be
+papered over by a coarser target-owned cell covering the same point. If any
+probe fails, the whole
 overlay is rolled back and the command exits nonzero with the database
 unchanged — a bad entry can never leave a half-curated database behind, and
 automation can rely on "nonzero exit means nothing was applied". The reverse
@@ -211,16 +221,18 @@ database visibly cannot express that probe's intended result yet:
   lookup cells **with the overlay applied** — if the pending merge itself
   grants the target cells, a failing probe expecting the target exposes an
   incomplete `absorb` set and still fails; or
-- the probe expects the merge target's name, sits on **no cell this entry has
-  drained** (per the journal), and one of the entry's absorbed places owns no
-  cells the entry could actually relabel (at or above its `minPrecision`)
-  **and has no journaled drained cells at or above that precision**. In other
-  words: a failure is only excused where the entry's data has demonstrably
-  never arrived. A failure on territory the entry drained is a regression and
-  stays strict no matter which other source is missing; a source whose cells
-  are gone because the overlay already consumed them excuses nothing; and
-  evidence from an earlier revision at a coarser precision does not vouch for
-  a finer one.
+- the probe expects the merge target's name, the lookup row it matched is
+  **not a cell this entry has drained** (per the journal, whoever owns that
+  row now), and one of the entry's absorbed places owns no cells the entry
+  could actually relabel (at or above its `minPrecision`) **and has no
+  journaled drained cells at or above that precision**. In other words: a
+  failure is only excused where the entry's data has demonstrably never
+  arrived. A failure on a cell the entry drained is a regression and stays
+  strict no matter which other source is missing — including when that cell
+  has since been handed to a third place; a source whose cells are gone
+  because the overlay already consumed them excuses nothing; and evidence
+  from an earlier revision at a coarser precision does not vouch for a finer
+  one.
 
 Guard probes expecting any other name never inherit deferral from missing
 merge sources: a failing guard rolls the transaction back even with the flag.
@@ -230,11 +242,26 @@ with the flag.
 
 ### A note on the Guatemala probes
 
-The probes in `gt.json` describe the **intended end state once the world
-database is rebuilt with county boundaries indexed at precision 5**. On the
-currently shipped database, Santa Catarina Pinula owns no cells at all, so the
-merge is a no-op there — the mechanism still validates and applies cleanly,
-and `--verify --skip-unresolvable` defers the probes that cannot resolve yet.
+Every coordinate in `gt.json` was chosen **empirically against a world build
+with county boundaries indexed at precision 5**, not synthesized from a map:
+each positive probe sits inside a cell the merge actually drains, and the
+whole entry passes strict `--verify` (no `--skip-unresolvable`) on that
+build, relabeling 3 cells.
+
+Two things that build taught us, both recorded in the entry's rationale:
+
+- The municipality of Guatemala (421191461) owns **no** cells at precision 5,
+  because Guatemala City's locality polygon already covers its municipal
+  territory. Absorbing it is a no-op today; it stays in `absorb` as
+  future-proofing for builds where the municipality does win cells.
+- The corridor cells below roughly km 18 belong to Guatemala City natively or
+  to Villa Canales (which keeps its own identity), so the drained territory
+  is Santa Catarina Pinula's two cells plus Fraijanes' one. The probes cover
+  all three.
+
+On a database built without county boundaries at that precision, the absorbed
+municipalities own no cells, the merge is a validated no-op, and
+`--verify --skip-unresolvable` defers the probes that cannot resolve yet.
 
 ## Contributing and conflict policy
 
@@ -286,4 +313,6 @@ changing them are strict by design:
   bare name "Guatemala", which renders like a country-only label in apps. All
   three are absorbed into the Guatemala City label at precision ≥ 5, while
   coarse fallback cells keep their original owners. Mixco and Villa Nueva
-  intentionally keep their own identities.
+  intentionally keep their own identities, and Villa Canales — which owns the
+  corridor cells nearer the city — keeps its own name too. Verified strictly
+  against a world build; see the note on the Guatemala probes above.
