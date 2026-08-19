@@ -62,6 +62,16 @@ function requireNumericArg(flag, raw) {
   return value
 }
 
+function requireValueArg(flag, raw) {
+  // A following option token means the value was accidentally omitted;
+  // consuming it would silently change behavior (e.g. --accept-language
+  // swallowing --dry-run turns a cache-only command into a network run).
+  if (raw === undefined || (typeof raw === 'string' && raw.slice(0, 2) === '--')) {
+    throw new Error(flag + ' requires a value, got: ' + (raw === undefined ? '(missing)' : raw))
+  }
+  return String(raw)
+}
+
 function parseArgs(argv) {
   var opts = {
     database: null,
@@ -412,6 +422,8 @@ async function ensureSamplePoints(sourceDb, cacheDb, lookupTable, targetCount, s
   }
 }
 
+var LATIN_BASE_RE = /\p{Script=Latin}/u
+
 function normalizeName(value) {
   if (!value) return ''
 
@@ -447,7 +459,10 @@ function normalizeName(value) {
       continue
     }
     kept += ch
-    lastBaseIsLatin = (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)
+    // Script-based, not ASCII-based: letters like ø or đ are Latin bases
+    // that never decompose themselves, yet their accented forms do (ǿ is
+    // ø + U+0301 under NFKD) and must fold the same way as e/é.
+    lastBaseIsLatin = LATIN_BASE_RE.test(ch)
   }
 
   return kept
@@ -1193,9 +1208,9 @@ function parseSampleArgs(argv) {
     var arg = argv[i]
 
     if (arg === '--geonames') {
-      opts.geonames = path.resolve(argv[++i])
+      opts.geonames = path.resolve(requireValueArg('--geonames', argv[++i]))
     } else if (arg === '--out') {
-      opts.out = path.resolve(argv[++i])
+      opts.out = path.resolve(requireValueArg('--out', argv[++i]))
     } else if (arg === '--per-country') {
       opts.perCountry = Math.max(1, Math.trunc(requireNumericArg('--per-country', argv[++i])))
     } else if (arg === '--max-points') {
@@ -1496,16 +1511,18 @@ function comparePoint(point, offlineResult, cacheEntry) {
     record.verdict = 'country_unknown'
   } else if (offlineCountry !== record.liq_country) {
     record.verdict = 'country_mismatch'
-  } else if (!liqHasComparableName(address)) {
-    // Countries agree, but LocationIQ supplied no locality/county/state name
-    // to compare against (common for sparse rural responses): unverifiable,
-    // not a name mismatch.
-    record.verdict = 'liq_name_missing'
   } else {
+    // Attempt the match first: display_name segments count as agreement even
+    // when the address block carries no name fields at all.
     var via = findLiqNameMatch(normalizeName(offlineName), address, record.liq_display_name)
     if (via) {
       record.verdict = 'agree'
       record.match_via = via
+    } else if (!liqHasComparableName(address)) {
+      // Countries agree, but LocationIQ supplied no locality/county/state
+      // name to compare against (common for sparse rural responses):
+      // unverifiable, not a name mismatch.
+      record.verdict = 'liq_name_missing'
     } else {
       record.verdict = 'name_mismatch'
     }
@@ -1890,25 +1907,27 @@ function parseSweepArgs(argv) {
     var arg = argv[i]
 
     if (arg === '--points') {
-      opts.pointsPath = path.resolve(argv[++i])
+      opts.pointsPath = path.resolve(requireValueArg('--points', argv[++i]))
     } else if (arg === '--database' || arg === '-d') {
-      opts.database = path.resolve(argv[++i])
+      opts.database = path.resolve(requireValueArg('--database', argv[++i]))
     } else if (arg === '--workdir') {
-      opts.workdir = path.resolve(argv[++i])
+      opts.workdir = path.resolve(requireValueArg('--workdir', argv[++i]))
     } else if (arg === '--cache') {
-      opts.cachePath = path.resolve(argv[++i])
+      opts.cachePath = path.resolve(requireValueArg('--cache', argv[++i]))
     } else if (arg === '--state') {
-      opts.statePath = path.resolve(argv[++i])
+      opts.statePath = path.resolve(requireValueArg('--state', argv[++i]))
     } else if (arg === '--report') {
-      opts.reportPath = path.resolve(argv[++i])
+      opts.reportPath = path.resolve(requireValueArg('--report', argv[++i]))
     } else if (arg === '--mismatches') {
-      opts.mismatchesPath = path.resolve(argv[++i])
+      opts.mismatchesPath = path.resolve(requireValueArg('--mismatches', argv[++i]))
     } else if (arg === '--api-key') {
-      opts.apiKey = String(argv[++i] || '')
+      opts.apiKey = requireValueArg('--api-key', argv[++i])
     } else if (arg === '--endpoint') {
-      opts.endpoint = String(argv[++i] || opts.endpoint)
+      opts.endpoint = requireValueArg('--endpoint', argv[++i])
     } else if (arg === '--accept-language') {
-      opts.acceptLanguage = String(argv[++i] || '')
+      // '' is a documented value (disables the header), but a following
+      // option token means the value was omitted.
+      opts.acceptLanguage = requireValueArg('--accept-language', argv[++i])
     } else if (arg === '--daily-cap') {
       // Reject non-numeric values outright: a NaN here would silently
       // disable the daily quota instead of enforcing it.

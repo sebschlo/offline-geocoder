@@ -289,6 +289,27 @@ describe('locationiq sweep', () => {
       expect(report).toContain('no name 1');
     });
 
+    it('accepts a display-name-only match before falling back to liq_name_missing', () => {
+      // The address block has no name fields, but the display_name segment
+      // matches: that is agreement, not an unverifiable answer.
+      const record = liq.comparePoint(
+        point({ country: 'US' }),
+        { name: 'Testville', country: { id: 'US' } },
+        { status: 200, body: { display_name: 'Testville, United States', address: { country_code: 'us' } } }
+      );
+      expect(record.verdict).toEqual('agree');
+      expect(record.match_via).toEqual('display_name');
+    });
+
+    it('folds diacritics on non-ASCII Latin bases', () => {
+      // NFKD decomposes ǿ into ø + U+0301; ø is Latin but not ASCII, so the
+      // base test must use the Unicode script property, not [a-z].
+      expect(liq.normalizeName('ǿ')).toEqual(liq.normalizeName('ø'));
+      expect(liq.normalizeName('Ǿrsted')).toEqual(liq.normalizeName('Ørsted'));
+      // Non-Latin bases still keep their marks.
+      expect(liq.normalizeName('й')).not.toEqual(liq.normalizeName('и'));
+    });
+
     it('agrees when the offline name matches a locality field after normalization', () => {
       const record = liq.comparePoint(
         point({ name: 'Kilómetro 18' }),
@@ -617,6 +638,17 @@ describe('locationiq sweep', () => {
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
+    });
+
+    it('rejects option flags consumed as values for value-taking options', () => {
+      // Swallowing the next flag can silently flip network behavior:
+      // `--accept-language --dry-run` must not eat the dry-run flag.
+      expect(() => liq.parseSweepArgs(['--accept-language', '--dry-run'])).toThrowError(/--accept-language/);
+      expect(() => liq.parseSweepArgs(['--endpoint'])).toThrowError(/--endpoint/);
+      expect(() => liq.parseSweepArgs(['--api-key', '--points', 'x.jsonl'])).toThrowError(/--api-key/);
+      expect(() => liq.parseSampleArgs(['--geonames', '--out'])).toThrowError(/--geonames/);
+      // The documented empty value still works.
+      expect(liq.parseSweepArgs(['--accept-language', '']).acceptLanguage).toEqual('');
     });
 
     it('rejects unsupported --reverse-mode values instead of silently mapping them', () => {
