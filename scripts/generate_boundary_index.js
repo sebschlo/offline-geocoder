@@ -15,6 +15,13 @@ const PLACETYPE_CODES = {
   county: 3
 }
 
+const PLACETYPE_BY_CODE = {
+  0: 'locality',
+  1: 'localadmin',
+  2: 'region',
+  3: 'county'
+}
+
 function parseBool(value, defaultValue) {
   if (value === undefined || value === null || value === '') {
     return defaultValue
@@ -939,6 +946,27 @@ function isCityPlacetypeCode(code) {
   return code === PLACETYPE_CODES.locality || code === PLACETYPE_CODES.localadmin || code === PLACETYPE_CODES.county
 }
 
+// Rebuild a comparable place record from a stored compact_places row so that
+// appended batches can be ranked against places written by earlier batches.
+// Databases created before population/area were stored yield NULL for those
+// columns; they are treated as population 0 / area 0.
+function cellCandidateFromCompactRow(row) {
+  var population = Number(row.population)
+  if (!Number.isFinite(population) || population < 0) population = 0
+
+  var area = Number(row.area)
+  if (!Number.isFinite(area) || area < 0) area = 0
+
+  return {
+    id: Number(row.id),
+    placetype: PLACETYPE_BY_CODE[Number(row.placetype_code)] || 'region',
+    population: population,
+    centroidLat: Number(row.latitude),
+    centroidLon: Number(row.longitude),
+    area: area
+  }
+}
+
 function placePopulation(place) {
   if (!place) return 0
 
@@ -1249,7 +1277,79 @@ function buildCompactLookupRows(places, opts) {
     compact.push(row)
   }
 
-  return compact
+  return {
+    rows: compact,
+    placeById: placeById
+  }
+}
+
+// In append mode a lookup cell may already belong to a place written by an
+// earlier batch (for example another country sharing a border cell). A plain
+// INSERT OR REPLACE would hand the cell to whichever batch ran last, so rank
+// the existing owner against the appended candidate with the same comparator
+// used within a batch and keep the better match. Cells owned by places that
+// are part of the current batch are always rewritten, because their rows are
+// deleted and replaced by this run.
+async function resolveExistingCellConflicts(db, rows, placeById, batchPlaceIds) {
+  if (!rows.length) {
+    return { rows: rows, skipped: 0 }
+  }
+
+  var tables = await dbAll(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='compact_geohash_lookup'")
+  if (!tables.length) {
+    return { rows: rows, skipped: 0 }
+  }
+
+  var existingByHash = Object.create(null)
+  var chunkSize = 400
+
+  for (var offset = 0; offset < rows.length; offset += chunkSize) {
+    var chunk = rows.slice(offset, offset + chunkSize)
+    var placeholders = chunk.map(function() { return '?' }).join(',')
+    var params = chunk.map(function(row) { return row.geohash })
+
+    var existingRows = await dbAll(db, `
+      SELECT
+        l.geohash AS geohash,
+        p.id AS id,
+        p.placetype_code AS placetype_code,
+        p.population AS population,
+        p.area AS area,
+        p.latitude AS latitude,
+        p.longitude AS longitude
+      FROM compact_geohash_lookup l
+      JOIN compact_places p ON p.id = l.place_id
+      WHERE l.geohash IN (${placeholders})
+    `, params)
+
+    existingRows.forEach(function(row) {
+      existingByHash[row.geohash] = row
+    })
+  }
+
+  var hashCenterCache = Object.create(null)
+  var kept = []
+  var skipped = 0
+
+  rows.forEach(function(row) {
+    var existing = existingByHash[row.geohash]
+    if (!existing || batchPlaceIds[String(existing.id)]) {
+      kept.push(row)
+      return
+    }
+
+    var incumbent = cellCandidateFromCompactRow(existing)
+    var challenger = placeById[String(row.placeId)]
+
+    if (!challenger || comparePlacesForHash(incumbent, challenger, row.geohash, hashCenterCache) <= 0) {
+      skipped += 1
+      return
+    }
+
+    kept.push(row)
+  })
+
+  return { rows: kept, skipped: skipped }
 }
 
 function dbExec(db, sql) {
@@ -1266,6 +1366,15 @@ function dbRun(db, sql, params) {
     db.run(sql, params || [], function(err) {
       if (err) reject(err)
       else resolve(this)
+    })
+  })
+}
+
+function dbAll(db, sql, params) {
+  return new Promise(function(resolve, reject) {
+    db.all(sql, params || [], function(err, rows) {
+      if (err) reject(err)
+      else resolve(rows || [])
     })
   })
 }
@@ -1297,6 +1406,25 @@ function stmtFinalize(stmt) {
   })
 }
 
+// Databases produced before population/area were stored in compact_places
+// (they ship without those columns) are upgraded in place when appending.
+// The columns are nullable so existing rows stay valid and older readers,
+// which select columns by name, are unaffected.
+async function ensureCompactPlacesColumns(db) {
+  var columns = await dbAll(db, 'PRAGMA table_info(compact_places)')
+  var names = Object.create(null)
+  columns.forEach(function(column) {
+    names[column.name] = true
+  })
+
+  if (!names.population) {
+    await dbExec(db, 'ALTER TABLE compact_places ADD COLUMN population REAL')
+  }
+  if (!names.area) {
+    await dbExec(db, 'ALTER TABLE compact_places ADD COLUMN area REAL')
+  }
+}
+
 async function ensureBoundarySchema(db, opts) {
   if (opts.indexMode === 'compact') {
     if (opts.replace) {
@@ -1320,7 +1448,9 @@ async function ensureBoundarySchema(db, opts) {
         admin1_id INTEGER,
         placetype_code INTEGER NOT NULL,
         latitude REAL NOT NULL,
-        longitude REAL NOT NULL
+        longitude REAL NOT NULL,
+        population REAL,
+        area REAL
       );
 
       CREATE TABLE IF NOT EXISTS compact_geohash_lookup(
@@ -1332,6 +1462,7 @@ async function ensureBoundarySchema(db, opts) {
       CREATE INDEX IF NOT EXISTS compact_places_placetype_code ON compact_places (placetype_code);
       CREATE INDEX IF NOT EXISTS compact_geohash_lookup_place_id ON compact_geohash_lookup (place_id);
     `)
+    await ensureCompactPlacesColumns(db)
     return
   }
 
@@ -1578,8 +1709,8 @@ async function writePlaces(db, places, opts, compactLookupRows) {
       placeStmt = db.prepare(`
         INSERT OR REPLACE INTO compact_places(
           id, name, country_id, admin1_id, placetype_code,
-          latitude, longitude
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          latitude, longitude, population, area
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
 
       compactStmt = db.prepare(`
@@ -1611,7 +1742,9 @@ async function writePlaces(db, places, opts, compactLookupRows) {
             place.admin1Id,
             place.placetypeCode,
             place.centroidLat,
-            place.centroidLon
+            place.centroidLon,
+            place.population,
+            place.area
           ])
         } else {
           await stmtRun(placeStmt, [
@@ -1768,13 +1901,27 @@ async function main() {
   var pruned = pruneContainedLocalities(dedupedPlaces, options.dropContainedLocalities)
   var regionPrune = pruneRedundantRegions(pruned.places)
   var finalPlaces = regionPrune.places
-  var compactLookupRows = options.indexMode === 'compact' ? buildCompactLookupRows(finalPlaces, options) : []
+  var compactBuild = options.indexMode === 'compact' ? buildCompactLookupRows(finalPlaces, options) : null
+  var compactLookupRows = compactBuild ? compactBuild.rows : []
+  var lookupRowsDeferred = 0
 
   var databasePath = path.resolve(options.database)
   var db = new sqlite3.Database(databasePath)
 
   try {
     await ensureBoundarySchema(db, options)
+
+    if (compactBuild && !options.replace) {
+      var batchPlaceIds = Object.create(null)
+      finalPlaces.forEach(function(place) {
+        batchPlaceIds[String(place.id)] = true
+      })
+
+      var resolved = await resolveExistingCellConflicts(db, compactBuild.rows, compactBuild.placeById, batchPlaceIds)
+      compactLookupRows = resolved.rows
+      lookupRowsDeferred = resolved.skipped
+    }
+
     await writePlaces(db, finalPlaces, options, compactLookupRows)
 
     var coverCount = finalPlaces.reduce(function(total, place) {
@@ -1796,6 +1943,9 @@ async function main() {
     console.log('Places written: ' + finalPlaces.length)
     if (options.indexMode === 'compact') {
       console.log('Geohash lookup rows: ' + compactLookupRows.length)
+      if (!options.replace) {
+        console.log('Lookup rows deferring to better existing matches: ' + lookupRowsDeferred)
+      }
     } else {
       console.log('Geohash cover rows: ' + coverCount)
     }
