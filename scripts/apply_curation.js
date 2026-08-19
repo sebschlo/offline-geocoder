@@ -375,23 +375,31 @@ async function assertPlaceIdsExist(db, entries) {
 
   var ids = Object.keys(wanted).map(Number)
   var placeholders = ids.map(function() { return '?' }).join(', ')
-  var rows = await dbAll(db, 'SELECT id FROM compact_places WHERE id IN (' + placeholders + ')', ids)
+  var rows = await dbAll(db, 'SELECT id, country_id FROM compact_places WHERE id IN (' + placeholders + ')', ids)
 
-  var found = Object.create(null)
+  var countryById = Object.create(null)
   rows.forEach(function(row) {
-    found[row.id] = true
+    countryById[row.id] = String(row.country_id || '').toUpperCase()
   })
+
+  // A referenced id must exist AND belong to the file's declared country: a
+  // typo'd id that happens to identify a real place in another country must
+  // not silently relabel that foreign place's cells.
+  function checkId(id, role, entry, problems) {
+    var label = entry.source + ' entry ' + entry.index
+    if (countryById[id] === undefined) {
+      problems.push('place id ' + id + ' ("' + role + '", ' + label + ') not found in compact_places')
+    } else if (countryById[id] !== entry.country) {
+      problems.push('place id ' + id + ' ("' + role + '", ' + label + ') belongs to country ' +
+        (countryById[id] || '<none>') + ', not ' + entry.country)
+    }
+  }
 
   var problems = []
   entries.forEach(function(entry) {
-    var label = entry.source + ' entry ' + entry.index
-    if (!found[entry.into]) {
-      problems.push('place id ' + entry.into + ' ("into", ' + label + ') not found in compact_places')
-    }
+    checkId(entry.into, 'into', entry, problems)
     entry.absorb.forEach(function(id) {
-      if (!found[id]) {
-        problems.push('place id ' + id + ' ("absorb", ' + label + ') not found in compact_places')
-      }
+      checkId(id, 'absorb', entry, problems)
     })
   })
 
@@ -480,15 +488,13 @@ async function deriveBoundaryPrecision(db) {
   return { basePrecision: min, maxPrecision: max }
 }
 
-// Snapshot, before anything is written, which of each entry's inputs the
-// database can currently express: absorbed places that own no cells the entry
-// could relabel (at or above its minPrecision), and whether each probe's
-// expected name owns any cells within the entry's country. Verification uses
-// this to tell a genuine mismatch from a curation file that shipped ahead of
-// the data build that makes it effective.
+// Snapshot, before anything is written, which absorbed places own no cells
+// the entry could relabel (at or above its minPrecision) — the apply itself
+// drains sources, so this must be measured pre-apply. Verification uses it to
+// tell a genuine mismatch from a curation file that shipped ahead of the data
+// build that makes it effective.
 async function computeResolvability(db, entries) {
   var missingSourcesByEntry = Object.create(null)
-  var expectOwnsByName = Object.create(null)
 
   for (var i = 0; i < entries.length; i++) {
     var entry = entries[i]
@@ -500,23 +506,25 @@ async function computeResolvability(db, entries) {
       }
     }
     missingSourcesByEntry[entry.source + '#' + entry.index] = missing
-
-    for (var k = 0; k < entry.probes.length; k++) {
-      var key = entry.country + '|' + entry.probes[k].expect
-      if (expectOwnsByName[key] === undefined) {
-        expectOwnsByName[key] = await expectedPlaceOwnsCells(db, entry.probes[k].expect, entry.country)
-      }
-    }
   }
 
   return {
-    missingSourcesByEntry: missingSourcesByEntry,
-    expectOwnsByName: expectOwnsByName
+    missingSourcesByEntry: missingSourcesByEntry
   }
 }
 
 // Runs probes on the shared connection so they see the uncommitted overlay;
 // the caller decides whether to commit or roll back based on the verdict.
+//
+// Deferral reasons are per probe:
+// - The expected place owning no cells is judged against the POST-apply
+//   transaction state: when the pending merge itself grants the target cells,
+//   a failing probe expecting the target exposes an incomplete absorb set and
+//   is a genuine failure, not an unresolvable probe.
+// - Missing merge sources (snapshotted PRE-apply, since the apply drains
+//   them) only defer probes that expect the merge target's name. Guard probes
+//   expecting any other name do not depend on the missing source and must
+//   keep blocking the transaction.
 async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvability) {
   var createGeocoder = require('../src/index.js')
   var geocoder = createGeocoder({
@@ -528,10 +536,12 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
   var passed = 0
   var skipped = 0
   var failures = []
+  var expectOwnsCache = Object.create(null)
 
   for (var i = 0; i < entries.length; i++) {
     var entry = entries[i]
     var missingSources = resolvability.missingSourcesByEntry[entry.source + '#' + entry.index] || []
+    var intoName = await describePlace(db, entry.into)
 
     for (var j = 0; j < entry.probes.length; j++) {
       var probe = entry.probes[j]
@@ -548,11 +558,16 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
         continue
       }
 
+      var expectKey = entry.country + '|' + probe.expect
+      if (expectOwnsCache[expectKey] === undefined) {
+        expectOwnsCache[expectKey] = await expectedPlaceOwnsCells(db, probe.expect, entry.country)
+      }
+
       var reasons = []
-      if (!resolvability.expectOwnsByName[entry.country + '|' + probe.expect]) {
+      if (!expectOwnsCache[expectKey]) {
         reasons.push('expected place "' + probe.expect + '" (' + entry.country + ') owns no cells in this database yet')
       }
-      if (missingSources.length) {
+      if (missingSources.length && probe.expect === intoName) {
         reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells at precision >= ' + entry.minPrecision + ' in this database yet')
       }
 

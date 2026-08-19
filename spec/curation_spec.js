@@ -481,6 +481,107 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
+  it('rejects an entry referencing a place from another country', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // HOMONYM is a real place, but it belongs to CA while the file declares
+      // US: a typo'd id that happens to exist elsewhere must not pass
+      // validation and relabel a foreign place's cells.
+      const absorbForeign = baseDoc();
+      absorbForeign.entries[0].absorb = [EAST, HOMONYM];
+      const absorbResult = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'absorb-foreign.json', absorbForeign)
+      ]);
+      expect(absorbResult.status).toEqual(1);
+      expect(absorbResult.stderr).toContain('belongs to country CA');
+
+      const intoForeign = baseDoc();
+      intoForeign.entries[0].into = HOMONYM;
+      const intoResult = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'into-foreign.json', intoForeign)
+      ]);
+      expect(intoResult.status).toEqual(1);
+      expect(intoResult.stderr).toContain('belongs to country CA');
+
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not defer guard failures unrelated to a missing merge source', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // The entry has a missing source (Ghost Town owns no cells), which may
+      // defer failing probes that expect the merge target — but a guard probe
+      // expecting a different name fails for reasons unrelated to the missing
+      // source and must still block the transaction, even with the flag.
+      const doc = baseDoc();
+      doc.entries[0].absorb = [EAST, GHOST];
+      doc.entries[0].probes = [
+        { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive probe passes' },
+        { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'West County', note: 'guard fails independently of the missing source' }
+      ];
+      const docPath = writeDoc(dir, 'tc.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('expected "West County", got "Bystander County"');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a merge target as resolvable once the overlay grants it cells', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // Ghost Town owns no cells before the apply, but absorbing East County
+      // gives it cells inside the transaction. A probe expecting Ghost Town
+      // where the overlay did NOT reach exposes an incomplete absorb set and
+      // must fail (resolvability is judged against the post-apply state), not
+      // be deferred as if the target could never resolve.
+      const doc = {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: GHOST,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: target owns cells only via the pending overlay.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Ghost Town', note: 'relabeled cell resolves to the target' },
+              { lat: points.west.lat, lon: points.west.lon, expect: 'Ghost Town', note: 'outside the absorb set: genuine failure' }
+            ]
+          }
+        ]
+      };
+      const docPath = writeDoc(dir, 'tc.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('expected "Ghost Town", got "West County"');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('defers failing probes when a merge source owns cells only below minPrecision', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
     try {

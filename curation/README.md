@@ -140,14 +140,22 @@ can never leave a half-curated database behind, and automation can rely on
 is derived from the geohash lengths actually present in the database, so
 verification works on databases built outside the library's default range.
 
-`--skip-unresolvable` downgrades a failing probe to a warning when the
-database visibly predates the entry's inputs: the expected place (matched by
-name within the entry's country) owns no lookup cells, or one of the entry's
-absorbed places owns no cells the entry could actually relabel (at or above
-its `minPrecision`). This lets a curation file ship ahead of the data build
-that makes it effective — see below. On a fully built database, where every
-merge source and expected place owns cells, mismatches fail even with the
-flag.
+`--skip-unresolvable` downgrades a failing probe to a warning only when the
+database visibly cannot express that probe's intended result yet:
+
+- the expected place (matched by name within the entry's country) owns no
+  lookup cells **with the overlay applied** — if the pending merge itself
+  grants the target cells, a failing probe expecting the target exposes an
+  incomplete `absorb` set and still fails; or
+- the probe expects the merge target's name and one of the entry's absorbed
+  places owns no cells the entry could actually relabel (at or above its
+  `minPrecision`).
+
+Guard probes expecting any other name never inherit deferral from missing
+merge sources: a failing guard rolls the transaction back even with the flag.
+This lets a curation file ship ahead of the data build that makes it
+effective — see below — while on a fully built database mismatches fail even
+with the flag.
 
 ### A note on the Guatemala probes
 
@@ -164,7 +172,10 @@ changing them are strict by design:
 
 - **One country per file.** A change to Guatemala lives in `gt.json` and
   nowhere else. This keeps review focused and keeps two contributors from
-  editing the same judgment in different places.
+  editing the same judgment in different places. Validation enforces it:
+  every `into` and `absorb` id must belong to the file's declared country, so
+  a typo'd id that happens to identify a real place elsewhere in the world is
+  rejected instead of silently relabeling a foreign place.
 - **Every entry carries a `rationale` and `probes`.** Entries without them are
   rejected by validation, not just by review.
 - **Existing probes are permanent regression guards.** Once an entry's probes
