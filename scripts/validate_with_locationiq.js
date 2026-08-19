@@ -3,6 +3,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const http = require('http')
 const https = require('https')
 
 const createGeocoder = require('../src/index')
@@ -646,21 +647,48 @@ function buildVerdict(localityMatch, countryMatch, localName, liqLocality) {
 
 function fetchJson(endpointUrl, timeoutMs) {
   return new Promise(function(resolve, reject) {
-    var req = https.get(endpointUrl, function(response) {
+    var settled = false
+    function fail(err) {
+      if (settled) return
+      settled = true
+      reject(err instanceof Error ? err : new Error(String(err)))
+    }
+    function succeed(value) {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+
+    // http is supported so a sweep can be pointed at a local mock endpoint;
+    // real LocationIQ traffic stays on https.
+    var transport = String(endpointUrl).slice(0, 6) === 'http:/' ? http : https
+
+    var req = transport.get(endpointUrl, function(response) {
       var chunks = []
       response.on('data', function(chunk) { chunks.push(chunk) })
+      // A stream reset or abort AFTER headers arrive is not reported by the
+      // request-level error listener: without these the process would die on
+      // an unhandled stream error instead of producing a resumable stop.
+      response.on('error', fail)
+      response.on('aborted', function() {
+        fail(new Error('Response stream aborted before completion'))
+      })
       response.on('end', function() {
+        if (!response.complete) {
+          fail(new Error('Response stream ended before the full body was received'))
+          return
+        }
         var body = Buffer.concat(chunks).toString('utf8')
         try {
           var parsed = JSON.parse(body)
-          resolve({ status: response.statusCode || 0, json: parsed, raw: body })
+          succeed({ status: response.statusCode || 0, json: parsed, raw: body })
         } catch (err) {
-          reject(new Error('Invalid JSON response (' + (response.statusCode || 0) + '): ' + body.slice(0, 200)))
+          fail(new Error('Invalid JSON response (' + (response.statusCode || 0) + '): ' + body.slice(0, 200)))
         }
       })
     })
 
-    req.on('error', reject)
+    req.on('error', fail)
     req.setTimeout(timeoutMs, function() {
       req.destroy(new Error('Request timed out after ' + timeoutMs + 'ms'))
     })
@@ -1050,7 +1078,10 @@ function sweepUsage() {
     'cleanly. Designed for LocationIQ\'s free tier; run one sweep at a time.',
     'The cache records the endpoint and accept-language it was built with, and',
     'network runs with different values are rejected — use a separate --workdir',
-    'per configuration (--dry-run only evaluates the cache and is exempt).',
+    'per configuration (--dry-run only evaluates the cache and is exempt). A',
+    'cache holding responses but no such record (e.g. from an older version of',
+    'this script) is rejected rather than adopted, since the settings that',
+    'produced those responses are unknown; only an empty cache is stamped.',
     '',
     'Options:',
     '  --points <path>          JSONL points file (required; see the sample subcommand)',
@@ -1429,6 +1460,17 @@ function ensureSweepCacheConfig(cachePath, config) {
   // would corrupt the report or re-spend quota.
   var meta = readSweepCacheMeta(cachePath)
   if (!meta) {
+    // Only a new or empty cache may be stamped. A populated but unstamped
+    // cache (e.g. written by an earlier version of this script) has an
+    // unknown provenance: adopting it would bless responses that may have
+    // been fetched under a different endpoint or language.
+    var existing = loadSweepCache(cachePath)
+    if (Object.keys(existing).length > 0) {
+      throw new Error('Cache ' + cachePath + ' holds responses but no configuration record, so the endpoint and ' +
+        'accept-language that produced them are unknown. Point --cache/--workdir at a new location, or delete ' +
+        'the cache to refetch under the current settings (endpoint=' + config.endpoint +
+        ' accept-language=' + (config.acceptLanguage || '(none)') + ').')
+    }
     appendSweepCache(cachePath, { meta: config })
     return
   }
@@ -1475,9 +1517,23 @@ function loadQuotaState(statePath, todayUtc) {
 
   // The last-attempt time is advisory (it only delays the next request), so
   // an absent or unusable value degrades to "no wait" rather than failing.
-  var lastRequestAt = typeof parsed.lastRequestAt === 'number' && Number.isFinite(parsed.lastRequestAt) && parsed.lastRequestAt > 0
-    ? parsed.lastRequestAt
-    : 0
+  // A future timestamp (backward clock correction) is clamped to now, or the
+  // computed wait would stall the run for the whole clock offset.
+  var nowMs = Date.now()
+  var lastRequestAt = 0
+  if (typeof parsed.lastRequestAt === 'number' && Number.isFinite(parsed.lastRequestAt) && parsed.lastRequestAt > 0) {
+    lastRequestAt = Math.min(parsed.lastRequestAt, nowMs)
+  }
+
+  if (parsed.date > todayUtc) {
+    // Requests made while the host clock ran ahead were counted by
+    // LocationIQ against the real (earlier) day, so resetting here would
+    // hand out a second full cap. Both fields are ISO YYYY-MM-DD, which
+    // compares lexicographically.
+    throw new Error('Quota state file ' + statePath + ' records a future date (' + parsed.date +
+      ', today is ' + todayUtc + ' UTC); refusing to reset the request count. Check the host clock, then ' +
+      'delete the file only if you are sure no requests were made today (UTC).')
+  }
 
   if (parsed.date !== todayUtc) {
     return { date: todayUtc, count: 0, lastRequestAt: lastRequestAt }
@@ -2130,6 +2186,7 @@ function dispatch() {
 }
 
 module.exports = {
+  fetchJson: fetchJson,
   normalizeName: normalizeName,
   namesMatch: namesMatch,
   extractLocationIqLocality: extractLocationIqLocality,

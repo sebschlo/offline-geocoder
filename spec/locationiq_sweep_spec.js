@@ -1,5 +1,6 @@
 const fs = require('fs');
 const os = require('os');
+const http = require('http');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
@@ -95,6 +96,21 @@ function cacheEntries(dir) {
       }
     })
     .filter((entry) => entry && entry.key);
+}
+
+// A cache written by a normal sweep always carries a configuration stamp on
+// its first line; fixtures must look the same or they are (correctly)
+// rejected as being of unknown provenance.
+const CACHE_META_LINE = JSON.stringify({
+  meta: { endpoint: 'https://liq.invalid/v1/reverse', acceptLanguage: 'en' }
+});
+
+function writeCacheFile(dir, body, options) {
+  const withMeta = !options || options.stamped !== false;
+  const file = (options && options.file) || path.join(dir, 'cache.jsonl');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, (withMeta ? CACHE_META_LINE + '\n' : '') + body);
+  return file;
 }
 
 function point(overrides) {
@@ -499,7 +515,7 @@ describe('locationiq sweep', () => {
           status: 200,
           body: { display_name: 'San Salvador, El Salvador', address: { city: 'San Salvador', country_code: 'sv' } }
         };
-        fs.writeFileSync(path.join(dir, 'cache.jsonl'), JSON.stringify(cached) + '\n');
+        writeCacheFile(dir, JSON.stringify(cached) + '\n');
 
         const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
         const summary = await liq.runSweep(sweepOpts(dir), deps);
@@ -564,7 +580,7 @@ describe('locationiq sweep', () => {
           status: 200,
           body: { display_name: '', address: { city: 'Testville', country_code: 'us' } }
         };
-        fs.writeFileSync(path.join(dir, 'cache.jsonl'), JSON.stringify(cached) + '\n');
+        writeCacheFile(dir, JSON.stringify(cached) + '\n');
 
         const deps = makeDeps(() => {
           throw new Error('dry-run must not touch the network');
@@ -689,6 +705,81 @@ describe('locationiq sweep', () => {
           await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/quota state/i);
         }
         expect(deps.calls.length).toEqual(0);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed on a future persisted quota date', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        // Requests made while the clock ran ahead were counted by LocationIQ
+        // against the real day, so resetting here would grant a second cap.
+        const tomorrow = liq.utcDateString(new Date(Date.now() + 24 * 3600 * 1000));
+        fs.writeFileSync(path.join(dir, 'quota.json'), JSON.stringify({ date: tomorrow, count: 4500 }));
+
+        await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/future date/i);
+        expect(deps.calls.length).toEqual(0);
+        // The evidence is left in place rather than overwritten.
+        expect(readState(dir).count).toEqual(4500);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('clamps a future pacing timestamp instead of stalling the run', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        // A backward clock correction can leave lastRequestAt an hour ahead;
+        // pacing must never wait longer than the configured interval.
+        fs.writeFileSync(path.join(dir, 'quota.json'), JSON.stringify({
+          date: liq.utcDateString(new Date()),
+          count: 0,
+          lastRequestAt: Date.now() + 3600 * 1000
+        }));
+
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const waits = [];
+        deps.sleep = async (ms) => { waits.push(ms); };
+
+        const summary = await liq.runSweep(sweepOpts(dir, { rps: 1, maxRequests: 1 }), deps);
+
+        expect(summary.requestsThisRun).toEqual(1);
+        waits.forEach((ms) => expect(ms).toBeLessThanOrEqual(1000));
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a populated cache that carries no configuration record', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const legacy = {
+          key: liq.sweepCoordKey(WORLD_POINTS[0].lat, WORLD_POINTS[0].lon),
+          lat: WORLD_POINTS[0].lat,
+          lon: WORLD_POINTS[0].lon,
+          status: 200,
+          body: { display_name: '', address: { city: 'Testville', country_code: 'us' } }
+        };
+        // A cache from an earlier implementation: responses of unknown
+        // provenance must not be adopted and stamped as if they were ours.
+        writeCacheFile(dir, JSON.stringify(legacy) + '\n', { stamped: false });
+
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        await expectAsync(liq.runSweep(sweepOpts(dir), deps))
+          .toBeRejectedWithError(/no configuration record/i);
+        expect(deps.calls.length).toEqual(0);
+
+        // An empty cache file is still adopted and stamped normally.
+        writeCacheFile(dir, '', { stamped: false });
+        const fresh = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const summary = await liq.runSweep(sweepOpts(dir), fresh);
+        expect(fresh.calls.length).toEqual(5);
+        expect(summary.stopReason).toBeNull();
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
@@ -898,7 +989,7 @@ describe('locationiq sweep', () => {
         };
         // Valid entry followed by a torn final line with no newline, as an
         // interrupted append would leave it.
-        fs.writeFileSync(path.join(dir, 'cache.jsonl'), JSON.stringify(seeded) + '\n' + '{"key":"13.4767');
+        writeCacheFile(dir, JSON.stringify(seeded) + '\n' + '{"key":"13.4767');
 
         const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
         const summary = await liq.runSweep(sweepOpts(dir), deps);
@@ -956,7 +1047,7 @@ describe('locationiq sweep', () => {
           status: 200,
           body: { display_name: '', address: { city: 'Testville', country_code: 'us' } }
         };
-        fs.writeFileSync(path.join(dir, 'cache.jsonl'), JSON.stringify(cached) + '\n');
+        writeCacheFile(dir, JSON.stringify(cached) + '\n');
 
         const deps = makeDeps(() => {
           throw new Error('dry-run must not touch the network');
@@ -1115,6 +1206,87 @@ describe('locationiq sweep', () => {
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('fetchJson', () => {
+    // These use a loopback server on 127.0.0.1 only: no external host is
+    // contacted, and no LocationIQ request is ever made.
+    function withServer(handler, run) {
+      return new Promise((resolve, reject) => {
+        const server = http.createServer(handler);
+        server.listen(0, '127.0.0.1', async () => {
+          const url = 'http://127.0.0.1:' + server.address().port + '/reverse';
+          try {
+            resolve(await run(url));
+          } catch (err) {
+            reject(err);
+          } finally {
+            server.close();
+          }
+        });
+        server.on('error', reject);
+      });
+    }
+
+    it('rejects rather than hanging when a chunked response is aborted mid-stream', async () => {
+      // Without response-stream handlers this promise never settles: the
+      // request-level 'error' listener does not fire once a response has
+      // begun, and no 'end' arrives on an aborted chunked stream — so the
+      // sweep would stall forever instead of stopping resumably.
+      await withServer(
+        (req, res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked' });
+          res.write(JSON.stringify({ address: { city: 'Truncated', country_code: 'us' } }));
+          setTimeout(() => res.socket.destroy(), 20);
+        },
+        async (url) => {
+          const outcome = await Promise.race([
+            liq.fetchJson(url, 5000).then(() => 'resolved', (err) => 'rejected: ' + err.message),
+            new Promise((resolve) => setTimeout(() => resolve('hung'), 2000))
+          ]);
+          expect(outcome).toMatch(/^rejected: /);
+        }
+      );
+    });
+
+    it('rejects when the connection drops mid-body', async () => {
+      await withServer(
+        (req, res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '64' });
+          res.write('{"address":');
+          res.socket.destroy();
+        },
+        async (url) => {
+          await expectAsync(liq.fetchJson(url, 5000)).toBeRejectedWithError(Error);
+        }
+      );
+    });
+
+    it('resolves a complete JSON response', async () => {
+      await withServer(
+        (req, res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ address: { city: 'Testville', country_code: 'us' } }));
+        },
+        async (url) => {
+          const response = await liq.fetchJson(url, 5000);
+          expect(response.status).toEqual(200);
+          expect(response.json.address.city).toEqual('Testville');
+        }
+      );
+    });
+
+    it('rejects a non-JSON body rather than resolving garbage', async () => {
+      await withServer(
+        (req, res) => {
+          res.writeHead(502, { 'Content-Type': 'text/html' });
+          res.end('<html>bad gateway</html>');
+        },
+        async (url) => {
+          await expectAsync(liq.fetchJson(url, 5000)).toBeRejectedWithError(/Invalid JSON response \(502\)/);
+        }
+      );
     });
   });
 });
