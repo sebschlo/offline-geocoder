@@ -187,7 +187,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     try {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
-      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
 
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(0);
@@ -206,7 +206,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     try {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
-      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
 
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(0);
@@ -224,7 +224,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     try {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
-      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
 
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(0);
@@ -243,7 +243,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     try {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
-      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
 
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(0);
@@ -265,7 +265,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     try {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
-      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
 
       const first = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(first.status).toEqual(0);
@@ -291,7 +291,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
 
       const doc = baseDoc();
       doc.entries[0].absorb = [EAST, 9999999];
-      const docPath = writeDoc(dir, 'tc.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(1);
@@ -314,7 +314,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
 
       const doc = baseDoc();
       doc.entries[0].absorb = [CITY, EAST];
-      const docPath = writeDoc(dir, 'tc.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(1);
@@ -377,6 +377,16 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       ]);
       expect(nullCoordinateResult.status).toEqual(1);
       expect(nullCoordinateResult.stderr).toContain('"lat" must be a number');
+
+      // A structurally valid file whose name does not match its declared
+      // country defeats the one-file-per-country boundary: an operator
+      // applying gt.json expects only Guatemala to change.
+      const wrongName = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'wrong-name.json', baseDoc())
+      ]);
+      expect(wrongName.status).toEqual(1);
+      expect(wrongName.stderr).toContain('must be named us.json');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -388,7 +398,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
       const before = await lookupSnapshot(dbPath);
-      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
 
       const result = runCurate(['--database', dbPath, '--curation', docPath, '--dry-run']);
       expect(result.status).toEqual(0);
@@ -406,7 +416,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     try {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
-      const docPath = writeDoc(dir, 'tc.json', baseDoc());
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
 
       const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
       expect(result.status).toEqual(0);
@@ -427,7 +437,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       doc.entries[0].probes = [
         { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Big City', note: 'deliberately wrong' }
       ];
-      const docPath = writeDoc(dir, 'tc.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
       expect(result.status).toEqual(1);
@@ -466,7 +476,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
         expect: 'Big City',
         note: 'cannot pass until the absorbed place owns cells'
       });
-      const docPath = writeDoc(dir, 'tc.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const deferred = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
       expect(deferred.status).toEqual(0);
@@ -495,7 +505,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       absorbForeign.entries[0].absorb = [EAST, HOMONYM];
       const absorbResult = runCurate([
         '--database', dbPath,
-        '--curation', writeDoc(dir, 'absorb-foreign.json', absorbForeign)
+        '--curation', writeDoc(dir, 'us.json', absorbForeign)
       ]);
       expect(absorbResult.status).toEqual(1);
       expect(absorbResult.stderr).toContain('belongs to country CA');
@@ -504,7 +514,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       intoForeign.entries[0].into = HOMONYM;
       const intoResult = runCurate([
         '--database', dbPath,
-        '--curation', writeDoc(dir, 'into-foreign.json', intoForeign)
+        '--curation', writeDoc(dir, 'us.json', intoForeign)
       ]);
       expect(intoResult.status).toEqual(1);
       expect(intoResult.stderr).toContain('belongs to country CA');
@@ -532,7 +542,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
         { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive probe passes' },
         { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'West County', note: 'guard fails independently of the missing source' }
       ];
-      const docPath = writeDoc(dir, 'tc.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
       expect(result.status).toEqual(1);
@@ -571,7 +581,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
           }
         ]
       };
-      const docPath = writeDoc(dir, 'tc.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
       expect(result.status).toEqual(1);
@@ -607,7 +617,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
           }
         ]
       };
-      const docPath = writeDoc(dir, 'tc.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const deferred = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
       expect(deferred.status).toEqual(0);
@@ -675,7 +685,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
           }
         ]
       };
-      const docPath = writeDoc(dir, 'fine.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
       expect(result.status).toEqual(0);
@@ -696,7 +706,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
         country: 'US',
         entries: [conflictEntry(CITY, [EAST]), conflictEntry(BYSTANDER, [EAST])]
       };
-      const docPath = writeDoc(dir, 'conflict.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(1);
@@ -718,7 +728,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
         country: 'US',
         entries: [conflictEntry(CITY, [EAST]), conflictEntry(EAST, [WEST])]
       };
-      const docPath = writeDoc(dir, 'chain.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const result = runCurate(['--database', dbPath, '--curation', docPath]);
       expect(result.status).toEqual(1);
@@ -729,17 +739,20 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
-  it('rejects duplicate absorption of the same place across files', async () => {
+  it('rejects duplicate absorption of the same place across entries', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
     try {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
       const before = await lookupSnapshot(dbPath);
 
+      // Loaded via a directory to also cover directory traversal.
       const curationDir = path.join(dir, 'curation');
       fs.mkdirSync(curationDir);
-      writeDoc(curationDir, 'aa.json', { country: 'US', entries: [conflictEntry(CITY, [EAST])] });
-      writeDoc(curationDir, 'bb.json', { country: 'US', entries: [conflictEntry(CITY, [EAST, WEST])] });
+      writeDoc(curationDir, 'us.json', {
+        country: 'US',
+        entries: [conflictEntry(CITY, [EAST]), conflictEntry(CITY, [EAST, WEST])]
+      });
 
       const result = runCurate(['--database', dbPath, '--curation', curationDir]);
       expect(result.status).toEqual(1);
@@ -768,7 +781,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
         expect: 'Ghost Town',
         note: 'expected place owns no cells yet'
       });
-      const docPath = writeDoc(dir, 'tc.json', doc);
+      const docPath = writeDoc(dir, 'us.json', doc);
 
       const skipped = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
       expect(skipped.status).toEqual(0);
@@ -778,6 +791,102 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       const strict = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
       expect(strict.status).toEqual(1);
       expect(strict.stderr).toContain('--skip-unresolvable');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stays strict on re-verification once a source was previously absorbed', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
+
+      // First apply drains the sources' fine cells into the target.
+      const first = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(first.status).toEqual(0);
+
+      // Simulate a later regression: someone hands an absorbed cell to a
+      // third place. On re-run the sources own no relabelable cells — but
+      // that is because the overlay already consumed them, not because the
+      // build lacks them, so verification must stay strict and catch this.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `UPDATE compact_geohash_lookup SET place_id = ${BYSTANDER} WHERE geohash = '${cells.eastFine}'`);
+      } finally {
+        await close(db);
+      }
+
+      const second = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(second.status).toEqual(1);
+      expect(second.stderr).toContain('expected "Big City", got "Bystander County"');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('normalizes country id case when checking expected-place ownership', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      // The boundary builder preserves the source country string, so a
+      // generated database can store lowercase country ids. A resolvable
+      // mismatch must still fail: case differences must not turn it into a
+      // deferrable "owns no cells" probe.
+      const dbPath = path.join(dir, 'compact.sqlite');
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `
+          CREATE TABLE compact_places(
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            country_id TEXT NOT NULL,
+            admin1_id INTEGER,
+            placetype_code INTEGER NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL
+          );
+
+          CREATE TABLE compact_geohash_lookup(
+            geohash TEXT PRIMARY KEY,
+            place_id INTEGER NOT NULL,
+            FOREIGN KEY (place_id) REFERENCES compact_places(id)
+          );
+
+          INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude) VALUES
+            (${CITY}, 'Big City', 'us', 5, 0, ${points.city.lat}, ${points.city.lon}),
+            (${BYSTANDER}, 'Bystander County', 'us', 5, 3, ${points.bystander.lat}, ${points.bystander.lon});
+
+          INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES
+            ('${cells.cityCoarse}', ${CITY}),
+            ('${cells.bystanderCoarse}', ${BYSTANDER}),
+            ('${cells.bystanderFine}', ${BYSTANDER});
+        `);
+      } finally {
+        await close(db);
+      }
+
+      const doc = {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [BYSTANDER],
+            minPrecision: 5,
+            rationale: 'Synthetic: database stores lowercase country ids.',
+            probes: [
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Big City', note: 'absorbed cell resolves to the target' },
+              { lat: points.city.lat, lon: points.city.lon, expect: 'Bystander County', note: 'deliberate mismatch: Bystander County still owns its coarse cell' }
+            ]
+          }
+        ]
+      };
+      const docPath = writeDoc(dir, 'us.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('expected "Bystander County", got "Big City"');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

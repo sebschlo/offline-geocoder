@@ -249,7 +249,20 @@ function loadCurationEntries(files) {
       throw new Error('Failed to parse curation file ' + filePath + ': ' + err.message)
     }
 
-    entries = entries.concat(validateCurationDocument(doc, filePath))
+    var fileEntries = validateCurationDocument(doc, filePath)
+
+    // One country per file is a safety boundary: an operator applying
+    // gt.json expects only Guatemala to change, so the filename must match
+    // the declared country.
+    var baseName = path.basename(filePath)
+    var stem = baseName.replace(/\.[^.]*$/, '')
+    if (stem.toLowerCase() !== doc.country.toLowerCase()) {
+      throw new Error('Curation file ' + filePath + ' declares country "' + doc.country +
+        '" but is named "' + baseName + '"; one country per file, so it must be named ' +
+        doc.country.toLowerCase() + '.json')
+    }
+
+    entries = entries.concat(fileEntries)
   }
 
   return entries
@@ -425,16 +438,36 @@ async function countAffectedRows(db, entry) {
   return rows.length ? rows[0].count : 0
 }
 
+// One UPDATE per source (sources are disjoint after conflict validation, so
+// this is equivalent to a single IN-list update) so the per-source relabel
+// count can be journaled: verification uses that record to distinguish a
+// source the build never had from one a previous apply already drained.
 async function applyEntry(db, entry) {
-  var placeholders = entry.absorb.map(function() { return '?' }).join(', ')
-  var result = await dbRun(db, `
-    UPDATE compact_geohash_lookup
-    SET place_id = ?
-    WHERE place_id IN (${placeholders})
-      AND LENGTH(geohash) >= ?
-  `, [entry.into].concat(entry.absorb).concat([entry.minPrecision]))
+  var total = 0
 
-  return result.changes || 0
+  for (var i = 0; i < entry.absorb.length; i++) {
+    var sourceId = entry.absorb[i]
+    var result = await dbRun(db, `
+      UPDATE compact_geohash_lookup
+      SET place_id = ?
+      WHERE place_id = ?
+        AND LENGTH(geohash) >= ?
+    `, [entry.into, sourceId, entry.minPrecision])
+
+    var changes = result.changes || 0
+    total += changes
+
+    await dbRun(db, `
+      INSERT INTO curation_journal(into_id, absorbed_id, min_precision, cells_relabeled, applied_at)
+      VALUES (?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(into_id, absorbed_id) DO UPDATE SET
+        cells_relabeled = cells_relabeled + excluded.cells_relabeled,
+        min_precision = excluded.min_precision,
+        applied_at = excluded.applied_at
+    `, [entry.into, sourceId, entry.minPrecision, changes])
+  }
+
+  return total
 }
 
 function entryLabel(entry, intoName) {
@@ -443,15 +476,17 @@ function entryLabel(entry, intoName) {
 }
 
 // Scoped to the entry's country so that a homonymous place elsewhere in the
-// world cannot make an expected name look resolvable.
+// world cannot make an expected name look resolvable. Country ids are
+// case-normalized on both sides, consistently with assertPlaceIdsExist,
+// because generated databases preserve the source country string's case.
 async function expectedPlaceOwnsCells(db, name, countryId) {
   var rows = await dbAll(db, `
     SELECT COUNT(*) AS count
     FROM compact_geohash_lookup l
     JOIN compact_places p ON p.id = l.place_id
     WHERE p.name = ?
-      AND p.country_id = ?
-  `, [name, countryId])
+      AND UPPER(p.country_id) = ?
+  `, [name, String(countryId).toUpperCase()])
 
   return Boolean(rows.length && rows[0].count > 0)
 }
@@ -488,22 +523,74 @@ async function deriveBoundaryPrecision(db) {
   return { basePrecision: min, maxPrecision: max }
 }
 
+// The apply records which sources it drained in a small bookkeeping table
+// inside the curated database. A source owning no relabelable cells is
+// ambiguous on its own: either the data build never had them (defer probes),
+// or a previous apply already moved them to the target (stay strict). The
+// journal disambiguates the two so re-verification of an already-curated
+// database cannot become vacuous.
+async function hasCurationJournal(db) {
+  var rows = await dbAll(db, `
+    SELECT name
+    FROM sqlite_master
+    WHERE type='table'
+      AND name='curation_journal'
+  `)
+  return rows.length > 0
+}
+
+async function ensureCurationJournal(db) {
+  await dbExec(db, `
+    CREATE TABLE IF NOT EXISTS curation_journal(
+      into_id INTEGER NOT NULL,
+      absorbed_id INTEGER NOT NULL,
+      min_precision INTEGER NOT NULL,
+      cells_relabeled INTEGER NOT NULL,
+      applied_at TEXT NOT NULL,
+      PRIMARY KEY (into_id, absorbed_id)
+    )
+  `)
+}
+
+async function sourcePreviouslyDrained(db, journalPresent, intoId, sourceId) {
+  if (!journalPresent) {
+    return false
+  }
+
+  var rows = await dbAll(db, `
+    SELECT cells_relabeled
+    FROM curation_journal
+    WHERE into_id = ?
+      AND absorbed_id = ?
+  `, [intoId, sourceId])
+
+  return Boolean(rows.length && rows[0].cells_relabeled > 0)
+}
+
 // Snapshot, before anything is written, which absorbed places own no cells
 // the entry could relabel (at or above its minPrecision) — the apply itself
-// drains sources, so this must be measured pre-apply. Verification uses it to
-// tell a genuine mismatch from a curation file that shipped ahead of the data
-// build that makes it effective.
+// drains sources, so this must be measured pre-apply. A source with journal
+// evidence of a previous drain is never treated as missing: its cells are
+// gone because the overlay consumed them, not because the build lacks them.
+// Verification uses this to tell a genuine mismatch from a curation file that
+// shipped ahead of the data build that makes it effective.
 async function computeResolvability(db, entries) {
   var missingSourcesByEntry = Object.create(null)
+  var journalPresent = await hasCurationJournal(db)
 
   for (var i = 0; i < entries.length; i++) {
     var entry = entries[i]
     var missing = []
 
     for (var j = 0; j < entry.absorb.length; j++) {
-      if (!(await placeOwnsRelabelableCells(db, entry.absorb[j], entry.minPrecision))) {
-        missing.push(entry.absorb[j])
+      var sourceId = entry.absorb[j]
+      if (await placeOwnsRelabelableCells(db, sourceId, entry.minPrecision)) {
+        continue
       }
+      if (await sourcePreviouslyDrained(db, journalPresent, entry.into, sourceId)) {
+        continue
+      }
+      missing.push(sourceId)
     }
     missingSourcesByEntry[entry.source + '#' + entry.index] = missing
   }
@@ -641,6 +728,8 @@ async function main() {
 
       await dbExec(db, 'BEGIN')
       try {
+        await ensureCurationJournal(db)
+
         for (var j = 0; j < entries.length; j++) {
           var applied = entries[j]
           var appliedIntoName = await describePlace(db, applied.into)

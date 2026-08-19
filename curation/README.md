@@ -37,7 +37,9 @@ request, with the rationale in the entry itself and, ideally, the output of a
 ## File format
 
 One JSON file per country, named by lowercase ISO 3166-1 alpha-2 code
-(`gt.json`, `fr.json`, ...).
+(`gt.json`, `fr.json`, ...). The filename must match the declared `country`
+(validation enforces it), so applying a file by name can only ever change the
+country it is named for.
 
 ```json
 {
@@ -100,6 +102,11 @@ WHERE place_id IN (<absorb...>) AND LENGTH(geohash) >= <minPrecision>
   sorted path order and entries in file order, and cross-entry conflict
   validation (see the conflict policy below) guarantees that every lookup row
   is touched by at most one entry, so the final state never depends on order.
+- The apply **journals what it drained** in a small `curation_journal`
+  bookkeeping table it creates inside the curated database (per target and
+  absorbed place, cumulative relabeled-cell counts). Verification uses it to
+  distinguish a source the data build never had (probes may be deferred) from
+  a source a previous apply already consumed (probes stay strict).
 
 ## Applying
 
@@ -149,7 +156,10 @@ database visibly cannot express that probe's intended result yet:
   incomplete `absorb` set and still fails; or
 - the probe expects the merge target's name and one of the entry's absorbed
   places owns no cells the entry could actually relabel (at or above its
-  `minPrecision`).
+  `minPrecision`) **and has never been drained by a previous apply of this
+  entry**. The apply journals what it drained (see below), so a source whose
+  cells are gone because the overlay already consumed them excuses nothing:
+  re-verification of an already-curated database stays strict.
 
 Guard probes expecting any other name never inherit deferral from missing
 merge sources: a failing guard rolls the transaction back even with the flag.
@@ -195,13 +205,14 @@ changing them are strict by design:
     (duplicate absorption). This is mechanically harmless but is rejected as
     an error anyway: duplicated judgment drifts when someone later edits one
     copy and not the other. Keep one entry per absorbed place.
-- **Curation never touches the schema.** Schema-level backwards compatibility
-  is governed by the repository's compatibility contract, `COMPATIBILITY.md`
-  (introduced by [#4](https://github.com/sebschlo/offline-geocoder/pull/4));
-  curation only relabels `compact_geohash_lookup` rows within whatever schema
-  the database already has. Absorbed places intentionally remain in
-  `compact_places`, so place ids stored by old readers and forward lookups
-  keep resolving.
+- **Curation never alters the library's tables.** Schema-level backwards
+  compatibility is governed by the repository's compatibility contract,
+  `COMPATIBILITY.md` (introduced by
+  [#4](https://github.com/sebschlo/offline-geocoder/pull/4)); curation only
+  relabels `compact_geohash_lookup` rows within whatever schema the database
+  already has, plus its own `curation_journal` bookkeeping table, which no
+  reader queries. Absorbed places intentionally remain in `compact_places`,
+  so place ids stored by old readers and forward lookups keep resolving.
 - **The maintainer arbitrates judgment disputes.** When two contributors
   disagree about what a place should be called, probes and rationales are the
   evidence, and the maintainer makes the call.
