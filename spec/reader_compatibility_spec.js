@@ -23,15 +23,94 @@
 // - Lookup test points are cross-mapped: the geohash cell maps to one
 //   place while another place's centroid is nearer, so a broken geohash
 //   lookup cannot sneak through via the nearest-centroid fallback.
-// - Geohash keys are computed with the library's own encoder, exactly as
-//   the database builder computes them.
+// - Stored geohash keys are frozen literals, never computed here. See
+//   FROZEN_GEOHASH below.
+// - Each generation pins its exact column set, and generated databases
+//   are checked to remain supersets of it. See FROZEN_COLUMNS below.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const sqlite3 = require('sqlite3');
 const createGeocoder = require('../src/index.js');
 const geohash = require('../src/geohash');
+
+// Frozen precision-5 geohash lookup keys, stored as literals.
+//
+// These must NOT be computed with src/geohash: the reader queries with
+// that same encoder, so computing both sides would make the fixtures
+// self-referential — an incompatible encoder change would regenerate the
+// stored keys and the query keys together, leaving every spec green while
+// real databases persisted by older builders became unreadable.
+//
+// The encoder conformance block below pins these literals (alongside
+// published reference vectors from the geohash specification), so an
+// encoder change fails immediately and names the drifted coordinate
+// instead of surfacing as a mysterious lookup miss.
+const FROZEN_GEOHASH = {
+  '40.5,10.95': 'sppy3',
+  '40.5,11.85': 'sr0qm',
+  '-20.65,130.65': 'qukft',
+  '-20.3,130.3': 'qukst',
+  '47.6,-3.2': 'gbmwz',
+  '47.3,-3.7': 'gbmm5'
+};
+
+// Frozen column sets, in declaration order, for every generation.
+//
+// Two jobs: each fixture asserts its own tables match EXACTLY (so a
+// fixture cannot be quietly widened to make a new reader pass), and the
+// builder block at the bottom asserts freshly generated databases are a
+// SUPERSET of the shipped sets (so a builder that drops or renames a
+// shipped column fails here, even while the current reader still happens
+// to support both layouts).
+const FROZEN_COLUMNS = {
+  centroid: {
+    coordinates: ['feature_id', 'latitude', 'longitude'],
+    features: ['id', 'name', 'country_id', 'admin1_id'],
+    admin1: ['country_id', 'id', 'name'],
+    countries: ['id', 'name']
+  },
+  full: {
+    countries: ['id', 'name'],
+    admin1: ['country_id', 'id', 'name'],
+    places: [
+      'id', 'name', 'country_id', 'admin1_id', 'placetype',
+      'centroid_lat', 'centroid_lon',
+      'bbox_min_lat', 'bbox_min_lon', 'bbox_max_lat', 'bbox_max_lon',
+      'priority_rank', 'area', 'country_name', 'admin1_name'
+    ],
+    place_geohash_cover: ['geohash', 'precision', 'place_id', 'coverage_type'],
+    place_geometry: ['place_id', 'encoding', 'geometry'],
+    place_geohash_lookup: ['geohash', 'place_id']
+  },
+  compactLegacy: {
+    countries: ['id', 'name'],
+    admin1: ['country_id', 'id', 'name'],
+    places: [
+      'id', 'name', 'country_id', 'admin1_id', 'placetype',
+      'centroid_lat', 'centroid_lon',
+      'bbox_min_lat', 'bbox_min_lon', 'bbox_max_lat', 'bbox_max_lon',
+      'priority_rank', 'area', 'country_name', 'admin1_name'
+    ],
+    place_geohash_lookup: ['geohash', 'place_id']
+  },
+  compactV2: {
+    compact_places: [
+      'id', 'name', 'country_id', 'admin1_id', 'placetype_code',
+      'latitude', 'longitude'
+    ],
+    compact_geohash_lookup: ['geohash', 'place_id']
+  },
+  compactV2Population: {
+    compact_places: [
+      'id', 'name', 'country_id', 'admin1_id', 'placetype_code',
+      'latitude', 'longitude', 'population', 'area'
+    ],
+    compact_geohash_lookup: ['geohash', 'place_id']
+  }
+};
 
 function exec(db, sql) {
   return new Promise((resolve, reject) => {
@@ -45,9 +124,38 @@ function run(db, sql, params) {
   });
 }
 
+function all(db, sql) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, [], (err, rows) => (err ? reject(err) : resolve(rows || [])));
+  });
+}
+
 function close(db) {
   return new Promise((resolve, reject) => {
     db.close((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+// Reads column names in declaration order via PRAGMA table_info.
+async function readColumns(databasePath, table) {
+  const db = new sqlite3.Database(databasePath);
+  try {
+    const rows = await all(db, `PRAGMA table_info(${table})`);
+    return rows.map((row) => row.name);
+  } finally {
+    await close(db);
+  }
+}
+
+// Registers the exact-column-set assertion for one generation's fixture.
+function expectFrozenColumns(getDatabasePath, frozen) {
+  it('preserves the exact frozen column set of this generation', async () => {
+    for (const table of Object.keys(frozen)) {
+      const actual = await readColumns(getDatabasePath(), table);
+      // Compared as strings so a failure names the table and both lists.
+      expect(`${table}: ${actual.join(', ')}`)
+        .toEqual(`${table}: ${frozen[table].join(', ')}`);
+    }
   });
 }
 
@@ -71,6 +179,27 @@ function boundaryGeocoder(databasePath) {
     }
   });
 }
+
+// The encoder is the one piece of reader logic that must agree with bytes
+// written by builders that ran months or years ago. Pin it against
+// published geohash reference vectors and against every literal key the
+// fixtures below store.
+describe('reader compatibility: geohash encoder conformance', () => {
+  it('matches published geohash reference vectors', () => {
+    expect(geohash.encode(42.6, -5.6, 5)).toEqual('ezs42');
+    expect(geohash.encode(57.64911, 10.40744, 11)).toEqual('u4pruydqqvj');
+    expect(geohash.encode(0, 0, 5)).toEqual('s0000');
+  });
+
+  it('still produces the frozen lookup keys stored in shipped databases', () => {
+    for (const coordinate of Object.keys(FROZEN_GEOHASH)) {
+      const parts = coordinate.split(',');
+      const encoded = geohash.encode(Number(parts[0]), Number(parts[1]), 5);
+      expect(`${coordinate} -> ${encoded}`)
+        .toEqual(`${coordinate} -> ${FROZEN_GEOHASH[coordinate]}`);
+    }
+  });
+});
 
 // Generation 0: GeoNames centroid-only schema, as generated by the
 // released v1.0.0 code (scripts/generate_geonames.sh at tag time).
@@ -182,6 +311,8 @@ describe('reader compatibility: centroid-only schema generation (v1.0.0)', () =>
     const result = await centroidGeocoder.forward('Oldbridge');
     expect(result).toBeUndefined();
   });
+
+  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.centroid);
 });
 
 // Generation 1: full boundary schema.
@@ -276,14 +407,14 @@ describe('reader compatibility: full boundary schema generation', () => {
         polygon: { type: 'Polygon', coordinates: [[[10, 40], [11, 40], [11, 41], [10, 41], [10, 40]]] },
         bbox: { minLat: 40, minLon: 10, maxLat: 41, maxLon: 11 },
         priorityRank: 10, area: 1.0,
-        coverPoints: [{ lat: 40.5, lon: 10.95 }]
+        coverCells: [FROZEN_GEOHASH['40.5,10.95']]
       },
       {
         id: 502, name: 'Milltown', centroidLat: 40.5, centroidLon: 11.05,
         polygon: { type: 'Polygon', coordinates: [[[11, 40], [12, 40], [12, 41], [11, 41], [11, 40]]] },
         bbox: { minLat: 40, minLon: 11, maxLat: 41, maxLon: 12 },
         priorityRank: 20, area: 1.0,
-        coverPoints: [{ lat: 40.5, lon: 11.85 }]
+        coverCells: [FROZEN_GEOHASH['40.5,11.85']]
       },
       {
         id: 503, name: 'Notchford', centroidLat: 40.46, centroidLon: 10.95,
@@ -300,7 +431,7 @@ describe('reader compatibility: full boundary schema generation', () => {
         },
         bbox: { minLat: 40.45, minLon: 10.90, maxLat: 40.55, maxLon: 11.00 },
         priorityRank: 5, area: 0.01,
-        coverPoints: [{ lat: 40.5, lon: 10.95 }]
+        coverCells: [FROZEN_GEOHASH['40.5,10.95']]
       }
     ];
 
@@ -322,13 +453,13 @@ describe('reader compatibility: full boundary schema generation', () => {
         INSERT INTO place_geometry(place_id, encoding, geometry) VALUES (?, 'json', ?)
       `, [place.id, JSON.stringify(place.polygon)]);
 
-      // Cover cells at precision 5, exactly as the builder would emit for
-      // cells intersecting the polygon.
-      for (const point of place.coverPoints) {
+      // Cover cells at precision 5, as the builder of this generation
+      // persisted them (frozen literals, not recomputed here).
+      for (const cell of place.coverCells) {
         await run(db, `
           INSERT INTO place_geohash_cover(geohash, precision, place_id, coverage_type)
           VALUES (?, 5, ?, 'partial')
-        `, [geohash.encode(point.lat, point.lon, 5), place.id]);
+        `, [cell, place.id]);
       }
     }
 
@@ -355,6 +486,8 @@ describe('reader compatibility: full boundary schema generation', () => {
     expect(result.name).toEqual('Milltown');
     expect(result.formatted).toEqual('Milltown, Coral Province, Atlantis');
   });
+
+  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.full);
 });
 
 // Generation 2: compact legacy schema.
@@ -434,12 +567,12 @@ describe('reader compatibility: compact legacy schema generation', () => {
       ]);
     }
 
-    // Cross-mapped lookup cells: each test point's cell maps to the place
-    // whose centroid is FARTHER away.
+    // Cross-mapped lookup cells (frozen literals): each test point's cell
+    // maps to the place whose centroid is FARTHER away.
     await run(db, 'INSERT INTO place_geohash_lookup(geohash, place_id) VALUES (?, ?)',
-      [geohash.encode(-20.65, 130.65, 5), 611]);
+      [FROZEN_GEOHASH['-20.65,130.65'], 611]);
     await run(db, 'INSERT INTO place_geohash_lookup(geohash, place_id) VALUES (?, ?)',
-      [geohash.encode(-20.30, 130.30, 5), 612]);
+      [FROZEN_GEOHASH['-20.3,130.3'], 612]);
 
     await close(db);
     geocoder = boundaryGeocoder(fixture.databasePath);
@@ -464,6 +597,8 @@ describe('reader compatibility: compact legacy schema generation', () => {
     expect(result.name).toEqual('Westport');
     expect(result.formatted).toEqual('Westport, Northmark, Bordonia');
   });
+
+  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.compactLegacy);
 });
 
 // Shared seed data for the two compact v2 generations. Both blocks insert
@@ -475,12 +610,13 @@ const COMPACT_V2_ROWS = {
     { id: 81, name: 'Alphaville', countryId: 'XC', admin1Id: 71, placetypeCode: 0, lat: 47.25, lon: -3.75 },
     { id: 82, name: 'Betaton', countryId: 'XC', admin1Id: 71, placetypeCode: 0, lat: 47.70, lon: -3.10 }
   ],
-  // Cross-mapped lookup cells: each test point's cell maps to the place
-  // whose centroid is FARTHER away, so a broken lookup that degrades to the
-  // nearest-centroid fallback returns the wrong place and fails the spec.
+  // Cross-mapped lookup cells (frozen literals): each test point's cell
+  // maps to the place whose centroid is FARTHER away, so a broken lookup
+  // that degrades to the nearest-centroid fallback returns the wrong place
+  // and fails the spec.
   lookups: [
-    { point: { lat: 47.60, lon: -3.20 }, placeId: 81 },
-    { point: { lat: 47.30, lon: -3.70 }, placeId: 82 }
+    { geohash: FROZEN_GEOHASH['47.6,-3.2'], placeId: 81 },
+    { geohash: FROZEN_GEOHASH['47.3,-3.7'], placeId: 82 }
   ]
 };
 
@@ -547,7 +683,7 @@ describe('reader compatibility: compact v2 schema generation (shipped)', () => {
 
     for (const lookup of COMPACT_V2_ROWS.lookups) {
       await run(db, 'INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES (?, ?)',
-        [geohash.encode(lookup.point.lat, lookup.point.lon, 5), lookup.placeId]);
+        [lookup.geohash, lookup.placeId]);
     }
 
     await close(db);
@@ -559,6 +695,7 @@ describe('reader compatibility: compact v2 schema generation (shipped)', () => {
   });
 
   expectCompactV2Results(() => geocoder);
+  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.compactV2);
 });
 
 // Generation 4 (PENDING, gated on PR #3): compact v2 schema with nullable
@@ -625,7 +762,7 @@ describe('reader compatibility: compact v2 schema generation with population/are
 
     for (const lookup of COMPACT_V2_ROWS.lookups) {
       await run(db, 'INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES (?, ?)',
-        [geohash.encode(lookup.point.lat, lookup.point.lon, 5), lookup.placeId]);
+        [lookup.geohash, lookup.placeId]);
     }
 
     await close(db);
@@ -639,4 +776,99 @@ describe('reader compatibility: compact v2 schema generation with population/are
   // Identical expectations to the shipped compact v2 generation: the new
   // columns (valued or NULL) must not change any reader-visible result.
   expectCompactV2Results(() => geocoder);
+  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.compactV2Population);
+});
+
+// The opposite direction of the contract: an older reader opening a NEWLY
+// generated database. The fixtures above cannot see that regression —
+// they only run the current reader against hand-written historical
+// databases, so a builder that drops or renames a shipped column stays
+// green as long as the current reader still supports both layouts.
+//
+// Instead of vendoring copies of released readers (which would rot, and
+// whose git history is unavailable under CI's shallow checkout), assert
+// the structural property those readers depend on: every database the
+// builder produces today must remain a SUPERSET of the frozen column set
+// of every generation that mode has shipped. Additive columns pass;
+// removals and renames fail.
+describe('reader compatibility: generated databases stay supersets of shipped generations', () => {
+  const BUILDER = path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js');
+
+  // One locality is enough — this asserts schema, not place selection.
+  const INPUT = {
+    type: 'FeatureCollection',
+    features: [{
+      type: 'Feature',
+      id: 3001,
+      properties: {
+        name: 'Buildertown',
+        placetype: 'locality',
+        country_id: 'US',
+        admin1_id: 5,
+        is_current: 1
+      },
+      geometry: {
+        type: 'Polygon',
+        coordinates: [[[-5, -5], [5, -5], [5, 5], [-5, 5], [-5, -5]]]
+      }
+    }]
+  };
+
+  function build(indexMode) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `offline-geocoder-compat-build-${indexMode}-`));
+    const inputPath = path.join(dir, 'input.geojson');
+    const databasePath = path.join(dir, 'built.sqlite');
+
+    fs.writeFileSync(inputPath, JSON.stringify(INPUT));
+
+    const result = spawnSync('node', [
+      BUILDER,
+      '--database', databasePath,
+      '--input', inputPath,
+      '--base-precision', '4',
+      '--max-precision', '5',
+      '--index-mode', indexMode
+    ], { encoding: 'utf8' });
+
+    return {
+      status: result.status,
+      stderr: result.stderr,
+      databasePath: databasePath,
+      cleanup: () => fs.rmSync(dir, { recursive: true, force: true })
+    };
+  }
+
+  async function expectSuperset(databasePath, frozen) {
+    for (const table of Object.keys(frozen)) {
+      const actual = await readColumns(databasePath, table);
+      const missing = frozen[table].filter((column) => actual.indexOf(column) === -1);
+      // Compared as strings so a failure names the table and the columns.
+      expect(`${table} missing: ${missing.join(', ')}`).toEqual(`${table} missing: `);
+    }
+  }
+
+  it('keeps every shipped compact v2 column in --index-mode compact', async () => {
+    const built = build('compact');
+    try {
+      expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
+      // Generation 4's population/area columns are deliberately NOT
+      // required here: that generation is still pending on PR #3, so no
+      // released builder produces them yet. Add them to this assertion
+      // when it ships.
+      await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactV2);
+    } finally {
+      built.cleanup();
+    }
+  }, 30000);
+
+  it('keeps every shipped full and compact-legacy column in --index-mode full', async () => {
+    const built = build('full');
+    try {
+      expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
+      await expectSuperset(built.databasePath, FROZEN_COLUMNS.full);
+      await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactLegacy);
+    } finally {
+      built.cleanup();
+    }
+  }, 30000);
 });

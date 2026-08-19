@@ -62,6 +62,27 @@ move forward over time — and asserts the reader paths that generation
 supports (boundary and/or centroid reverse, id lookup, graceful forward
 degradation).
 
+A compatibility fixture is only useful if it can fail, so three things are
+frozen rather than recomputed:
+
+- **Geohash lookup keys are stored as literals.** Computing them with
+  `src/geohash` would make the fixtures self-referential: the reader
+  queries with that same encoder, so an incompatible encoder change would
+  regenerate the stored keys and the query keys together and stay green
+  while real databases became unreadable. A conformance spec pins the
+  encoder against published geohash reference vectors and against every
+  literal the fixtures store.
+- **Each generation's exact column set is asserted** (`PRAGMA
+  table_info`), so a fixture cannot be quietly widened to make a new
+  reader pass.
+- **Freshly generated databases are asserted to be supersets** of the
+  frozen column set of every generation their mode has shipped. The
+  builder is run for real (`--index-mode compact` and `--index-mode
+  full`) and its output inspected, which covers the contract's opposite
+  direction — a builder dropping or renaming a column that older readers
+  still need — even while the current reader happens to support both
+  layouts.
+
 Rules for contributors:
 
 - **Never modify the fixture of a shipped generation.** They pin history;
