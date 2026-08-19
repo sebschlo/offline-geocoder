@@ -103,6 +103,12 @@ WHERE place_id IN (<absorb...>) AND LENGTH(geohash) >= <minPrecision>
   relabeled.
 - The operation is **idempotent by construction**: relabeled cells leave the
   absorbed set, so a second apply changes nothing.
+- Applying **reconciles the database to the entry as written**: if a revision
+  raises `minPrecision`, cells drained by the earlier revision that the new
+  threshold defines as coarse are returned to their original owners (from the
+  per-cell journal) in the same apply, so the old, broader merge cannot
+  silently linger. Cells something else has since overwritten are left alone
+  and their journal records retired.
 - Application order is **deterministic and irrelevant**: files are applied in
   sorted path order and entries in file order, and cross-entry conflict
   validation (see the conflict policy below) guarantees that every lookup row
@@ -177,12 +183,17 @@ npm run curate -- --database data/geocoder.sqlite --curation curation/gt.json --
 
 `--verify` applies the entries and runs each probe through the library's
 boundary reverse lookup **inside the same transaction**, comparing
-`result.name` to `expect`. If any probe fails, the whole overlay is rolled
-back and the command exits nonzero with the database unchanged — a bad entry
-can never leave a half-curated database behind, and automation can rely on
-"nonzero exit means nothing was applied". The reverse lookup's precision range
-is derived from the geohash lengths actually present in the database, so
-verification works on databases built outside the library's default range.
+`result.name` to `expect`. Positive probes (those expecting the merge
+target's label) are held to a stricter standard: they must resolve to the
+target's **place id** (a same-named place does not count) **from a matching
+lookup cell** — a nearest-centroid fallback result never satisfies a positive
+probe, because the fallback can return the target for a coordinate the
+overlay never reached. If any probe fails, the whole overlay is rolled back
+and the command exits nonzero with the database unchanged — a bad entry can
+never leave a half-curated database behind, and automation can rely on
+"nonzero exit means nothing was applied". The reverse lookup's precision
+range is derived from the geohash lengths actually present in the database,
+so verification works on databases built outside the library's default range.
 
 `--skip-unresolvable` downgrades a failing probe to a warning only when the
 database visibly cannot express that probe's intended result yet:

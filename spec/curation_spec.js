@@ -1128,6 +1128,88 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
+  it('returns previously drained cells excluded by a raised minPrecision', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
+
+      const first = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(first.status).toEqual(0);
+      expect(ownerOf(await lookupSnapshot(dbPath), cells.eastFine)).toEqual(CITY);
+
+      // The revised entry raises minPrecision from 5 to 6: the precision-5
+      // cells it previously drained are now defined as coarse cells that must
+      // keep their original owner, so a re-apply must reconcile them back
+      // instead of silently leaving the old, broader merge in place.
+      writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST, WEST],
+            minPrecision: 6,
+            rationale: 'Synthetic: revised entry with a raised precision threshold.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive probe' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const second = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(second.status).toEqual(0);
+      expect(second.stdout).toContain('returned 2 coarse cell(s)');
+
+      const rows = await lookupSnapshot(dbPath);
+      expect(ownerOf(rows, cells.eastFine)).toEqual(EAST);
+      expect(ownerOf(rows, cells.westFine)).toEqual(WEST);
+      expect(ownerOf(rows, cells.eastCoarse)).toEqual(EAST);
+
+      // Reconciliation is idempotent: a third run has nothing to return.
+      const third = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(third.status).toEqual(0);
+      expect(third.stdout).toContain('relabeled 0 cell(s)');
+      expect(third.stdout).not.toContain('returned');
+      expect(await lookupSnapshot(dbPath)).toEqual(rows);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails a positive probe that resolves via centroid fallback instead of a lookup cell', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // A point covered by no lookup cell, whose nearest compact place by
+      // centroid is the merge target itself: the reverse fallback returns the
+      // right name AND id, so only the resolution path exposes that the
+      // overlay never relabeled a cell here.
+      const fallbackPoint = { lat: points.city.lat + 0.5, lon: points.city.lon + 0.5 };
+      expect(geohash.encode(fallbackPoint.lat, fallbackPoint.lon, 4)).not.toEqual(cells.cityCoarse);
+
+      const doc = baseDoc();
+      doc.entries[0].probes = [
+        { lat: fallbackPoint.lat, lon: fallbackPoint.lon, expect: 'Big City', note: 'nearest centroid is the target, but no cell matches' },
+        { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+      ];
+      const docPath = writeDoc(dir, 'us.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('did not resolve from a lookup cell');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('ships a structurally valid Guatemala curation file', () => {
     const gtPath = path.join(__dirname, '..', 'curation', 'gt.json');
     const doc = JSON.parse(fs.readFileSync(gtPath, 'utf8'));

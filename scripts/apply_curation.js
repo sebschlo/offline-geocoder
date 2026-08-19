@@ -479,17 +479,80 @@ async function countAffectedRows(db, entry) {
   return rows.length ? rows[0].count : 0
 }
 
+// Journaled cells below the entry's current minPrecision that are still
+// owned by the merge target: an apply would return these to their original
+// owners (see the reconciliation note on applyEntry).
+async function countReturnableCells(db, entry, journalTrusted) {
+  if (!journalTrusted) {
+    return 0
+  }
+
+  var placeholders = entry.absorb.map(function() { return '?' }).join(', ')
+  var rows = await dbAll(db, `
+    SELECT COUNT(*) AS count
+    FROM curation_journal_cells c
+    JOIN compact_geohash_lookup l ON l.geohash = c.geohash AND l.place_id = c.into_id
+    WHERE c.into_id = ?
+      AND c.absorbed_id IN (${placeholders})
+      AND LENGTH(c.geohash) < ?
+  `, [entry.into].concat(entry.absorb).concat([entry.minPrecision]))
+
+  return rows.length ? rows[0].count : 0
+}
+
 // One UPDATE per source (sources are disjoint after conflict validation, so
 // this is equivalent to a single IN-list update) so each drained cell can be
 // journaled with its original owner. Verification uses the per-cell records
 // to distinguish a source the build never had from one a previous apply
 // already drained — at the precision that actually matters — and --revert
 // uses them to restore original ownership before an append-mode refresh.
+//
+// Applying is a RECONCILIATION to the entry as currently written: cells a
+// previous revision drained that the current minPrecision now defines as
+// coarse (journaled cells below the threshold) are returned to their
+// original owners first, so raising minPrecision does not silently leave the
+// old, broader merge in place. Cells something else has since overwritten
+// are left alone; their journal records are retired either way.
 async function applyEntry(db, entry) {
-  var total = 0
+  var relabeled = 0
+  var returned = 0
 
   for (var i = 0; i < entry.absorb.length; i++) {
     var sourceId = entry.absorb[i]
+
+    var staleCells = await dbAll(db, `
+      SELECT geohash
+      FROM curation_journal_cells
+      WHERE into_id = ?
+        AND absorbed_id = ?
+        AND LENGTH(geohash) < ?
+    `, [entry.into, sourceId, entry.minPrecision])
+
+    var returnedForSource = 0
+    for (var s = 0; s < staleCells.length; s++) {
+      var restore = await dbRun(db, `
+        UPDATE compact_geohash_lookup
+        SET place_id = ?
+        WHERE geohash = ?
+          AND place_id = ?
+      `, [sourceId, staleCells[s].geohash, entry.into])
+
+      if (restore.changes) {
+        returnedForSource += 1
+      }
+
+      await dbRun(db, 'DELETE FROM curation_journal_cells WHERE geohash = ?', [staleCells[s].geohash])
+    }
+
+    if (returnedForSource) {
+      returned += returnedForSource
+      await dbRun(db, `
+        UPDATE curation_journal
+        SET cells_relabeled = MAX(0, cells_relabeled - ?)
+        WHERE into_id = ?
+          AND absorbed_id = ?
+      `, [returnedForSource, entry.into, sourceId])
+    }
 
     var cellRows = await dbAll(db, `
       SELECT geohash
@@ -513,7 +576,7 @@ async function applyEntry(db, entry) {
     `, [entry.into, sourceId, entry.minPrecision])
 
     var changes = result.changes || 0
-    total += changes
+    relabeled += changes
 
     await dbRun(db, `
       INSERT INTO curation_journal(into_id, absorbed_id, min_precision, cells_relabeled, applied_at)
@@ -525,7 +588,7 @@ async function applyEntry(db, entry) {
     `, [entry.into, sourceId, entry.minPrecision, changes])
   }
 
-  return total
+  return { relabeled: relabeled, returned: returned }
 }
 
 function entryLabel(entry, intoName) {
@@ -728,6 +791,7 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
   var geocoder = createGeocoder({
     db: db,
     reverseMode: 'boundary',
+    reverseDebug: true,
     boundary: boundary
   })
 
@@ -749,14 +813,20 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
 
       var result = await geocoder.reverse(probe.lat, probe.lon)
       var actual = result && result.name
+      var resolvedVia = result && result._debug && result._debug.reason
 
       // Positive probes (those expecting the merge target) must resolve to
       // the target's actual place id, not merely a same-named place: with
       // two homonymous places in one country, a name-only comparison would
       // let a probe outside the relabeled cells mask an incomplete merge.
-      var idMatches = probe.expect !== intoName || Boolean(result && Number(result.id) === entry.into)
+      // They must also resolve FROM A LOOKUP CELL: the nearest-centroid
+      // fallback can return the target itself for a coordinate no cell
+      // covers, which would pass without exercising any relabeled cell.
+      var isPositive = probe.expect === intoName
+      var idMatches = !isPositive || Boolean(result && Number(result.id) === entry.into)
+      var pathMatches = !isPositive || resolvedVia === 'geohash_lookup'
 
-      if (actual === probe.expect && idMatches) {
+      if (actual === probe.expect && idMatches && pathMatches) {
         console.log('PASS ' + context + ' -> "' + actual + '"')
         passed += 1
         continue
@@ -784,9 +854,13 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       var hint = reasons.length
         ? ' (' + reasons.join('; ') + '; rerun with --skip-unresolvable to defer this probe)'
         : ''
-      var got = actual === probe.expect
-        ? '"' + actual + '" (same-named place ' + (result && result.id) + ', not the merge target ' + entry.into + ')'
-        : '"' + (actual || '<nothing>') + '"'
+      var got = '"' + (actual || '<nothing>') + '"'
+      if (actual === probe.expect && !idMatches) {
+        got = '"' + actual + '" (same-named place ' + (result && result.id) + ', not the merge target ' + entry.into + ')'
+      } else if (actual === probe.expect && !pathMatches) {
+        got = '"' + actual + '" via ' + (resolvedVia || 'an unknown path') +
+          ' (did not resolve from a lookup cell; the overlay does not cover this coordinate)'
+      }
       failures.push('FAIL ' + context + ': expected "' + probe.expect + '", got ' + got + hint)
     }
   }
@@ -911,12 +985,15 @@ async function main() {
     await assertGuardProbes(db, entries)
 
     if (options.dryRun) {
+      var dryRunJournal = await journalState(db)
       for (var i = 0; i < entries.length; i++) {
         var entry = entries[i]
         var intoName = await describePlace(db, entry.into)
         var count = await countAffectedRows(db, entry)
+        var returnable = await countReturnableCells(db, entry, dryRunJournal.trusted)
         totalRelabeled += count
-        console.log('[dry-run] ' + entryLabel(entry, intoName) + ': would relabel ' + count + ' cell(s)')
+        console.log('[dry-run] ' + entryLabel(entry, intoName) + ': would relabel ' + count + ' cell(s)' +
+          (returnable ? ' and return ' + returnable + ' coarse cell(s) to their original owners' : ''))
       }
     } else {
       var journal = await journalState(db)
@@ -935,8 +1012,9 @@ async function main() {
           var applied = entries[j]
           var appliedIntoName = await describePlace(db, applied.into)
           var changes = await applyEntry(db, applied)
-          totalRelabeled += changes
-          console.log(entryLabel(applied, appliedIntoName) + ': relabeled ' + changes + ' cell(s)')
+          totalRelabeled += changes.relabeled
+          console.log(entryLabel(applied, appliedIntoName) + ': relabeled ' + changes.relabeled + ' cell(s)' +
+            (changes.returned ? ', returned ' + changes.returned + ' coarse cell(s) to their original owners' : ''))
         }
 
         if (options.verify) {
