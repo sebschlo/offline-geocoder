@@ -1210,6 +1210,152 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
+  it('fails verification when no positive probe resolves from the cells the entry relabeled', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // The positive probe sits on a cell the target owned all along
+      // (cityCoarse), so it passes name, id, and lookup-path checks — yet the
+      // entry's own relabeling of East County is never exercised. An
+      // incorrect absorb list could commit unnoticed without this rule.
+      const doc = {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: positive probe only covers target-native territory.',
+            probes: [
+              { lat: points.city.lat, lon: points.city.lon, expect: 'Big City', note: 'target-native cell, not a relabeled one' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      };
+      const docPath = writeDoc(dir, 'us.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('no positive probe resolved from the cells this entry relabeled');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns cells of sources removed from a revised entry', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
+
+      const first = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(first.status).toEqual(0);
+      expect(ownerOf(await lookupSnapshot(dbPath), cells.westFine)).toEqual(CITY);
+
+      // The revision drops West County from absorb: its journaled cells must
+      // be returned, or re-applying would silently preserve the removed
+      // judgment.
+      writeDoc(dir, 'us.json', {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 5,
+            rationale: 'Synthetic: revised entry no longer absorbs West County.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive probe' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      });
+
+      const second = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(second.status).toEqual(0);
+      expect(second.stdout).toContain('no longer absorbed');
+
+      const rows = await lookupSnapshot(dbPath);
+      expect(ownerOf(rows, cells.westFine)).toEqual(WEST);
+      expect(ownerOf(rows, cells.eastFine)).toEqual(CITY);
+
+      const third = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(third.status).toEqual(0);
+      expect(third.stdout).not.toContain('no longer absorbed');
+      expect(await lookupSnapshot(dbPath)).toEqual(rows);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stays strict for failing positives on drained territory despite a missing source', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // Ghost Town owns no cells (missing source); East County drains fine.
+      const doc = baseDoc();
+      doc.entries[0].absorb = [EAST, WEST, GHOST];
+      doc.entries[0].probes = [
+        { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive on drained territory' },
+        { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+      ];
+      const docPath = writeDoc(dir, 'us.json', doc);
+
+      const first = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(first.status).toEqual(0);
+
+      // A later regression hands the drained cell to a third place. The
+      // missing source (Ghost Town) must not excuse this failure: the probe
+      // sits on territory this entry demonstrably drained.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `UPDATE compact_geohash_lookup SET place_id = ${BYSTANDER} WHERE geohash = '${cells.eastFine}'`);
+      } finally {
+        await close(db);
+      }
+
+      const second = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(second.status).toEqual(1);
+      expect(second.stderr).toContain('expected "Big City", got "Bystander County"');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a probe whose expected label names no place in the entry country', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // A typo'd guard ("East Countyy") satisfies the different-name guard
+      // rule and its mismatch would be deferrable as "owns no cells" — the
+      // overlay would commit without an effective guard. It must instead be
+      // a hard validation error.
+      const doc = baseDoc();
+      doc.entries[0].probes[1].expect = 'East Countyy';
+      const docPath = writeDoc(dir, 'us.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath]);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('does not name any place in country US');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('ships a structurally valid Guatemala curation file', () => {
     const gtPath = path.join(__dirname, '..', 'curation', 'gt.json');
     const doc = JSON.parse(fs.readFileSync(gtPath, 'utf8'));

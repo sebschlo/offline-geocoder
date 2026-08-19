@@ -4,6 +4,7 @@
 const fs = require('fs')
 const path = require('path')
 const sqlite3 = require('sqlite3')
+const geohash = require('../src/geohash')
 
 const SUPPORTED_OPS = ['merge']
 const MIN_PRECISION_FLOOR = 1
@@ -435,8 +436,14 @@ async function describePlace(db, placeId) {
 // id relabeling an unrelated municipality would sail through verification.
 // Probes that only guard other places never exercise the intended relabeling:
 // --verify could commit a merge that changed the wrong cells or none at all.
+//
+// Every expected label must also name a place that exists in the entry's
+// country: a place owning no cells is a deferrable data gap, but a label
+// naming NO place is a typo — deferring it would let the overlay commit
+// without an effective guard.
 async function assertGuardProbes(db, entries) {
   var problems = []
+  var nameExistsCache = Object.create(null)
 
   for (var i = 0; i < entries.length; i++) {
     var entry = entries[i]
@@ -445,10 +452,26 @@ async function assertGuardProbes(db, entries) {
     var hasPositive = false
 
     for (var j = 0; j < entry.probes.length; j++) {
-      if (entry.probes[j].expect === intoName) {
+      var probe = entry.probes[j]
+      if (probe.expect === intoName) {
         hasPositive = true
       } else {
         hasGuard = true
+      }
+
+      var nameKey = entry.country + '|' + probe.expect
+      if (nameExistsCache[nameKey] === undefined) {
+        var rows = await dbAll(db, `
+          SELECT COUNT(*) AS count
+          FROM compact_places
+          WHERE name = ?
+            AND UPPER(country_id) = ?
+        `, [probe.expect, entry.country])
+        nameExistsCache[nameKey] = Boolean(rows.length && rows[0].count > 0)
+      }
+      if (!nameExistsCache[nameKey]) {
+        problems.push(entry.source + ' entry ' + entry.index + ': probes[' + j + '] expects "' +
+          probe.expect + '", which does not name any place in country ' + entry.country)
       }
     }
 
@@ -589,6 +612,71 @@ async function applyEntry(db, entry) {
   }
 
   return { relabeled: relabeled, returned: returned }
+}
+
+// The other half of reconciliation: journaled cells whose SOURCE is no longer
+// absorbed by any current entry for that target are returned to their
+// original owners, so dropping a place from an entry's absorb list actually
+// undoes its absorption on the next apply. Grouped per target across all
+// loaded entries, because several entries may legitimately share one target.
+// (An entry removed entirely is invisible here — use --revert for that.)
+async function reconcileRemovedSources(db, entries) {
+  var absorbByInto = Object.create(null)
+  entries.forEach(function(entry) {
+    if (!absorbByInto[entry.into]) {
+      absorbByInto[entry.into] = []
+    }
+    entry.absorb.forEach(function(id) {
+      absorbByInto[entry.into].push(id)
+    })
+  })
+
+  var totalReturned = 0
+  var intoIds = Object.keys(absorbByInto)
+
+  for (var i = 0; i < intoIds.length; i++) {
+    var intoId = Number(intoIds[i])
+    var currentSources = absorbByInto[intoIds[i]]
+    var placeholders = currentSources.map(function() { return '?' }).join(', ')
+
+    var orphaned = await dbAll(db, `
+      SELECT geohash, absorbed_id
+      FROM curation_journal_cells
+      WHERE into_id = ?
+        AND absorbed_id NOT IN (${placeholders})
+    `, [intoId].concat(currentSources))
+
+    var returned = 0
+    for (var c = 0; c < orphaned.length; c++) {
+      var restore = await dbRun(db, `
+        UPDATE compact_geohash_lookup
+        SET place_id = ?
+        WHERE geohash = ?
+          AND place_id = ?
+      `, [orphaned[c].absorbed_id, orphaned[c].geohash, intoId])
+
+      if (restore.changes) {
+        returned += 1
+      }
+
+      await dbRun(db, 'DELETE FROM curation_journal_cells WHERE geohash = ?', [orphaned[c].geohash])
+    }
+
+    await dbRun(db, `
+      DELETE FROM curation_journal
+      WHERE into_id = ?
+        AND absorbed_id NOT IN (${placeholders})
+    `, [intoId].concat(currentSources))
+
+    if (orphaned.length) {
+      totalReturned += returned
+      var intoName = await describePlace(db, intoId)
+      console.log('reconciled target ' + intoId + ' (' + intoName + '): returned ' + returned +
+        ' cell(s) from source(s) no longer absorbed')
+    }
+  }
+
+  return totalReturned
 }
 
 function entryLabel(entry, intoName) {
@@ -774,6 +862,49 @@ async function computeResolvability(db, entries) {
   }
 }
 
+// Does one of the probe's enclosing geohashes (at the precisions this entry
+// relabels) appear among the entry's journaled drained cells? This defines
+// "the probe sits on territory this entry demonstrably absorbed", which is
+// the anchor for both strictness (failures there are never deferred) and
+// completeness (some passing positive probe must sit there).
+async function probeOnDrainedCells(db, entry, probe, maxPrecision) {
+  var hashes = []
+  for (var precision = entry.minPrecision; precision <= maxPrecision; precision++) {
+    hashes.push(geohash.encode(probe.lat, probe.lon, precision))
+  }
+
+  if (!hashes.length) {
+    return false
+  }
+
+  var hashPlaceholders = hashes.map(function() { return '?' }).join(', ')
+  var absorbPlaceholders = entry.absorb.map(function() { return '?' }).join(', ')
+  var rows = await dbAll(db, `
+    SELECT geohash
+    FROM curation_journal_cells
+    WHERE into_id = ?
+      AND absorbed_id IN (${absorbPlaceholders})
+      AND geohash IN (${hashPlaceholders})
+    LIMIT 1
+  `, [entry.into].concat(entry.absorb).concat(hashes))
+
+  return rows.length > 0
+}
+
+async function entryHasDrainedCells(db, entry) {
+  var placeholders = entry.absorb.map(function() { return '?' }).join(', ')
+  var rows = await dbAll(db, `
+    SELECT geohash
+    FROM curation_journal_cells
+    WHERE into_id = ?
+      AND absorbed_id IN (${placeholders})
+      AND LENGTH(geohash) >= ?
+    LIMIT 1
+  `, [entry.into].concat(entry.absorb).concat([entry.minPrecision]))
+
+  return rows.length > 0
+}
+
 // Runs probes on the shared connection so they see the uncommitted overlay;
 // the caller decides whether to commit or roll back based on the verdict.
 //
@@ -783,9 +914,14 @@ async function computeResolvability(db, entries) {
 //   a failing probe expecting the target exposes an incomplete absorb set and
 //   is a genuine failure, not an unresolvable probe.
 // - Missing merge sources (snapshotted PRE-apply, since the apply drains
-//   them) only defer probes that expect the merge target's name. Guard probes
-//   expecting any other name do not depend on the missing source and must
-//   keep blocking the transaction.
+//   them) only defer positive probes that sit OUTSIDE the entry's drained
+//   territory: a failure on a cell this entry demonstrably drained is a
+//   regression regardless of which other source is still unavailable, and
+//   guard probes never inherit deferral from missing sources at all.
+//
+// Completeness: an entry that relabeled cells must have at least one passing
+// positive probe resolving from those cells, or its own effect was never
+// tested (a positive probe can otherwise pass on target-native territory).
 async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvability) {
   var createGeocoder = require('../src/index.js')
   var geocoder = createGeocoder({
@@ -804,6 +940,7 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
     var entry = entries[i]
     var missingSources = resolvability.missingSourcesByEntry[entry.source + '#' + entry.index] || []
     var intoName = await describePlace(db, entry.into)
+    var entryExercised = false
 
     for (var j = 0; j < entry.probes.length; j++) {
       var probe = entry.probes[j]
@@ -825,10 +962,16 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       var isPositive = probe.expect === intoName
       var idMatches = !isPositive || Boolean(result && Number(result.id) === entry.into)
       var pathMatches = !isPositive || resolvedVia === 'geohash_lookup'
+      var onTerritory = isPositive
+        ? await probeOnDrainedCells(db, entry, probe, boundary.maxPrecision)
+        : false
 
       if (actual === probe.expect && idMatches && pathMatches) {
         console.log('PASS ' + context + ' -> "' + actual + '"')
         passed += 1
+        if (onTerritory) {
+          entryExercised = true
+        }
         continue
       }
 
@@ -841,7 +984,7 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       if (!expectOwnsCache[expectKey]) {
         reasons.push('expected place "' + probe.expect + '" (' + entry.country + ') owns no cells in this database yet')
       }
-      if (missingSources.length && probe.expect === intoName) {
+      if (missingSources.length && isPositive && !onTerritory) {
         reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells at precision >= ' + entry.minPrecision + ' in this database yet')
       }
 
@@ -862,6 +1005,11 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
           ' (did not resolve from a lookup cell; the overlay does not cover this coordinate)'
       }
       failures.push('FAIL ' + context + ': expected "' + probe.expect + '", got ' + got + hint)
+    }
+
+    if (!entryExercised && await entryHasDrainedCells(db, entry)) {
+      failures.push('FAIL ' + entry.source + ' entry ' + entry.index +
+        ': no positive probe resolved from the cells this entry relabeled; add a positive probe on the absorbed territory')
     }
   }
 
@@ -1016,6 +1164,8 @@ async function main() {
           console.log(entryLabel(applied, appliedIntoName) + ': relabeled ' + changes.relabeled + ' cell(s)' +
             (changes.returned ? ', returned ' + changes.returned + ' coarse cell(s) to their original owners' : ''))
         }
+
+        await reconcileRemovedSources(db, entries)
 
         if (options.verify) {
           var verdict = await verifyEntries(db, entries, options.skipUnresolvable, boundary, resolvability)

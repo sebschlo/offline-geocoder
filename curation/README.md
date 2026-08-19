@@ -76,7 +76,7 @@ country it is named for.
 | `entries[].rationale` | string | Required. The reviewable justification for the entry. |
 | `entries[].probes` | array | Required. Coordinates with expected reverse-lookup labels, checked by `--verify`. Must include at least one positive probe (`expect` equals the merge target's name, verified against the target's place id) and at least one guard probe (`expect` differs). |
 | `probes[].lat`, `probes[].lon` | number | Probe coordinate. |
-| `probes[].expect` | string | Expected `result.name` from a reverse lookup at that coordinate. |
+| `probes[].expect` | string | Expected `result.name` from a reverse lookup at that coordinate. Must name a place that exists in the entry's country (typo protection). |
 | `probes[].note` | string | Optional human context (what the coordinate is, or which guard it enforces). |
 
 Unknown fields are rejected so that typos (`"absorbs"`, `"minPrecison"`) fail
@@ -106,9 +106,12 @@ WHERE place_id IN (<absorb...>) AND LENGTH(geohash) >= <minPrecision>
 - Applying **reconciles the database to the entry as written**: if a revision
   raises `minPrecision`, cells drained by the earlier revision that the new
   threshold defines as coarse are returned to their original owners (from the
-  per-cell journal) in the same apply, so the old, broader merge cannot
-  silently linger. Cells something else has since overwritten are left alone
-  and their journal records retired.
+  per-cell journal) in the same apply — and if a revision removes a place
+  from `absorb`, that source's journaled cells are likewise returned — so an
+  old, broader merge cannot silently linger. Cells something else has since
+  overwritten are left alone and their journal records retired. The one
+  structural change apply cannot see is deleting an entire entry: for that,
+  run `--revert` and re-apply.
 - Application order is **deterministic and irrelevant**: files are applied in
   sorted path order and entries in file order, and cross-entry conflict
   validation (see the conflict policy below) guarantees that every lookup row
@@ -183,17 +186,23 @@ npm run curate -- --database data/geocoder.sqlite --curation curation/gt.json --
 
 `--verify` applies the entries and runs each probe through the library's
 boundary reverse lookup **inside the same transaction**, comparing
-`result.name` to `expect`. Positive probes (those expecting the merge
-target's label) are held to a stricter standard: they must resolve to the
-target's **place id** (a same-named place does not count) **from a matching
-lookup cell** — a nearest-centroid fallback result never satisfies a positive
-probe, because the fallback can return the target for a coordinate the
-overlay never reached. If any probe fails, the whole overlay is rolled back
-and the command exits nonzero with the database unchanged — a bad entry can
-never leave a half-curated database behind, and automation can rely on
-"nonzero exit means nothing was applied". The reverse lookup's precision
-range is derived from the geohash lengths actually present in the database,
-so verification works on databases built outside the library's default range.
+`result.name` to `expect`. Every `expect` must name a place that exists in
+the entry's country — a misspelled label is a validation error before
+anything runs, never a deferrable probe. Positive probes (those expecting the
+merge target's label) are held to a stricter standard: they must resolve to
+the target's **place id** (a same-named place does not count) **from a
+matching lookup cell** — a nearest-centroid fallback result never satisfies a
+positive probe, because the fallback can return the target for a coordinate
+the overlay never reached. In addition, when an entry relabeled any cells,
+**at least one passing positive probe must have resolved from those relabeled
+cells**: positive probes sitting only on cells the target owned all along
+prove nothing about the entry's own effect. If any probe fails, the whole
+overlay is rolled back and the command exits nonzero with the database
+unchanged — a bad entry can never leave a half-curated database behind, and
+automation can rely on "nonzero exit means nothing was applied". The reverse
+lookup's precision range is derived from the geohash lengths actually present
+in the database, so verification works on databases built outside the
+library's default range.
 
 `--skip-unresolvable` downgrades a failing probe to a warning only when the
 database visibly cannot express that probe's intended result yet:
@@ -202,14 +211,16 @@ database visibly cannot express that probe's intended result yet:
   lookup cells **with the overlay applied** — if the pending merge itself
   grants the target cells, a failing probe expecting the target exposes an
   incomplete `absorb` set and still fails; or
-- the probe expects the merge target's name and one of the entry's absorbed
-  places owns no cells the entry could actually relabel (at or above its
-  `minPrecision`) **and has no journaled drained cells at or above that
-  precision**. The apply journals every cell it drains, so a source whose
-  cells are gone because the overlay already consumed them excuses nothing:
-  re-verification of an already-curated database stays strict, and evidence
-  from an earlier revision at a coarser precision does not vouch for a finer
-  one.
+- the probe expects the merge target's name, sits on **no cell this entry has
+  drained** (per the journal), and one of the entry's absorbed places owns no
+  cells the entry could actually relabel (at or above its `minPrecision`)
+  **and has no journaled drained cells at or above that precision**. In other
+  words: a failure is only excused where the entry's data has demonstrably
+  never arrived. A failure on territory the entry drained is a regression and
+  stays strict no matter which other source is missing; a source whose cells
+  are gone because the overlay already consumed them excuses nothing; and
+  evidence from an earlier revision at a coarser precision does not vouch for
+  a finer one.
 
 Guard probes expecting any other name never inherit deferral from missing
 merge sources: a failing guard rolls the transaction back even with the flag.
