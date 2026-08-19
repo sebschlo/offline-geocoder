@@ -414,14 +414,32 @@ async function ensureSamplePoints(sourceDb, cacheDb, lookupTable, targetCount, s
 
 function normalizeName(value) {
   if (!value) return ''
-  return String(value)
-    .normalize('NFKD')
-    // Strip only marks that are optional spelling variants: Latin combining
-    // diacritics (U+0300-U+036F), Hebrew niqqud/cantillation (U+0591-U+05C7)
-    // and Arabic harakat (U+064B-U+065F, U+0670). Marks in other scripts,
-    // e.g. Devanagari vowel signs, are essential letters and are preserved
-    // by \p{M} below.
-    .replace(/[\u0300-\u036f\u0591-\u05c7\u064b-\u065f\u0670]/g, '')
+
+  // Strip only marks that are optional spelling variants, and only where
+  // they are optional. Combining diacritics (U+0300-U+036F) are dropped
+  // solely when they modify a Latin base letter (e vs \u00e9): the same block
+  // spells essential letters in other scripts (Cyrillic \u0438 + breve = \u0439), so
+  // stripping them unconditionally would collapse distinct names. Hebrew
+  // niqqud/cantillation (U+0591-U+05C7) and Arabic harakat (U+064B-U+065F,
+  // U+0670) are optional vocalization regardless of position. All other
+  // marks (e.g. Devanagari vowel signs) are preserved via \p{M} below.
+  var decomposed = String(value).normalize('NFKD')
+  var kept = ''
+  var lastBaseIsLatin = false
+  for (var ch of decomposed) {
+    var code = ch.codePointAt(0)
+    if (code >= 0x0300 && code <= 0x036f) {
+      if (!lastBaseIsLatin) kept += ch
+      continue
+    }
+    if ((code >= 0x0591 && code <= 0x05c7) || (code >= 0x064b && code <= 0x065f) || code === 0x0670) {
+      continue
+    }
+    kept += ch
+    lastBaseIsLatin = (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)
+  }
+
+  return kept
     .toLowerCase()
     .replace(/[^\p{L}\p{M}\p{N}]+/gu, ' ')
     .trim()
@@ -927,6 +945,10 @@ async function main() {
 var SWEEP_CACHE_DECIMALS = 4
 var SWEEP_TIMEOUT_MS = 20000
 var SWEEP_DEFAULT_WORKDIR = 'tmp/locationiq-sweep'
+// Fixed seed for the sampler's country-order shuffle: stable across runs, but
+// not alphabetical, so a small --max-points does not bias the world sample
+// toward alphabetically-early country codes.
+var SWEEP_SAMPLE_SHUFFLE_SEED = 1729
 var SWEEP_SEVERITY = {
   country_mismatch: 3,
   offline_empty: 2,
@@ -951,7 +973,9 @@ function sampleUsage() {
     '  --geonames <path>    GeoNames-style TSV input (required)',
     '  --out <path>         Output JSONL points file (default: ' + SWEEP_DEFAULT_WORKDIR + '/points.jsonl)',
     '  --per-country <n>    Places per country, most populous first (default: 25)',
-    '  --max-points <n>     Optional total cap, filled round-robin by rank so every country keeps coverage',
+    '  --max-points <n>     Optional total cap, filled round-robin by rank over a deterministically',
+    '                       shuffled country order; a cap below the country count leaves some',
+    '                       countries out (an unbiased subset — a warning reports how many)',
     '  --help, -h           Show this help message'
   ].join('\n')
 }
@@ -1057,10 +1081,14 @@ function selectTopPlaces(rows, perCountry, maxPoints) {
   var picked = []
   if (maxPoints && total > maxPoints) {
     // Fill round-robin by rank so a total cap trims depth per country instead
-    // of dropping whole countries.
+    // of dropping whole countries. The per-rank country order is shuffled
+    // deterministically: with an alphabetical order, a cap smaller than the
+    // country count would always drop the same alphabetically-late countries
+    // and systematically bias the world report.
+    var order = deterministicShuffle(countries, SWEEP_SAMPLE_SHUFFLE_SEED)
     for (var rank = 0; rank < perCountry && picked.length < maxPoints; rank++) {
-      for (var j = 0; j < countries.length && picked.length < maxPoints; j++) {
-        var ranked = byCountry[countries[j]]
+      for (var j = 0; j < order.length && picked.length < maxPoints; j++) {
+        var ranked = byCountry[order[j]]
         if (rank < ranked.length) picked.push(ranked[rank])
       }
     }
@@ -1097,10 +1125,16 @@ function buildSamplePoints(tsvText, perCountry, maxPoints) {
     if (row) rows.push(row)
     else skipped += 1
   }
+  var countriesTotal = Object.create(null)
+  for (var j = 0; j < rows.length; j++) {
+    countriesTotal[rows[j].country] = true
+  }
+
   return {
     points: selectTopPlaces(rows, perCountry, maxPoints),
     parsed: rows.length,
-    skipped: skipped
+    skipped: skipped,
+    countriesTotal: Object.keys(countriesTotal).length
   }
 }
 
@@ -1170,8 +1204,14 @@ async function sampleMain(argv) {
   fs.mkdirSync(path.dirname(opts.out), { recursive: true })
   fs.writeFileSync(opts.out, lines.join('\n') + '\n', 'utf8')
 
+  var coveredCountries = Object.keys(countries).length
   console.log('Parsed rows: ' + result.parsed + ' (skipped ' + result.skipped + ')')
-  console.log('Points written: ' + result.points.length + ' across ' + Object.keys(countries).length + ' countries')
+  console.log('Points written: ' + result.points.length + ' across ' + coveredCountries + ' countries')
+  if (coveredCountries < result.countriesTotal) {
+    console.log('Warning: --max-points ' + opts.maxPoints + ' is below the country count; only ' +
+      coveredCountries + ' of ' + result.countriesTotal + ' countries are included ' +
+      '(an unbiased deterministic subset). Increase --max-points for full world coverage.')
+  }
   console.log('Points file: ' + opts.out)
 }
 
@@ -1359,7 +1399,13 @@ function comparePoint(point, offlineResult, cacheEntry) {
     record.verdict = offlineName ? 'liq_empty' : 'both_empty'
   } else if (!offlineName) {
     record.verdict = 'offline_empty'
-  } else if (offlineCountry && record.liq_country && offlineCountry !== record.liq_country) {
+  } else if (!offlineCountry || !record.liq_country) {
+    // One side lacks a country code, so the severe check cannot run and the
+    // point must not inflate agreement either: classify it as unverifiable.
+    // Any name match is still recorded in match_via for context.
+    record.match_via = findLiqNameMatch(normalizeName(offlineName), address, record.liq_display_name) || ''
+    record.verdict = 'country_unknown'
+  } else if (offlineCountry !== record.liq_country) {
     record.verdict = 'country_mismatch'
   } else {
     var via = findLiqNameMatch(normalizeName(offlineName), address, record.liq_display_name)
@@ -1387,7 +1433,7 @@ function formatAnswer(name, country, fallback) {
 function buildSweepReport(params) {
   var records = params.records || []
   var perCountry = Object.create(null)
-  var totals = { agree: 0, country_mismatch: 0, name_mismatch: 0, offline_empty: 0, liq_empty: 0, both_empty: 0 }
+  var totals = { agree: 0, country_mismatch: 0, name_mismatch: 0, offline_empty: 0, liq_empty: 0, both_empty: 0, country_unknown: 0 }
 
   for (var i = 0; i < records.length; i++) {
     var record = records[i]
@@ -1401,7 +1447,8 @@ function buildSweepReport(params) {
         name_mismatch: 0,
         offline_empty: 0,
         liq_empty: 0,
-        both_empty: 0
+        both_empty: 0,
+        country_unknown: 0
       }
     }
     bucket.evaluated += 1
@@ -1445,22 +1492,27 @@ function buildSweepReport(params) {
     ' (' + agreementPct.toFixed(1) + '%)')
   lines.push('- Mismatches: ' + (verifiable - totals.agree) + ' (country ' + totals.country_mismatch +
     ', name ' + totals.name_mismatch + ', offline empty ' + totals.offline_empty + ')')
-  lines.push('- Unverifiable: ' + (totals.liq_empty + totals.both_empty) +
-    ' (LocationIQ empty ' + totals.liq_empty + ', both empty ' + totals.both_empty + ')')
-  lines.push('- Requests used on ' + params.quota.date + ' (UTC): ' + params.quota.count + '/' + params.dailyCap)
+  lines.push('- Unverifiable: ' + (totals.liq_empty + totals.both_empty + totals.country_unknown) +
+    ' (LocationIQ empty ' + totals.liq_empty + ', both empty ' + totals.both_empty +
+    ', country unknown ' + totals.country_unknown + ')')
+  var quotaCount = params.quota && params.quota.count !== null && params.quota.count !== undefined &&
+    Number.isFinite(Number(params.quota.count)) ? Number(params.quota.count) : null
+  lines.push('- Requests used on ' + params.quota.date + ' (UTC): ' +
+    (quotaCount === null ? 'unknown (quota state unreadable)' : quotaCount + '/' + params.dailyCap))
   if (params.stopReason) {
     lines.push('- Run stopped early: ' + params.stopReason + (params.stopDetail ? ' (' + params.stopDetail + ')' : ''))
   }
   lines.push('')
   lines.push('## Countries ranked by mismatch rate (worst first)')
   lines.push('')
-  lines.push('| Country | Points | Verifiable | Agreement | Country mismatch | Name mismatch | Offline empty | LIQ empty |')
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
+  lines.push('| Country | Points | Verifiable | Agreement | Country mismatch | Name mismatch | Offline empty | LIQ empty | Country unknown |')
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
   for (var c = 0; c < countryRows.length; c++) {
     var row = countryRows[c]
     var pct = row.verifiable > 0 ? ((row.agree * 100) / row.verifiable).toFixed(1) + '%' : '-'
     lines.push('| ' + mdEscape(row.country) + ' | ' + row.evaluated + ' | ' + row.verifiable + ' | ' + pct +
-      ' | ' + row.country_mismatch + ' | ' + row.name_mismatch + ' | ' + row.offline_empty + ' | ' + row.liq_empty + ' |')
+      ' | ' + row.country_mismatch + ' | ' + row.name_mismatch + ' | ' + row.offline_empty + ' | ' + row.liq_empty +
+      ' | ' + row.country_unknown + ' |')
   }
   lines.push('')
   lines.push('## Worst examples')
@@ -1487,6 +1539,7 @@ function buildSweepReport(params) {
   lines.push('- `name_mismatch`: countries match but no LocationIQ field matches the offline name')
   lines.push('- `offline_empty`: LocationIQ answered but the offline geocoder returned nothing')
   lines.push('- `liq_empty` / `both_empty`: LocationIQ had no answer — excluded from agreement figures')
+  lines.push('- `country_unknown`: one side answered without a country code, so the comparison cannot be verified — excluded from agreement figures (a name match, if any, is noted in `match_via`)')
   lines.push('')
   return lines.join('\n')
 }
@@ -1536,7 +1589,18 @@ async function runSweep(opts, deps) {
   fs.mkdirSync(path.dirname(opts.cachePath), { recursive: true })
   var cache = loadSweepCache(opts.cachePath)
   var todayUtc = utcDateString(nowImpl())
-  var state = loadQuotaState(opts.statePath, todayUtc)
+  var state
+  try {
+    state = loadQuotaState(opts.statePath, todayUtc)
+  } catch (err) {
+    if (!opts.dryRun) throw err
+    // A dry run makes no requests, so an unreadable quota file must not
+    // block inspecting the cache. Leave the file untouched for inspection
+    // and report the day's usage as unknown.
+    state = { date: todayUtc, count: null }
+    log('Warning: ' + String(err && err.message ? err.message : err))
+    log('Continuing anyway: --dry-run makes no requests and leaves the quota state untouched.')
+  }
 
   var stopReason = null
   var stopDetail = ''
@@ -1549,10 +1613,19 @@ async function runSweep(opts, deps) {
       var point = points[i]
       if (cache[point.key]) continue
 
-      // A long run can cross midnight UTC: roll the state over so requests
-      // are attributed to the day they are actually made in, otherwise a
-      // later invocation would reset the stale date and allow nearly twice
-      // the cap within the new UTC day.
+      if (opts.maxRequests !== null && opts.maxRequests !== undefined && requestsThisRun >= opts.maxRequests) {
+        stopReason = 'max_requests'
+        break
+      }
+
+      var waitMs = lastRequestAt + delayMs - Date.now()
+      if (waitMs > 0) await sleepImpl(waitMs)
+
+      // A long run can cross midnight UTC — including during the rate-limit
+      // wait just above, so the day is derived only after it. Roll the state
+      // over so the request counts against the day it is actually made in;
+      // otherwise a later invocation would reset the stale date and allow
+      // nearly twice the cap within the new UTC day.
       var attemptDate = utcDateString(nowImpl())
       if (attemptDate !== state.date) {
         state = { date: attemptDate, count: 0 }
@@ -1563,13 +1636,6 @@ async function runSweep(opts, deps) {
         stopReason = 'daily_cap'
         break
       }
-      if (opts.maxRequests !== null && opts.maxRequests !== undefined && requestsThisRun >= opts.maxRequests) {
-        stopReason = 'max_requests'
-        break
-      }
-
-      var waitMs = lastRequestAt + delayMs - Date.now()
-      if (waitMs > 0) await sleepImpl(waitMs)
 
       // Count the attempt before it happens so a crash mid-request can only
       // over-count, never let a later run exceed the cap.
@@ -1651,7 +1717,8 @@ async function runSweep(opts, deps) {
   var mismatchCount = writeSweepMismatches(opts.mismatchesPath, records)
 
   log('Points: ' + points.length + ' total, ' + records.length + ' evaluated, ' + unfetched + ' awaiting fetch')
-  log('LocationIQ requests this run: ' + requestsThisRun + ' (today ' + state.date + ' UTC: ' + state.count + '/' + opts.dailyCap + ')')
+  log('LocationIQ requests this run: ' + requestsThisRun + ' (today ' + state.date + ' UTC: ' +
+    (state.count === null ? 'unknown' : state.count + '/' + opts.dailyCap) + ')')
   log('Report: ' + opts.reportPath)
   log('Mismatches: ' + opts.mismatchesPath + ' (' + mismatchCount + ' rows)')
 

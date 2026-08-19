@@ -133,10 +133,31 @@ describe('locationiq sweep', () => {
         acc[p.country] = (acc[p.country] || 0) + 1;
         return acc;
       }, {});
-      expect(byCountry.US).toEqual(1);
-      expect(byCountry.MX).toEqual(2);
+      // With a cap of 3 over 2 countries, both keep their top place and
+      // exactly one (shuffle-determined) country gets its second.
+      expect(byCountry.US).toBeGreaterThanOrEqual(1);
+      expect(byCountry.MX).toBeGreaterThanOrEqual(1);
+      expect(byCountry.US + byCountry.MX).toEqual(3);
       expect(result.points.some((p) => p.name === 'US One')).toBeTrue();
-      expect(result.points.some((p) => p.name === 'US Two')).toBeFalse();
+      expect(result.points.some((p) => p.name === 'MX One')).toBeTrue();
+    });
+
+    it('spreads a cap below the country count over a deterministic non-alphabetical subset', () => {
+      const codes = ['AA', 'AB', 'AC', 'AD', 'AE', 'AF', 'AG', 'AH', 'AI', 'AJ'];
+      const tsv = codes
+        .map((code, i) => geonamesRow(i + 1, code + ' City', i, i, 'P', code, 100))
+        .join('\n');
+
+      const first = liq.buildSamplePoints(tsv, 1, 5);
+      expect(first.points.length).toEqual(5);
+      expect(first.countriesTotal).toEqual(10);
+      const selected = first.points.map((p) => p.country);
+      // An alphabetical fill would always drop the same alphabet-late
+      // countries; the shuffled order must not equal the alphabetical prefix.
+      expect(selected).not.toEqual(['AA', 'AB', 'AC', 'AD', 'AE']);
+      // ...but it must be deterministic so re-generated points files match.
+      const second = liq.buildSamplePoints(tsv, 1, 5);
+      expect(second.points.map((p) => p.country)).toEqual(selected);
     });
 
     it('skips non-P feature classes and malformed rows', () => {
@@ -172,6 +193,19 @@ describe('locationiq sweep', () => {
       // name with and without them must compare equal.
       expect(liq.normalizeName('مُحَمَّد')).toEqual(liq.normalizeName('محمد'));
       expect(liq.normalizeName('יְרוּשָׁלַיִם')).toEqual(liq.normalizeName('ירושלים'));
+    });
+
+    it('strips combining diacritics only from Latin bases, keeping Cyrillic letters distinct', () => {
+      // NFKD decomposes these into base + U+0300-block marks; stripping the
+      // mark unconditionally would collapse distinct letters (й→и, ё→е, ї→і).
+      expect(liq.normalizeName('й')).not.toEqual(liq.normalizeName('и'));
+      expect(liq.normalizeName('ё')).not.toEqual(liq.normalizeName('е'));
+      expect(liq.normalizeName('ї')).not.toEqual(liq.normalizeName('і'));
+      // Precomposed and decomposed spellings of the same letter still agree.
+      expect(liq.normalizeName('й')).toEqual(liq.normalizeName('й'));
+      expect(liq.normalizeName('Йошкар-Ола')).toEqual(liq.normalizeName('йошкар ола'));
+      // Latin diacritics still fold.
+      expect(liq.normalizeName('São Paulo')).toEqual('sao paulo');
     });
 
     it('agrees when the offline name matches a locality field after normalization', () => {
@@ -241,6 +275,42 @@ describe('locationiq sweep', () => {
         { status: 404, body: { error: 'Unable to geocode' } }
       );
       expect(bothEmpty.verdict).toEqual('both_empty');
+    });
+
+    it('marks points country_unknown when either side lacks a country code', () => {
+      // LocationIQ answered with a matching locality but no country_code:
+      // the severe check cannot run, and the name match alone must not be
+      // counted as agreement.
+      const missingLiq = liq.comparePoint(
+        point(),
+        { name: 'Zaragoza', country: { id: 'SV' } },
+        { status: 200, body: { display_name: 'Zaragoza', address: { city: 'Zaragoza' } } }
+      );
+      expect(missingLiq.verdict).toEqual('country_unknown');
+      expect(missingLiq.match_via).toEqual('city');
+
+      const missingOffline = liq.comparePoint(
+        point(),
+        { name: 'Zaragoza' },
+        { status: 200, body: { display_name: '', address: { city: 'Zaragoza', country_code: 'sv' } } }
+      );
+      expect(missingOffline.verdict).toEqual('country_unknown');
+
+      // The report treats these as unverifiable, not as agreement.
+      const report = liq.buildSweepReport({
+        generatedAt: 'now',
+        databaseLabel: 'db',
+        pointsPath: 'points.jsonl',
+        totalPoints: 1,
+        unfetched: 0,
+        records: [missingLiq],
+        quota: { date: '2026-08-18', count: 0 },
+        dailyCap: 4500,
+        stopReason: null,
+        stopDetail: ''
+      });
+      expect(report).toContain('- Verifiable points: 0 — agreement 0/0 (0.0%)');
+      expect(report).toContain('country unknown 1');
     });
   });
 
@@ -532,6 +602,64 @@ describe('locationiq sweep', () => {
         const summary2 = await liq.runSweep(sweepOpts(dir), again);
         expect(again.calls.length).toEqual(0);
         expect(summary2.evaluated).toEqual(5);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('attributes a request to the new UTC day when the rate-limit wait crosses midnight', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS.slice(0, 2));
+        // The clock only advances past midnight during the rate-limit sleep
+        // before the second request.
+        let clock = new Date('2026-01-01T23:59:59Z');
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        deps.now = () => clock;
+        deps.sleep = async () => { clock = new Date('2026-01-02T00:00:01Z'); };
+
+        const summary = await liq.runSweep(sweepOpts(dir, { rps: 1, dailyCap: 1 }), deps);
+
+        // One request on each UTC day is within a cap of 1 per day; recording
+        // the post-midnight request against yesterday would either block it
+        // or let a later run double-spend the new day.
+        expect(deps.calls.length).toEqual(2);
+        expect(summary.stopReason).toBeNull();
+        const state = readState(dir);
+        expect(state.date).toEqual('2026-01-02');
+        expect(state.count).toEqual(1);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('warns instead of failing when dry-run finds an unreadable quota state file', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const tornState = '{"date":"2026-';
+        fs.writeFileSync(path.join(dir, 'quota.json'), tornState);
+        const cached = {
+          key: liq.sweepCoordKey(WORLD_POINTS[0].lat, WORLD_POINTS[0].lon),
+          lat: WORLD_POINTS[0].lat,
+          lon: WORLD_POINTS[0].lon,
+          status: 200,
+          body: { display_name: '', address: { city: 'Testville', country_code: 'us' } }
+        };
+        fs.writeFileSync(path.join(dir, 'cache.jsonl'), JSON.stringify(cached) + '\n');
+
+        const deps = makeDeps(() => {
+          throw new Error('dry-run must not touch the network');
+        });
+        const summary = await liq.runSweep(sweepOpts(dir, { dryRun: true, apiKey: '' }), deps);
+
+        expect(deps.calls.length).toEqual(0);
+        expect(summary.evaluated).toEqual(1);
+        expect(summary.quota.count).toBeNull();
+        const report = fs.readFileSync(path.join(dir, 'report.md'), 'utf8');
+        expect(report).toContain('unknown (quota state unreadable)');
+        // The damaged file is left untouched for inspection.
+        expect(fs.readFileSync(path.join(dir, 'quota.json'), 'utf8')).toEqual(tornState);
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
