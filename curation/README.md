@@ -141,11 +141,13 @@ is derived from the geohash lengths actually present in the database, so
 verification works on databases built outside the library's default range.
 
 `--skip-unresolvable` downgrades a failing probe to a warning when the
-database visibly predates the entry's inputs: the expected place owns no
-lookup cells, or one of the entry's absorbed places owns no cells. This lets a
-curation file ship ahead of the data build that makes it effective — see
-below. On a fully built database, where every merge source and expected place
-owns cells, mismatches fail even with the flag.
+database visibly predates the entry's inputs: the expected place (matched by
+name within the entry's country) owns no lookup cells, or one of the entry's
+absorbed places owns no cells the entry could actually relabel (at or above
+its `minPrecision`). This lets a curation file ship ahead of the data build
+that makes it effective — see below. On a fully built database, where every
+merge source and expected place owns cells, mismatches fail even with the
+flag.
 
 ### A note on the Guatemala probes
 
@@ -183,10 +185,12 @@ changing them are strict by design:
     an error anyway: duplicated judgment drifts when someone later edits one
     copy and not the other. Keep one entry per absorbed place.
 - **Curation never touches the schema.** Schema-level backwards compatibility
-  is governed by [`COMPATIBILITY.md`](../COMPATIBILITY.md); curation only
-  relabels `compact_geohash_lookup` rows within whatever schema the database
-  already has. Absorbed places intentionally remain in `compact_places`, so
-  place ids stored by old readers and forward lookups keep resolving.
+  is governed by the repository's compatibility contract, `COMPATIBILITY.md`
+  (introduced by [#4](https://github.com/sebschlo/offline-geocoder/pull/4));
+  curation only relabels `compact_geohash_lookup` rows within whatever schema
+  the database already has. Absorbed places intentionally remain in
+  `compact_places`, so place ids stored by old readers and forward lookups
+  keep resolving.
 - **The maintainer arbitrates judgment disputes.** When two contributors
   disagree about what a place should be called, probes and rationales are the
   evidence, and the maintainer makes the call.

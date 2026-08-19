@@ -13,13 +13,15 @@ const EAST = 8000002;
 const WEST = 8000003;
 const BYSTANDER = 8000004;
 const GHOST = 8000005;
+const HOMONYM = 8000006;
 
 const points = {
   city: { lat: 10.2, lon: 10.2 },
   east: { lat: 20.2, lon: 20.2 },
   west: { lat: 30.2, lon: 30.2 },
   bystander: { lat: -20.2, lon: -20.2 },
-  ghost: { lat: 40.2, lon: 40.2 }
+  ghost: { lat: 40.2, lon: 40.2 },
+  homonym: { lat: -40.2, lon: -160.2 }
 };
 
 // Cells owned by each place: one precision-4 (coarse fallback) cell and, for
@@ -28,7 +30,8 @@ const cells = {
   cityCoarse: geohash.encode(points.city.lat, points.city.lon, 4),
   eastFine: geohash.encode(points.east.lat, points.east.lon, 5),
   westFine: geohash.encode(points.west.lat, points.west.lon, 5),
-  bystanderFine: geohash.encode(points.bystander.lat, points.bystander.lon, 5)
+  bystanderFine: geohash.encode(points.bystander.lat, points.bystander.lon, 5),
+  homonymFine: geohash.encode(points.homonym.lat, points.homonym.lon, 5)
 };
 cells.eastCoarse = cells.eastFine.slice(0, 4);
 cells.westCoarse = cells.westFine.slice(0, 4);
@@ -101,7 +104,8 @@ async function seedCompactDb(dbPath) {
         (${EAST}, 'East County', 'US', 5, 3, ${points.east.lat}, ${points.east.lon}),
         (${WEST}, 'West County', 'US', 5, 3, ${points.west.lat}, ${points.west.lon}),
         (${BYSTANDER}, 'Bystander County', 'US', 5, 3, ${points.bystander.lat}, ${points.bystander.lon}),
-        (${GHOST}, 'Ghost Town', 'US', 5, 0, ${points.ghost.lat}, ${points.ghost.lon});
+        (${GHOST}, 'Ghost Town', 'US', 5, 0, ${points.ghost.lat}, ${points.ghost.lon}),
+        (${HOMONYM}, 'Ghost Town', 'CA', 9, 0, ${points.homonym.lat}, ${points.homonym.lon});
 
       INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES
         ('${cells.cityCoarse}', ${CITY}),
@@ -110,7 +114,8 @@ async function seedCompactDb(dbPath) {
         ('${cells.westCoarse}', ${WEST}),
         ('${cells.westFine}', ${WEST}),
         ('${cells.bystanderCoarse}', ${BYSTANDER}),
-        ('${cells.bystanderFine}', ${BYSTANDER});
+        ('${cells.bystanderFine}', ${BYSTANDER}),
+        ('${cells.homonymFine}', ${HOMONYM});
     `);
   } finally {
     await close(db);
@@ -361,6 +366,17 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       ]);
       expect(typoResult.status).toEqual(1);
       expect(typoResult.stderr).toContain('unknown field "minPrecison"');
+
+      // Number(null) is 0: a null coordinate must not silently become a valid
+      // probe at latitude 0, because probes gate whether the apply commits.
+      const nullCoordinate = baseDoc();
+      nullCoordinate.entries[0].probes[0].lat = null;
+      const nullCoordinateResult = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'null-coordinate.json', nullCoordinate)
+      ]);
+      expect(nullCoordinateResult.status).toEqual(1);
+      expect(nullCoordinateResult.stderr).toContain('"lat" must be a number');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -454,8 +470,48 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
 
       const deferred = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
       expect(deferred.status).toEqual(0);
-      expect(deferred.stderr).toContain(`merge source(s) ${GHOST} own no cells in this database yet`);
+      expect(deferred.stderr).toContain(`merge source(s) ${GHOST} own no cells at precision >= 5`);
       expect(deferred.stdout).toContain('Probes passed: 3, skipped: 1, failed: 0');
+
+      const strict = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(strict.status).toEqual(1);
+      expect(strict.stderr).toContain('--skip-unresolvable');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('defers failing probes when a merge source owns cells only below minPrecision', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // East County owns precision-4 and precision-5 cells, but this entry
+      // relabels only cells at precision >= 6, so the merge is a no-op for it:
+      // the source must count as unresolvable even though it owns SOME cells.
+      const doc = {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST],
+            minPrecision: 6,
+            rationale: 'Synthetic: absorbed place owns no cells the entry can relabel yet.',
+            probes: [
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard still passes' },
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'needs precision-6 cells that do not exist yet' }
+            ]
+          }
+        ]
+      };
+      const docPath = writeDoc(dir, 'tc.json', doc);
+
+      const deferred = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(deferred.status).toEqual(0);
+      expect(deferred.stderr).toContain(`merge source(s) ${EAST} own no cells at precision >= 6`);
+      expect(deferred.stdout).toContain('Probes passed: 1, skipped: 1, failed: 0');
 
       const strict = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
       expect(strict.status).toEqual(1);
@@ -599,9 +655,11 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
       const dbPath = path.join(dir, 'compact.sqlite');
       await seedCompactDb(dbPath);
 
-      // Ghost Town exists in compact_places but owns no lookup cells, and the
-      // probed coordinate resolves to another place — the situation of a
+      // Ghost Town (US) exists in compact_places but owns no lookup cells, and
+      // the probed coordinate resolves to another place — the situation of a
       // curation file shipped ahead of the data build that makes it effective.
+      // A same-named place in another country (CA) DOES own cells, so this
+      // also pins down that resolvability is scoped to the entry's country.
       const doc = baseDoc();
       doc.entries[0].probes.push({
         lat: points.east.lat,
@@ -613,7 +671,7 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
 
       const skipped = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
       expect(skipped.status).toEqual(0);
-      expect(skipped.stderr).toContain('owns no cells in this database yet');
+      expect(skipped.stderr).toContain('"Ghost Town" (US) owns no cells in this database yet');
       expect(skipped.stdout).toContain('Probes passed: 3, skipped: 1, failed: 0');
 
       const strict = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);

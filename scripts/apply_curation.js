@@ -120,13 +120,16 @@ function validateProbe(probe, label) {
 
   rejectUnknownKeys(probe, PROBE_KEYS, label)
 
-  var lat = Number(probe.lat)
-  if (!Number.isFinite(lat) || lat < -90 || lat > 90) {
+  // Check the original type: Number(null), Number(false), and Number('') all
+  // coerce to 0, which would silently turn a malformed probe into a "valid"
+  // probe at coordinate 0 — and probes gate whether the apply commits.
+  var lat = probe.lat
+  if (typeof lat !== 'number' || !Number.isFinite(lat) || lat < -90 || lat > 90) {
     throw new Error(label + ': "lat" must be a number between -90 and 90')
   }
 
-  var lon = Number(probe.lon)
-  if (!Number.isFinite(lon) || lon < -180 || lon > 180) {
+  var lon = probe.lon
+  if (typeof lon !== 'number' || !Number.isFinite(lon) || lon < -180 || lon > 180) {
     throw new Error(label + ': "lon" must be a number between -180 and 180')
   }
 
@@ -431,23 +434,29 @@ function entryLabel(entry, intoName) {
     entry.absorb.join(', ') + '] at precision >= ' + entry.minPrecision
 }
 
-async function expectedPlaceOwnsCells(db, name) {
+// Scoped to the entry's country so that a homonymous place elsewhere in the
+// world cannot make an expected name look resolvable.
+async function expectedPlaceOwnsCells(db, name, countryId) {
   var rows = await dbAll(db, `
     SELECT COUNT(*) AS count
     FROM compact_geohash_lookup l
     JOIN compact_places p ON p.id = l.place_id
     WHERE p.name = ?
-  `, [name])
+      AND p.country_id = ?
+  `, [name, countryId])
 
   return Boolean(rows.length && rows[0].count > 0)
 }
 
-async function placeOwnsCellsById(db, placeId) {
+// Counts only cells the entry could actually relabel: a place owning cells
+// solely below minPrecision still makes the merge a no-op for that source.
+async function placeOwnsRelabelableCells(db, placeId, minPrecision) {
   var rows = await dbAll(db, `
     SELECT COUNT(*) AS count
     FROM compact_geohash_lookup
     WHERE place_id = ?
-  `, [placeId])
+      AND LENGTH(geohash) >= ?
+  `, [placeId, minPrecision])
 
   return Boolean(rows.length && rows[0].count > 0)
 }
@@ -472,8 +481,9 @@ async function deriveBoundaryPrecision(db) {
 }
 
 // Snapshot, before anything is written, which of each entry's inputs the
-// database can currently express: absorbed places that own no lookup cells,
-// and whether each probe's expected name owns any cells. Verification uses
+// database can currently express: absorbed places that own no cells the entry
+// could relabel (at or above its minPrecision), and whether each probe's
+// expected name owns any cells within the entry's country. Verification uses
 // this to tell a genuine mismatch from a curation file that shipped ahead of
 // the data build that makes it effective.
 async function computeResolvability(db, entries) {
@@ -485,16 +495,16 @@ async function computeResolvability(db, entries) {
     var missing = []
 
     for (var j = 0; j < entry.absorb.length; j++) {
-      if (!(await placeOwnsCellsById(db, entry.absorb[j]))) {
+      if (!(await placeOwnsRelabelableCells(db, entry.absorb[j], entry.minPrecision))) {
         missing.push(entry.absorb[j])
       }
     }
     missingSourcesByEntry[entry.source + '#' + entry.index] = missing
 
     for (var k = 0; k < entry.probes.length; k++) {
-      var name = entry.probes[k].expect
-      if (expectOwnsByName[name] === undefined) {
-        expectOwnsByName[name] = await expectedPlaceOwnsCells(db, name)
+      var key = entry.country + '|' + entry.probes[k].expect
+      if (expectOwnsByName[key] === undefined) {
+        expectOwnsByName[key] = await expectedPlaceOwnsCells(db, entry.probes[k].expect, entry.country)
       }
     }
   }
@@ -539,11 +549,11 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       }
 
       var reasons = []
-      if (!resolvability.expectOwnsByName[probe.expect]) {
-        reasons.push('expected place "' + probe.expect + '" owns no cells in this database yet')
+      if (!resolvability.expectOwnsByName[entry.country + '|' + probe.expect]) {
+        reasons.push('expected place "' + probe.expect + '" (' + entry.country + ') owns no cells in this database yet')
       }
       if (missingSources.length) {
-        reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells in this database yet')
+        reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells at precision >= ' + entry.minPrecision + ' in this database yet')
       }
 
       if (reasons.length && skipUnresolvable) {
