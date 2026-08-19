@@ -420,8 +420,11 @@ function normalizeName(value) {
   // solely when they modify a Latin base letter (e vs \u00e9): the same block
   // spells essential letters in other scripts (Cyrillic \u0438 + breve = \u0439), so
   // stripping them unconditionally would collapse distinct names. Hebrew
-  // niqqud/cantillation (U+0591-U+05C7) and Arabic harakat (U+064B-U+065F,
-  // U+0670) are optional vocalization regardless of position. All other
+  // niqqud/cantillation (U+0591-U+05C7) and the Arabic harakat proper
+  // (U+064B-U+0652 plus U+0670 superscript alef) are optional vocalization
+  // regardless of position. Maddah and hamza marks (U+0653-U+0655) are NOT
+  // stripped: NFKD decomposes alef/waw/yeh-hamza letters into base + one of
+  // these marks, so removing them would collapse distinct letters. All other
   // marks (e.g. Devanagari vowel signs) are preserved via \p{M} below.
   var decomposed = String(value).normalize('NFKD')
   var kept = ''
@@ -432,7 +435,7 @@ function normalizeName(value) {
       if (!lastBaseIsLatin) kept += ch
       continue
     }
-    if ((code >= 0x0591 && code <= 0x05c7) || (code >= 0x064b && code <= 0x065f) || code === 0x0670) {
+    if ((code >= 0x0591 && code <= 0x05c7) || (code >= 0x064b && code <= 0x0652) || code === 0x0670) {
       continue
     }
     kept += ch
@@ -991,6 +994,9 @@ function sweepUsage() {
     'file records the UTC date and request count, so multiple runs on the same',
     'UTC day share one daily cap. On HTTP 429 the run backs off and stops',
     'cleanly. Designed for LocationIQ\'s free tier; run one sweep at a time.',
+    'The cache records the endpoint and accept-language it was built with, and',
+    'network runs with different values are rejected — use a separate --workdir',
+    'per configuration (--dry-run only evaluates the cache and is exempt).',
     '',
     'Options:',
     '  --points <path>          JSONL points file (required; see the sample subcommand)',
@@ -1304,6 +1310,41 @@ function appendSweepCache(cachePath, entry) {
   fs.appendFileSync(cachePath, prefix + JSON.stringify(entry) + '\n', 'utf8')
 }
 
+function readSweepCacheMeta(cachePath) {
+  if (!fs.existsSync(cachePath)) return null
+
+  var lines = fs.readFileSync(cachePath, 'utf8').split(/\r?\n/)
+  for (var i = 0; i < lines.length; i++) {
+    if (!lines[i].trim()) continue
+    try {
+      var entry = JSON.parse(lines[i])
+      if (entry && entry.meta && typeof entry.meta === 'object') return entry.meta
+    } catch (err) {
+      // Torn lines are handled by loadSweepCache; skip them here too.
+    }
+  }
+  return null
+}
+
+function ensureSweepCacheConfig(cachePath, config) {
+  // Cached responses depend on the request-shaping options, so the cache is
+  // stamped with them and a run using different options is rejected loudly:
+  // silently evaluating stale responses (or silently refetching everything)
+  // would corrupt the report or re-spend quota.
+  var meta = readSweepCacheMeta(cachePath)
+  if (!meta) {
+    appendSweepCache(cachePath, { meta: config })
+    return
+  }
+  if (meta.endpoint !== config.endpoint || meta.acceptLanguage !== config.acceptLanguage) {
+    throw new Error('Cache ' + cachePath + ' was built with endpoint=' + meta.endpoint +
+      ' accept-language=' + (meta.acceptLanguage || '(none)') +
+      ', but this run uses endpoint=' + config.endpoint +
+      ' accept-language=' + (config.acceptLanguage || '(none)') +
+      '. Responses are not comparable across these settings: use a separate --workdir or --cache, or delete the cache to refetch.')
+  }
+}
+
 function loadQuotaState(statePath, todayUtc) {
   var raw
   try {
@@ -1587,6 +1628,11 @@ async function runSweep(opts, deps) {
   }
 
   fs.mkdirSync(path.dirname(opts.cachePath), { recursive: true })
+  if (!opts.dryRun) {
+    // Dry runs only evaluate what is already cached, so the request-shaping
+    // options are irrelevant there; network runs must match the cache.
+    ensureSweepCacheConfig(opts.cachePath, { endpoint: opts.endpoint, acceptLanguage: opts.acceptLanguage })
+  }
   var cache = loadSweepCache(opts.cachePath)
   var todayUtc = utcDateString(nowImpl())
   var state
@@ -1806,7 +1852,13 @@ function parseSweepArgs(argv) {
     } else if (arg === '--max-requests') {
       opts.maxRequests = Math.max(0, Math.trunc(requireNumericArg('--max-requests', argv[++i])))
     } else if (arg === '--reverse-mode') {
-      opts.reverseMode = String(argv[++i] || 'boundary').toLowerCase()
+      // The mode defines which lookup algorithm the report measures, so a
+      // typo must not silently reconfigure the experiment.
+      var reverseMode = String(argv[++i] || '').toLowerCase()
+      if (reverseMode !== 'centroid' && reverseMode !== 'boundary') {
+        throw new Error('--reverse-mode must be centroid or boundary, got: ' + (argv[i] === undefined ? '(missing)' : argv[i]))
+      }
+      opts.reverseMode = reverseMode
     } else if (arg === '--base-precision') {
       opts.basePrecision = Math.max(1, Math.trunc(requireNumericArg('--base-precision', argv[++i])))
     } else if (arg === '--max-precision') {
@@ -1855,7 +1907,7 @@ async function sweepMain(argv) {
 
   var geocoder = createGeocoder({
     database: opts.database,
-    reverseMode: opts.reverseMode === 'centroid' ? 'centroid' : 'boundary',
+    reverseMode: opts.reverseMode,
     boundary: {
       basePrecision: opts.basePrecision,
       maxPrecision: opts.maxPrecision

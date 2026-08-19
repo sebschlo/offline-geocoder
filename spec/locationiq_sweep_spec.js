@@ -85,6 +85,18 @@ function cacheLines(dir) {
   return fs.readFileSync(file, 'utf8').split('\n').filter((line) => line.trim());
 }
 
+function cacheEntries(dir) {
+  return cacheLines(dir)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch (err) {
+        return null;
+      }
+    })
+    .filter((entry) => entry && entry.key);
+}
+
 function point(overrides) {
   return Object.assign({
     key: '13.4767,-89.3072',
@@ -208,6 +220,18 @@ describe('locationiq sweep', () => {
       expect(liq.normalizeName('São Paulo')).toEqual('sao paulo');
     });
 
+    it('keeps Arabic hamza and maddah distinctions while stripping harakat', () => {
+      // NFKD decomposes أ/إ/آ into alef + U+0653-0655; those marks are
+      // orthographically essential, so distinct names must stay distinct.
+      expect(liq.normalizeName('أمل')).not.toEqual(liq.normalizeName('امل'));
+      expect(liq.normalizeName('إربد')).not.toEqual(liq.normalizeName('اربد'));
+      expect(liq.normalizeName('آزاد')).not.toEqual(liq.normalizeName('ازاد'));
+      // Precomposed hamza letters equal their decomposed spellings.
+      expect(liq.normalizeName('أ')).toEqual(liq.normalizeName('أ'));
+      // True harakat remain optional vocalization.
+      expect(liq.normalizeName('مُحَمَّد')).toEqual(liq.normalizeName('محمد'));
+    });
+
     it('agrees when the offline name matches a locality field after normalization', () => {
       const record = liq.comparePoint(
         point({ name: 'Kilómetro 18' }),
@@ -328,7 +352,7 @@ describe('locationiq sweep', () => {
         expect(first.calls[0]).toContain('accept-language=en');
         expect(summary.stopReason).toEqual('daily_cap');
         expect(summary.requestsThisRun).toEqual(3);
-        expect(cacheLines(dir).length).toEqual(3);
+        expect(cacheEntries(dir).length).toEqual(3);
 
         const state = readState(dir);
         expect(state.date).toEqual(liq.utcDateString(new Date()));
@@ -409,7 +433,7 @@ describe('locationiq sweep', () => {
 
         expect(deps.calls.length).toEqual(2);
         expect(summary.stopReason).toEqual('rate_limited');
-        expect(cacheLines(dir).length).toEqual(1);
+        expect(cacheEntries(dir).length).toEqual(1);
         expect(summary.evaluated).toEqual(1);
         // The failed attempt still counts against the persisted quota.
         expect(readState(dir).count).toEqual(2);
@@ -538,6 +562,13 @@ describe('locationiq sweep', () => {
       }
     });
 
+    it('rejects unsupported --reverse-mode values instead of silently mapping them', () => {
+      expect(() => liq.parseSweepArgs(['--reverse-mode', 'centriod'])).toThrowError(/--reverse-mode/);
+      expect(() => liq.parseSweepArgs(['--reverse-mode'])).toThrowError(/--reverse-mode/);
+      expect(liq.parseSweepArgs(['--reverse-mode', 'centroid']).reverseMode).toEqual('centroid');
+      expect(liq.parseSweepArgs(['--reverse-mode', 'Boundary']).reverseMode).toEqual('boundary');
+    });
+
     it('rolls quota state over when the UTC day changes mid-run', async () => {
       const dir = makeTmpDir();
       try {
@@ -587,15 +618,7 @@ describe('locationiq sweep', () => {
 
         expect(deps.calls.length).toEqual(4);
         expect(summary.evaluated).toEqual(5);
-        const parseable = cacheLines(dir).filter((line) => {
-          try {
-            JSON.parse(line);
-            return true;
-          } catch (err) {
-            return false;
-          }
-        });
-        expect(parseable.length).toEqual(5);
+        expect(cacheEntries(dir).length).toEqual(5);
 
         // The repaired cache must fully satisfy a second run: zero requests.
         const again = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
@@ -660,6 +683,46 @@ describe('locationiq sweep', () => {
         expect(report).toContain('unknown (quota state unreadable)');
         // The damaged file is left untouched for inspection.
         expect(fs.readFileSync(path.join(dir, 'quota.json'), 'utf8')).toEqual(tornState);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a network run against a cache built with different request options', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const respond = () => okResponse({ city: 'Testville', country_code: 'us' });
+
+        const first = makeDeps(respond);
+        await liq.runSweep(sweepOpts(dir), first);
+        expect(first.calls.length).toEqual(5);
+
+        // A different accept-language must not silently reuse the cache.
+        const second = makeDeps(respond);
+        await expectAsync(liq.runSweep(sweepOpts(dir, { acceptLanguage: 'fr' }), second))
+          .toBeRejectedWithError(/accept-language/);
+        expect(second.calls.length).toEqual(0);
+
+        // Neither may a different endpoint.
+        const third = makeDeps(respond);
+        await expectAsync(liq.runSweep(sweepOpts(dir, { endpoint: 'https://eu1.liq.invalid/v1/reverse' }), third))
+          .toBeRejectedWithError(/endpoint/);
+        expect(third.calls.length).toEqual(0);
+
+        // Matching options keep resuming from the cache.
+        const fourth = makeDeps(respond);
+        const summary = await liq.runSweep(sweepOpts(dir), fourth);
+        expect(fourth.calls.length).toEqual(0);
+        expect(summary.evaluated).toEqual(5);
+
+        // Dry runs only evaluate the cache as-is, so options are exempt.
+        const fifth = makeDeps(() => {
+          throw new Error('dry-run must not touch the network');
+        });
+        const drySummary = await liq.runSweep(sweepOpts(dir, { acceptLanguage: 'fr', dryRun: true, apiKey: '' }), fifth);
+        expect(fifth.calls.length).toEqual(0);
+        expect(drySummary.evaluated).toEqual(5);
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
