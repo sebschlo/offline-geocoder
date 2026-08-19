@@ -80,22 +80,28 @@ frozen rather than recomputed:
   while real databases became unreadable. A conformance spec pins the
   encoder against published geohash reference vectors and against every
   literal the fixtures store.
-- **Each generation's exact column signature is asserted** (`PRAGMA
-  table_info`: name, type, `NOT NULL`, default, primary-key flag), so a
-  fixture cannot be quietly widened, retyped or relaxed to make a new
-  reader pass. Column *order* is deliberately not asserted — readers
-  select by name.
+- **Each generation's exact schema is asserted** — every column signature
+  (`PRAGMA table_info`: name, type, `NOT NULL`, default, primary-key flag)
+  *and* the exact set of tables and views. Both halves matter: a fixture
+  that gains a table would let a future reader take a query path that
+  generation never shipped (boundary readers feature-detect their path),
+  while the signatures stop a fixture being quietly widened, retyped or
+  relaxed. Column *order* is deliberately not asserted — readers select by
+  name.
 - **Freshly generated databases are asserted to be supersets** of the
-  frozen columns of every generation they have shipped, by name **and
-  declared type**. This covers the contract's opposite direction — a
-  builder dropping, renaming or retyping a column that older readers still
-  need — even while the current reader happens to support both layouts.
-  All the generators are exercised: `generate_boundary_index.js` in
-  `--index-mode compact` and `--index-mode full`, and `scripts/schema.sql`
-  (applied verbatim by `generate_geonames.sh`), including the output
-  columns of the `everything` view that centroid, forward and id-lookup
-  readers select from. Nullability and defaults are not required to match
-  there, because tightening them is reader-safe; see the contract above.
+  frozen columns of every generation they have shipped: name and declared
+  type must match, and a column frozen as `NOT NULL` or `PRIMARY KEY` must
+  remain so, while tightening a historically nullable column is allowed
+  because that direction is reader-safe. This covers the contract's
+  opposite direction — a builder dropping, renaming, retyping or relaxing
+  a column that older readers still need — even while the current reader
+  happens to support both layouts. Every generator is exercised:
+  `generate_boundary_index.js` in `--index-mode compact` and `--index-mode
+  full`, and `scripts/schema.sql` (applied verbatim by
+  `generate_geonames.sh`), which is checked against both the centroid and
+  the boundary tables it creates, plus the output columns of the
+  `everything` view that centroid, forward and id-lookup readers select
+  from.
 
 Rules for contributors:
 

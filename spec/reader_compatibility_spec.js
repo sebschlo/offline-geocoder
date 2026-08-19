@@ -64,14 +64,18 @@ const FROZEN_GEOHASH = {
 //
 // - `name` and `type` are asserted everywhere. Affinity is reader-visible:
 //   flipping `latitude REAL` to TEXT hands arithmetic a string.
-// - `NOT NULL`, `DEFAULT` and `PK` are asserted on fixtures (frozen
-//   history, nothing legitimately changes them) but NOT on generated
-//   databases, where only name+type are required. That is deliberate:
-//   relaxing a shipped NOT NULL column is reader-visible (a value readers
-//   always had can arrive null), while tightening one only constrains
-//   builders — and the current scripts/schema.sql legitimately tightened
-//   `features.name` / `features.country_id` to NOT NULL relative to the
-//   v1.0.0 schema without breaking any reader.
+// - `NOT NULL` and `PK` are asserted exactly on fixtures (frozen history,
+//   nothing legitimately changes them) and DIRECTIONALLY on generated
+//   databases: a column frozen as NOT NULL or PRIMARY KEY must stay that
+//   way, while a historically nullable column may be tightened. That
+//   asymmetry is the contract — relaxing NOT NULL is reader-visible (a
+//   value readers always had can arrive null), whereas tightening only
+//   constrains builders, and scripts/schema.sql has already tightened
+//   `features.name` / `features.country_id` relative to v1.0.0 without
+//   breaking any reader.
+// - `DEFAULT` is asserted on fixtures only. On generated databases it says
+//   what a builder writes when it omits a column, which is builder-side
+//   behavior already covered by the builders' own specs.
 // - `cid` (ordinal position) is deliberately excluded: the contract
 //   requires readers to select by name, so column order is not binding.
 //   These lists are written in declaration order purely for legibility.
@@ -159,6 +163,24 @@ const FROZEN_EVERYTHING_COLUMNS = [
   'country_id', 'country_name', 'latitude', 'longitude'
 ];
 
+// The complete set of tables and views each generation's fixture contains.
+//
+// Asserted exactly, because boundary readers select their query path by
+// feature-detecting tables (see getBoundarySchemaStatus in src/reverse.js).
+// A fixture that gained, say, compact_places would quietly let a future
+// reader take the compact path against a database generation that never
+// had it — the precise failure these fixtures exist to prevent.
+const FROZEN_OBJECTS = {
+  centroid: ['admin1', 'coordinates', 'countries', 'everything', 'features'],
+  full: [
+    'admin1', 'countries', 'place_geohash_cover', 'place_geohash_lookup',
+    'place_geometry', 'places'
+  ],
+  compactLegacy: ['admin1', 'countries', 'place_geohash_lookup', 'places'],
+  compactV2: ['compact_geohash_lookup', 'compact_places'],
+  compactV2Population: ['compact_geohash_lookup', 'compact_places']
+};
+
 function exec(db, sql) {
   return new Promise((resolve, reject) => {
     db.exec(sql, (err) => (err ? reject(err) : resolve()));
@@ -184,11 +206,8 @@ function close(db) {
 }
 
 // Renders one PRAGMA table_info row in the frozen-signature format.
-function formatSignature(row, typeOnly) {
+function formatSignature(row) {
   let signature = `${row.name} ${row.type}`;
-  if (typeOnly) {
-    return signature;
-  }
   if (row.notnull) signature += ' NOT NULL';
   if (row.dflt_value !== null && row.dflt_value !== undefined) {
     signature += ` DEFAULT ${row.dflt_value}`;
@@ -197,43 +216,102 @@ function formatSignature(row, typeOnly) {
   return signature;
 }
 
+// Parses a frozen signature string back into the fields compared against
+// generated databases.
+function parseSignature(entry) {
+  const parts = entry.split(' ');
+  return {
+    name: parts[0],
+    type: parts[1],
+    notnull: / NOT NULL/.test(entry),
+    pk: / PK$/.test(entry)
+  };
+}
+
 // Reads column signatures in declaration order via PRAGMA table_info.
-// typeOnly drops the fields that generated databases may legitimately
-// tighten (see FROZEN_COLUMNS).
-async function readSignatures(databasePath, table, typeOnly) {
+async function readSignatures(databasePath, table) {
   const db = new sqlite3.Database(databasePath);
   try {
     const rows = await all(db, `PRAGMA table_info(${table})`);
-    return rows.map((row) => formatSignature(row, typeOnly));
+    return rows.map((row) => ({ row: row, signature: formatSignature(row) }));
   } finally {
     await close(db);
   }
 }
 
-// Registers the exact-signature assertion for one generation's fixture.
-function expectFrozenColumns(getDatabasePath, frozen) {
+// Reads every table and view, excluding SQLite's own bookkeeping objects.
+async function readObjects(databasePath) {
+  const db = new sqlite3.Database(databasePath);
+  try {
+    const rows = await all(db, `
+      SELECT name FROM sqlite_master
+      WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `);
+    return rows.map((row) => row.name);
+  } finally {
+    await close(db);
+  }
+}
+
+// Registers both frozen-schema assertions for one generation's fixture:
+// the exact column signatures, and the exact set of tables and views.
+function expectFrozenSchema(getDatabasePath, generation) {
+  const frozen = FROZEN_COLUMNS[generation];
+  const objects = FROZEN_OBJECTS[generation];
+
   it('preserves the exact frozen column signatures of this generation', async () => {
     for (const table of Object.keys(frozen)) {
-      const actual = await readSignatures(getDatabasePath(), table, false);
+      const actual = await readSignatures(getDatabasePath(), table);
       // Compared as strings so a failure names the table and both lists.
-      expect(`${table}: ${actual.join(', ')}`)
+      expect(`${table}: ${actual.map((column) => column.signature).join(', ')}`)
         .toEqual(`${table}: ${frozen[table].join(', ')}`);
     }
   });
+
+  // A fixture that silently gains a table is not frozen history any more:
+  // boundary readers pick their query path by feature-detecting tables, so
+  // an extra table would let a future reader exercise a path this
+  // generation never shipped while every signature check stayed green.
+  it('contains exactly the tables and views this generation shipped', async () => {
+    const actual = await readObjects(getDatabasePath());
+    expect(actual.join(', ')).toEqual(objects.slice().sort().join(', '));
+  });
 }
 
-// Asserts a generated database still carries every frozen column, by name
-// and declared type. Extra columns pass; drops, renames and retypes fail.
+// Asserts a generated database still carries every frozen column.
+//
+// Compared directionally, matching the contract: name and declared type
+// must match exactly, and a column frozen as NOT NULL or PRIMARY KEY must
+// still be NOT NULL / PRIMARY KEY. Extra columns, and constraints added to
+// historically nullable columns, are allowed — tightening is reader-safe,
+// relaxing is not.
 async function expectSuperset(databasePath, frozen) {
   for (const table of Object.keys(frozen)) {
-    const actual = await readSignatures(databasePath, table, true);
-    const required = frozen[table].map((entry) => {
-      const parts = entry.split(' ');
-      return `${parts[0]} ${parts[1]}`;
-    });
-    const missing = required.filter((entry) => actual.indexOf(entry) === -1);
-    // Compared as strings so a failure names the table and the columns.
-    expect(`${table} missing: ${missing.join(', ')}`).toEqual(`${table} missing: `);
+    const actual = await readSignatures(databasePath, table);
+    const problems = [];
+
+    for (const entry of frozen[table]) {
+      const required = parseSignature(entry);
+      const match = actual.find((column) => column.row.name === required.name);
+
+      if (!match) {
+        problems.push(`${required.name}: missing`);
+        continue;
+      }
+      if (match.row.type !== required.type) {
+        problems.push(`${required.name}: type ${match.row.type}, expected ${required.type}`);
+      }
+      if (required.notnull && !match.row.notnull) {
+        problems.push(`${required.name}: NOT NULL was relaxed to nullable`);
+      }
+      if (required.pk && !match.row.pk) {
+        problems.push(`${required.name}: PRIMARY KEY was dropped`);
+      }
+    }
+
+    // Compared as strings so a failure names the table and every problem.
+    expect(`${table}: ${problems.join('; ')}`).toEqual(`${table}: `);
   }
 }
 
@@ -390,7 +468,7 @@ describe('reader compatibility: centroid-only schema generation (v1.0.0)', () =>
     expect(result).toBeUndefined();
   });
 
-  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.centroid);
+  expectFrozenSchema(() => fixture.databasePath, 'centroid');
 });
 
 // Generation 1: full boundary schema.
@@ -565,7 +643,7 @@ describe('reader compatibility: full boundary schema generation', () => {
     expect(result.formatted).toEqual('Milltown, Coral Province, Atlantis');
   });
 
-  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.full);
+  expectFrozenSchema(() => fixture.databasePath, 'full');
 });
 
 // Generation 2: compact legacy schema.
@@ -676,7 +754,7 @@ describe('reader compatibility: compact legacy schema generation', () => {
     expect(result.formatted).toEqual('Westport, Northmark, Bordonia');
   });
 
-  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.compactLegacy);
+  expectFrozenSchema(() => fixture.databasePath, 'compactLegacy');
 });
 
 // Shared seed data for the two compact v2 generations. Both blocks insert
@@ -773,7 +851,7 @@ describe('reader compatibility: compact v2 schema generation (shipped)', () => {
   });
 
   expectCompactV2Results(() => geocoder);
-  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.compactV2);
+  expectFrozenSchema(() => fixture.databasePath, 'compactV2');
 });
 
 // Generation 4: compact v2 schema with nullable population/area columns,
@@ -847,7 +925,7 @@ describe('reader compatibility: compact v2 schema generation with population/are
   // Identical expectations to the shipped compact v2 generation: the new
   // columns (valued or NULL) must not change any reader-visible result.
   expectCompactV2Results(() => geocoder);
-  expectFrozenColumns(() => fixture.databasePath, FROZEN_COLUMNS.compactV2Population);
+  expectFrozenSchema(() => fixture.databasePath, 'compactV2Population');
 });
 
 // The opposite direction of the contract: an older reader opening a NEWLY
@@ -958,9 +1036,19 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
       await expectSuperset(fixture.databasePath, FROZEN_COLUMNS.centroid);
     });
 
+    // This schema also creates the full boundary tables, and it is the
+    // starting point for `--append` builds: CREATE TABLE IF NOT EXISTS
+    // will not repair a table that schema.sql created with a column
+    // missing, so the builder's insert would fail against a database the
+    // boundary-mode specs never see (they start from an empty file).
+    it('keeps every shipped full and compact-legacy boundary column', async () => {
+      await expectSuperset(fixture.databasePath, FROZEN_COLUMNS.full);
+      await expectSuperset(fixture.databasePath, FROZEN_COLUMNS.compactLegacy);
+    });
+
     it('keeps every generation-0 output column of the everything view', async () => {
-      const actual = await readSignatures(fixture.databasePath, 'everything', true);
-      const names = actual.map((entry) => entry.split(' ')[0]);
+      const actual = await readSignatures(fixture.databasePath, 'everything');
+      const names = actual.map((column) => column.row.name);
       const missing = FROZEN_EVERYTHING_COLUMNS.filter(
         (column) => names.indexOf(column) === -1);
       expect(`everything missing: ${missing.join(', ')}`).toEqual('everything missing: ');
