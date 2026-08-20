@@ -68,6 +68,12 @@ agree on them:
 - **The geohash query range** — readers query every precision from
   `basePrecision` to `maxPrecision` (4-7 by default), so a database may
   store a cell at any precision in that range and expect it to be found.
+- **Column order in `scripts/schema.sql`, for one path only** —
+  `generate_geonames.sh` reshapes the upstream dumps with `awk` and loads
+  them through SQLite's positional `.import FILE TABLE`, so that file's
+  column order has to line up with the field order the script prints.
+  Readers never depend on column order; this single generator does, and
+  reordering columns there silently misassigns every imported value.
 
 ## Known schema generations
 
@@ -114,8 +120,9 @@ frozen rather than recomputed:
   that gains a table would let a future reader take a query path that
   generation never shipped (boundary readers feature-detect their path),
   while the signatures stop a fixture being quietly widened, retyped or
-  relaxed. Column *order* is deliberately not asserted — readers select by
-  name.
+  relaxed. Column *order* is not asserted structurally — readers select by
+  name — but it is pinned behaviorally for `scripts/schema.sql`, whose
+  positional `.import` does depend on it.
 - **Freshly generated databases are asserted to be supersets** of the
   frozen columns of every generation they have shipped: name and declared
   type must match, and a column frozen as `NOT NULL` or `PRIMARY KEY` must
@@ -125,9 +132,11 @@ frozen rather than recomputed:
   a column that older readers still need — even while the current reader
   happens to support both layouts. Every generator is exercised:
   `generate_boundary_index.js` in `--index-mode compact` and `--index-mode
-  full`, and `scripts/schema.sql` (applied verbatim by
-  `generate_geonames.sh`), which is checked against the centroid, widened
-  centroid and boundary tables it creates.
+  full`; `scripts/schema.sql`, checked against the centroid, widened
+  centroid and boundary tables it creates; and `generate_geonames.sh`
+  itself, run end to end over miniature local dumps with
+  `GEONAMES_DOWNLOAD=0`, because its `awk`-to-`.import` pipeline can
+  misassign values that no schema assertion can see.
 - **The non-column conventions above are pinned too**: the emitted
   `placetype_code` *and* `placetype` string for every placetype, the
   `json`/GeoJSON representation the builder writes into `place_geometry`,
@@ -136,16 +145,32 @@ frozen rather than recomputed:
   because a view's structure says nothing about which rows survive it — a
   feature with no `admin1` row staying visible through `everything`, the
   shape a supported `GEONAMES_INCLUDE_ADMIN1=0` build produces.
+- **Payloads are judged by the reader's own consumer, not by their shape.**
+  Generated geometry is parsed and run through `pointInGeometry` with
+  points known to be inside and outside, so a ring serialized as
+  `[lat, lon]` fails the way a released reader would fail. Likewise the
+  forward-path fixtures carry an ASCII spelling that differs from the name
+  and same-named places separated only by population, so an assertion
+  cannot pass on data that could not distinguish success from failure.
 
 Taken together the enforced surface is **complete for the reader-observable
 contract** as it stands: every generation that has shipped has a permanent
-fixture, every generator that writes a database is checked against the
-generations it must keep producing, every value a reader parses or compares
-rather than merely reads is pinned, and the geohash query range is
-exercised at both endpoints. This set is finished rather than arbitrarily
-stopped — if it grows, it should be because the library gained a new
-generation, generator, or reader-parsed encoding, not because the same
-surface was re-examined.
+fixture, every generator that writes a database is exercised — including
+`generate_geonames.sh` end to end, not merely the schema file it applies —
+every value a reader parses or compares rather than merely reads is pinned,
+and the geohash query range is exercised at both endpoints.
+
+That claim was first made one generator too early: `scripts/schema.sql` was
+treated as the whole of the GeoNames generator, when the `awk`-to-`.import`
+pipeline around it can misassign values on its own. The list of *kinds* of
+surface was right; one instance of a kind was missing. It is covered now.
+
+The distinction worth keeping is between a missing surface and a sharper
+assertion about a surface already covered. A reviewer can always propose a
+further refinement of any assertion — a deeper structural check, another
+edge case — and that is not evidence the contract is incomplete. Growth
+here should mean the library gained a new generation, a new generator, or a
+new reader-parsed encoding.
 
 ### What this suite deliberately does not pin
 

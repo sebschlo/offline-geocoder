@@ -35,6 +35,7 @@ const { spawnSync } = require('child_process');
 const sqlite3 = require('sqlite3');
 const createGeocoder = require('../src/index.js');
 const geohash = require('../src/geohash');
+const geometry = require('../src/geometry');
 
 // Frozen precision-5 geohash lookup keys, stored as literals.
 //
@@ -1291,7 +1292,7 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
         await close(db);
       }
 
-      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.length).toEqual(PLACETYPES.length);
 
       for (const row of rows) {
         expect(`${row.place_id} encoding: ${row.encoding}`)
@@ -1304,9 +1305,20 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
 
         expect(`${row.place_id} type: ${parsed.type}`)
           .toEqual(`${row.place_id} type: MultiPolygon`);
-        // Rings of [lon, lat] pairs, the shape the reader's
-        // point-in-polygon test assumes.
-        expect(typeof parsed.coordinates[0][0][0][0]).toEqual('number');
+
+        // Feed the payload to the reader's own consumer instead of
+        // type-checking its leaves. Each input polygon spans lon
+        // [band, band + 1] and lat [-2, 2], so a point inside must test
+        // inside and a point east of the band must not. Rings serialized
+        // as [lat, lon] rather than the contracted [lon, lat] fail here
+        // immediately — the same way a released reader would fail.
+        const band = (row.place_id - 4001) * 10;
+        const parsedGeometry = geometry.normalizeGeometry(parsed);
+
+        expect(`${row.place_id} inside: ${geometry.pointInGeometry(parsedGeometry, 0, band + 0.5)}`)
+          .toEqual(`${row.place_id} inside: true`);
+        expect(`${row.place_id} outside: ${geometry.pointInGeometry(parsedGeometry, 0, band + 5)}`)
+          .toEqual(`${row.place_id} outside: false`);
       }
     } finally {
       built.cleanup();
@@ -1327,18 +1339,29 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
         path.join(__dirname, '..', 'scripts', 'schema.sql'), 'utf8');
       await exec(fixture.db, schemaSql);
 
-      // Two features: one fully matched, and one with no admin1 row at
-      // all — the shape produced by the supported GEONAMES_INCLUDE_ADMIN1=0
-      // setting. See the join-preservation spec below.
+      // Seeded so every assertion below can actually fail:
+      // - 802 has no admin1 row at all (the shape a supported
+      //   GEONAMES_INCLUDE_ADMIN1=0 build produces);
+      // - 803's ASCII spelling differs from its name, so a view that
+      //   projected `name AS asciiname` would lose the match;
+      // - 804 and 805 share a name and differ only in population, so a
+      //   view projecting a constant or wrong population would rank them
+      //   wrongly.
       await exec(fixture.db, `
         INSERT INTO countries(id, name) VALUES ('XE', 'Ecotopia');
         INSERT INTO admin1(country_id, id, name) VALUES ('XE', 9, 'Cascade');
         INSERT INTO features(id, name, asciiname, country_id, admin1_id, population) VALUES
           (801, 'Matchedton', 'Matchedton', 'XE', 9, 40000),
-          (802, 'Adminless', 'Adminless', 'XE', NULL, 30000);
+          (802, 'Adminless', 'Adminless', 'XE', NULL, 30000),
+          (803, 'Fjördvik', 'Fjordvik', 'XE', 9, 55000),
+          (804, 'Pairtown', 'Pairtown', 'XE', 9, 700000),
+          (805, 'Pairtown', 'Pairtown', 'XE', 9, 9000);
         INSERT INTO coordinates(feature_id, latitude, longitude) VALUES
           (801, -33.25, 18.25),
-          (802, -33.75, 18.75);
+          (802, -33.75, 18.75),
+          (803, -34.25, 19.25),
+          (804, -34.75, 19.75),
+          (805, -35.25, 20.25);
       `);
       await close(fixture.db);
     });
@@ -1394,6 +1417,20 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
 
       const forward = await geocoder.forward('Adminless');
       expect(forward.id).toEqual(802);
+    });
+
+    // The view is where asciiname and population reach the forward
+    // reader, so project either wrongly and these two fail while every
+    // column check stays green.
+    it('surfaces asciiname and population through the view', async () => {
+      const geocoder = createGeocoder({ database: fixture.databasePath });
+
+      const alias = await geocoder.forward('Fjordvik');
+      expect(alias.id).toEqual(803);
+      expect(alias.name).toEqual('Fjördvik');
+
+      const ranked = await geocoder.forward('Pairtown');
+      expect(ranked.id).toEqual(804);
     });
   });
 });
@@ -1476,4 +1513,144 @@ describe('reader compatibility: geohash query range endpoints', () => {
     expect(geohash.encode(12.75, -61.25, 4)).toEqual(COARSE_CELL);
     expect(geohash.encode(12.25, -61.75, 7)).toEqual(FINE_CELL);
   });
+});
+
+// The GeoNames generator is more than its schema file. generate_geonames.sh
+// reshapes the upstream dumps with awk and loads them through SQLite's
+// positional `.import FILE TABLE`, so the field order of that awk output
+// has to line up with the column order scripts/schema.sql declares.
+//
+// That makes column order load-bearing for this one path even though it is
+// explicitly not binding for readers (they select by name), and nothing
+// else in this suite can see it: swapping latitude/longitude or
+// asciiname/population in either the awk print or the DDL leaves every
+// structural assertion green while producing databases full of
+// misassigned, reader-visible values.
+//
+// So run the real script over miniature local sources and let the reader
+// judge the result.
+describe('reader compatibility: GeoNames generator (scripts/generate_geonames.sh)', () => {
+  const GENERATOR = path.join(__dirname, '..', 'scripts', 'generate_geonames.sh');
+
+  // Upstream cities dumps are 19 tab-separated fields. Only these are
+  // read: 1 id, 2 name, 3 asciiname, 5 latitude, 6 longitude, 8 feature
+  // code, 9 country, 11 admin1, 15 population.
+  function cityRow(id, name, asciiname, latitude, longitude, featureCode, population) {
+    const fields = new Array(19).fill('');
+    fields[0] = String(id);
+    fields[1] = name;
+    fields[2] = asciiname;
+    fields[4] = String(latitude);
+    fields[5] = String(longitude);
+    fields[6] = 'P';
+    fields[7] = featureCode;
+    fields[8] = 'XH';
+    fields[10] = '07';
+    fields[14] = String(population);
+    fields[17] = 'Etc/UTC';
+    return fields.join('\t');
+  }
+
+  let dir;
+  let databasePath;
+  let generated;
+  let geocoder;
+
+  beforeAll(() => {
+    // The script drives the sqlite3 CLI, which is not a package
+    // dependency. Skip rather than fail where it is unavailable.
+    const probe = spawnSync('sqlite3', ['--version'], { encoding: 'utf8' });
+    if (probe.error || probe.status !== 0) {
+      generated = { skipped: true };
+      return;
+    }
+
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-compat-geonames-'));
+    const sourceDir = path.join(dir, '.geonames-build', 'source');
+    fs.mkdirSync(sourceDir, { recursive: true });
+
+    // Distinct latitude and longitude, an ASCII spelling that differs from
+    // the name, and two same-named places separated only by population —
+    // so a swap in any of those positions changes a reader's answer.
+    fs.writeFileSync(path.join(sourceDir, 'cities1000.txt'), [
+      cityRow(5001, 'Zürichbourg', 'Zurichbourg', 45.5, 9.25, 'PPLC', 250000),
+      cityRow(5002, 'Doubleton', 'Doubleton', 46.5, 9.75, 'PPLA', 800000),
+      cityRow(5003, 'Doubleton', 'Doubleton', 47.5, 10.25, 'PPLA', 12000)
+    ].join('\n') + '\n');
+
+    // countryInfo.txt: comment lines are stripped; ISO is field 1 and the
+    // country name is field 5.
+    const countryFields = new Array(19).fill('');
+    countryFields[0] = 'XH';
+    countryFields[4] = 'Helvetiana';
+    fs.writeFileSync(path.join(sourceDir, 'countryInfo.txt'),
+      '# ISO\tISO3\tISO-Numeric\tfips\tCountry\n' + countryFields.join('\t') + '\n');
+
+    // admin1CodesASCII.txt: "<country>.<id>" then the name.
+    fs.writeFileSync(path.join(sourceDir, 'admin1CodesASCII.txt'),
+      ['XH.07', 'Alpine Region', 'Alpine Region', '9999999'].join('\t') + '\n');
+
+    databasePath = path.join(dir, 'geonames.sqlite');
+    generated = spawnSync('bash', [GENERATOR, databasePath], {
+      encoding: 'utf8',
+      cwd: dir,
+      env: Object.assign({}, process.env, {
+        GEONAMES_DOWNLOAD: '0',
+        GEONAMES_WORKDIR: dir
+      })
+    });
+
+    geocoder = createGeocoder({ database: databasePath });
+  });
+
+  afterAll(() => {
+    if (dir) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function requireGenerated() {
+    if (generated.skipped) {
+      pending('sqlite3 CLI is not installed');
+      return false;
+    }
+    expect(`exit ${generated.status}: ${generated.stderr}`).toEqual('exit 0: ');
+    return true;
+  }
+
+  it('produces a database the schema assertions accept', async () => {
+    if (!requireGenerated()) return;
+    await expectSuperset(databasePath, FROZEN_COLUMNS.centroid);
+    await expectSuperset(databasePath, FROZEN_COLUMNS.centroidForward);
+  }, 30000);
+
+  it('imports coordinates into the columns the reader reads', async () => {
+    if (!requireGenerated()) return;
+    // Latitude 45.5 / longitude 9.25 — swapped on import, this point
+    // resolves to a different city or none at all.
+    const result = await geocoder.reverse(45.5, 9.25);
+    expect(result.id).toEqual(5001);
+    expect(result.name).toEqual('Zürichbourg');
+    expect(result.formatted).toEqual('Zürichbourg, Alpine Region, Helvetiana');
+    expect(result.coordinates).toEqual({ latitude: 45.5, longitude: 9.25 });
+  }, 30000);
+
+  it('imports the ASCII alias into asciiname', async () => {
+    if (!requireGenerated()) return;
+    const result = await geocoder.forward('Zurichbourg');
+    expect(result.id).toEqual(5001);
+    expect(result.name).toEqual('Zürichbourg');
+  }, 30000);
+
+  it('imports population where forward ranking can use it', async () => {
+    if (!requireGenerated()) return;
+    const result = await geocoder.forward('Doubleton');
+    expect(result.id).toEqual(5002);
+  }, 30000);
+
+  it('imports ids where location lookup can find them', async () => {
+    if (!requireGenerated()) return;
+    const result = await geocoder.location.find(5003);
+    expect(result.name).toEqual('Doubleton');
+  }, 30000);
 });
