@@ -569,6 +569,139 @@ describe('boundary builder home cell ownership', () => {
     });
   });
 
+  it('reports a shadowed centre even when the batch loses the cell it emitted', async () => {
+    await withTempDir(async (dir) => {
+      // Bigtown emits the coarse cell and loses it at the exact hash to a
+      // co-centred, more populous incumbent. It is still the rightful owner of
+      // the finer cell over its own centre - the horseshoe there is not
+      // centred in it at all - so the centre is shadowed. Deriving the paths
+      // to scan from the rows that survived the conflict resolver would skip
+      // Bigtown entirely and report nothing.
+      const coarseHash = 's000';
+      const cell = geohash.decodeBbox(coarseHash);
+      const ring = [
+        [cell.minLon, cell.minLat], [cell.maxLon, cell.minLat],
+        [cell.maxLon, cell.maxLat], [cell.minLon, cell.maxLat],
+        [cell.minLon, cell.minLat]
+      ];
+
+      const horseshoe = {
+        type: 'Feature',
+        id: 9201,
+        properties: {
+          name: 'Horseshoe', placetype: 'locality', country_id: 'US',
+          admin1_id: 1, is_current: 1, population: 300000
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[
+            [0.00, 0.00], [0.40, 0.00], [0.40, 0.20], [0.21, 0.20],
+            [0.21, 0.06], [0.19, 0.06], [0.19, 0.20], [0.00, 0.20], [0.00, 0.00]
+          ]]
+        }
+      };
+      // Owns the coarse cell and is centred in it, but somewhere else in it.
+      const rival = place({
+        id: 9202, name: 'Rival', placetype: 'locality', countryId: 'CA',
+        population: 800000,
+        minLon: cell.minLon, minLat: cell.minLat, maxLon: cell.maxLon, maxLat: cell.maxLat,
+        centroid: [0.03, 0.03]
+      });
+      const bigtown = {
+        type: 'Feature',
+        id: 9203,
+        properties: {
+          name: 'Bigtown', placetype: 'locality', country_id: 'MX',
+          admin1_id: 1, is_current: 1, population: 100000,
+          centroid_lat: 0.10, centroid_lon: 0.20
+        },
+        geometry: { type: 'Polygon', coordinates: [ring] }
+      };
+
+      const dbPath = path.join(dir, 'lost-coarse.sqlite');
+      expect(runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'first.geojson', [horseshoe, rival])
+      ].concat(commonFlags)).status).toEqual(0);
+
+      const appended = runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'bigtown.geojson', [bigtown]),
+        '--append'
+      ].concat(commonFlags));
+      expect(appended.status).toEqual(0);
+
+      // Bigtown really did lose every cell it emitted - the scan has to reach
+      // it without any surviving row of its own to start from.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const owned = await all(db, 'SELECT geohash FROM compact_geohash_lookup WHERE place_id = 9203');
+        expect(owned).toEqual([]);
+      } finally {
+        await close(db);
+      }
+
+      expect(appended.stdout).toContain('Home cells shadowed by a finer existing row: 1');
+    });
+  });
+
+  it('judges only the deepest stored row on a centroid path', async () => {
+    await withTempDir(async (dir) => {
+      // Three precisions, two stored owners on one path: a weak owner at
+      // precision 4 that the challenger outranks, and the real answer at
+      // precision 5 that outranks the challenger. A longest-prefix lookup only
+      // ever sees the deeper one, so the correct count is zero - judging each
+      // stored row on its own would report a shadow that no lookup can
+      // produce, and several nested rows would inflate one centre into many.
+      const deepFlags = ['--base-precision', '3', '--max-precision', '5', '--index-mode', 'compact'];
+      const outer = geohash.decodeBbox('s00');
+      const middle = geohash.decodeBbox('s000');
+      const inner = geohash.decodeBbox('s000s');
+
+      const weak = place({
+        id: 9301, name: 'Weak Owner', placetype: 'locality', countryId: 'US',
+        population: 100000,
+        minLon: middle.minLon, minLat: middle.minLat, maxLon: middle.maxLon, maxLat: middle.maxLat,
+        centroid: [0.02, 0.02]
+      });
+      const strong = place({
+        id: 9302, name: 'Strong Owner', placetype: 'locality', countryId: 'CA',
+        population: 800000,
+        minLon: inner.minLon, minLat: inner.minLat, maxLon: inner.maxLon, maxLat: inner.maxLat,
+        centroid: [0.105, 0.205]
+      });
+      const challenger = place({
+        id: 9303, name: 'Challenger', placetype: 'locality', countryId: 'MX',
+        population: 500000,
+        minLon: outer.minLon, minLat: outer.minLat, maxLon: outer.maxLon, maxLat: outer.maxLat,
+        centroid: [0.10, 0.20]
+      });
+
+      const dbPath = path.join(dir, 'deepest.sqlite');
+      expect(runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'stored.geojson', [weak, strong])
+      ].concat(deepFlags)).status).toEqual(0);
+
+      // Both stored rows really are on the challenger's centroid path.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const rows = await all(db, "SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash IN ('s000', 's000s')");
+        expect(rows.length).toEqual(2);
+      } finally {
+        await close(db);
+      }
+
+      const appended = runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'challenger.geojson', [challenger]),
+        '--append'
+      ].concat(deepFlags));
+      expect(appended.status).toEqual(0);
+      expect(appended.stdout).toContain('Home cells shadowed by a finer existing row: 0');
+    });
+  });
+
   it('resolves the home cell the same way in either append order', async () => {
     await withTempDir(async (dir) => {
       const bigInput = writeFixture(dir, 'big.geojson', [place(BIGVILLE)]);

@@ -16,6 +16,12 @@
   precision while this batch answers for that point only through a coarser
   cell. Reconciling stored owners across nested cells is not done, because the
   state does not occur in the data; the counter keeps that claim falsifiable.
+  It mirrors the runtime rather than the builder's bookkeeping: every place
+  with a valid home cell is scanned whether or not it won the cell it emitted,
+  only the deepest owner on each centroid path is judged (that is the only row
+  a longest-prefix lookup can return), the count is per place rather than per
+  row, and scan depth comes from the stored index rather than from this
+  batch's rows.
 - Give every place the geohash cell that contains its own centroid, ahead of
   the population tie-break, so a border town no longer loses its own centre to
   the larger city across the border (for example Calexico resolving to
