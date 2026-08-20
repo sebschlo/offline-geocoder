@@ -170,6 +170,23 @@ const FROZEN_EVERYTHING_COLUMNS = [
 // A fixture that gained, say, compact_places would quietly let a future
 // reader take the compact path against a database generation that never
 // had it — the precise failure these fixtures exist to prevent.
+// The compact placetype encoding, shared by two components that never see
+// each other: the builder writes these integers into
+// compact_places.placetype_code, and src/reverse.js hardcodes the same
+// numbers — both in its CASE that maps code back to a placetype name and
+// in SUPPORTED_PLACETYPE_CODES, which filters strictly to 0-3.
+//
+// Renumbering therefore breaks readers silently and structurally
+// invisibly: a database whose localities are written with a new code
+// resolves to nothing at all in a released reader, while every column
+// assertion in this file stays green.
+const FROZEN_PLACETYPE_CODES = {
+  locality: 0,
+  localadmin: 1,
+  region: 2,
+  county: 3
+};
+
 const FROZEN_OBJECTS = {
   centroid: ['admin1', 'coordinates', 'countries', 'everything', 'features'],
   full: [
@@ -281,11 +298,16 @@ function expectFrozenSchema(getDatabasePath, generation) {
 
 // Asserts a generated database still carries every frozen column.
 //
-// Compared directionally, matching the contract: name and declared type
-// must match exactly, and a column frozen as NOT NULL or PRIMARY KEY must
-// still be NOT NULL / PRIMARY KEY. Extra columns, and constraints added to
-// historically nullable columns, are allowed — tightening is reader-safe,
-// relaxing is not.
+// Columns are compared directionally: name and declared type must match
+// exactly, a column frozen as NOT NULL must stay NOT NULL, and extra
+// columns (or NOT NULL added to a historically nullable column) are
+// allowed, because that direction is reader-safe.
+//
+// The PRIMARY KEY is compared as a complete set instead, because a key is
+// not a per-column property: widening `PRIMARY KEY (geohash)` to
+// `PRIMARY KEY (geohash, place_id)` leaves every individual column still
+// flagged PK while destroying the uniqueness readers rely on — released
+// readers consume compact_geohash_lookup as one owner per hash.
 async function expectSuperset(databasePath, frozen) {
   for (const table of Object.keys(frozen)) {
     const actual = await readSignatures(databasePath, table);
@@ -305,9 +327,20 @@ async function expectSuperset(databasePath, frozen) {
       if (required.notnull && !match.row.notnull) {
         problems.push(`${required.name}: NOT NULL was relaxed to nullable`);
       }
-      if (required.pk && !match.row.pk) {
-        problems.push(`${required.name}: PRIMARY KEY was dropped`);
-      }
+    }
+
+    const frozenKey = frozen[table]
+      .map(parseSignature)
+      .filter((column) => column.pk)
+      .map((column) => column.name);
+    const actualKey = actual
+      .filter((column) => column.row.pk)
+      .sort((a, b) => a.row.pk - b.row.pk)
+      .map((column) => column.row.name);
+
+    if (actualKey.join(', ') !== frozenKey.join(', ')) {
+      problems.push(
+        `PRIMARY KEY (${actualKey.join(', ')}), expected (${frozenKey.join(', ')})`);
     }
 
     // Compared as strings so a failure names the table and every problem.
@@ -963,12 +996,12 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
     }]
   };
 
-  function build(indexMode) {
+  function build(indexMode, input, extraArgs) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `offline-geocoder-compat-build-${indexMode}-`));
     const inputPath = path.join(dir, 'input.geojson');
     const databasePath = path.join(dir, 'built.sqlite');
 
-    fs.writeFileSync(inputPath, JSON.stringify(INPUT));
+    fs.writeFileSync(inputPath, JSON.stringify(input || INPUT));
 
     const result = spawnSync('node', [
       BUILDER,
@@ -977,7 +1010,7 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
       '--base-precision', '4',
       '--max-precision', '5',
       '--index-mode', indexMode
-    ], { encoding: 'utf8' });
+    ].concat(extraArgs || []), { encoding: 'utf8' });
 
     return {
       status: result.status,
@@ -996,6 +1029,65 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
       // future widening of this table.
       await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactV2);
       await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactV2Population);
+    } finally {
+      built.cleanup();
+    }
+  }, 30000);
+
+  // The one piece of stored data that is contract rather than content:
+  // placetype_code is an encoding two components agree on without ever
+  // meeting (see FROZEN_PLACETYPE_CODES). Column checks cannot see a
+  // renumbering, so assert the emitted integers themselves.
+  it('emits the frozen placetype codes in --index-mode compact', async () => {
+    const placetypes = Object.keys(FROZEN_PLACETYPE_CODES);
+    const input = {
+      type: 'FeatureCollection',
+      features: placetypes.map((placetype, index) => ({
+        type: 'Feature',
+        id: 4001 + index,
+        properties: {
+          name: `Coded ${placetype}`,
+          placetype: placetype,
+          country_id: 'US',
+          admin1_id: 5,
+          is_current: 1,
+          population: 500000
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[
+            [index * 10, -2], [(index * 10) + 1, -2],
+            [(index * 10) + 1, 2], [index * 10, 2], [index * 10, -2]
+          ]]
+        }
+      }))
+    };
+
+    const built = build('compact', input, [
+      '--include-localadmin', 'true',
+      '--include-region', 'true',
+      '--include-county', 'true'
+    ]);
+
+    try {
+      expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
+
+      const db = new sqlite3.Database(built.databasePath);
+      let rows;
+      try {
+        rows = await all(db, 'SELECT name, placetype_code FROM compact_places ORDER BY id');
+      } finally {
+        await close(db);
+      }
+
+      const emitted = rows
+        .map((row) => `${row.name.replace('Coded ', '')}=${row.placetype_code}`)
+        .join(', ');
+      const expected = placetypes
+        .map((placetype) => `${placetype}=${FROZEN_PLACETYPE_CODES[placetype]}`)
+        .join(', ');
+
+      expect(emitted).toEqual(expected);
     } finally {
       built.cleanup();
     }
@@ -1025,6 +1117,20 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
       const schemaSql = fs.readFileSync(
         path.join(__dirname, '..', 'scripts', 'schema.sql'), 'utf8');
       await exec(fixture.db, schemaSql);
+
+      // Two features: one fully matched, and one with no admin1 row at
+      // all — the shape produced by the supported GEONAMES_INCLUDE_ADMIN1=0
+      // setting. See the join-preservation spec below.
+      await exec(fixture.db, `
+        INSERT INTO countries(id, name) VALUES ('XE', 'Ecotopia');
+        INSERT INTO admin1(country_id, id, name) VALUES ('XE', 9, 'Cascade');
+        INSERT INTO features(id, name, asciiname, country_id, admin1_id, population) VALUES
+          (801, 'Matchedton', 'Matchedton', 'XE', 9, 40000),
+          (802, 'Adminless', 'Adminless', 'XE', NULL, 30000);
+        INSERT INTO coordinates(feature_id, latitude, longitude) VALUES
+          (801, -33.25, 18.25),
+          (802, -33.75, 18.75);
+      `);
       await close(fixture.db);
     });
 
@@ -1052,6 +1158,27 @@ describe('reader compatibility: generated databases stay supersets of shipped ge
       const missing = FROZEN_EVERYTHING_COLUMNS.filter(
         (column) => names.indexOf(column) === -1);
       expect(`everything missing: ${missing.join(', ')}`).toEqual('everything missing: ');
+    });
+
+    // Structure is not the whole contract for a view: the join kind is.
+    // Turning `LEFT JOIN admin1` into an inner join keeps every output
+    // column in place while silently dropping rows, and a database built
+    // with the supported GEONAMES_INCLUDE_ADMIN1=0 setting has no admin1
+    // rows at all — so every place would vanish from centroid reverse,
+    // forward and id lookup at once.
+    it('keeps rows whose admin1 is missing visible through the view', async () => {
+      const geocoder = createGeocoder({ database: fixture.databasePath });
+
+      const reverse = await geocoder.reverse(-33.75, 18.75);
+      expect(reverse.id).toEqual(802);
+      expect(reverse.name).toEqual('Adminless');
+      expect(reverse.formatted).toEqual('Adminless, Ecotopia');
+
+      const found = await geocoder.location.find(802);
+      expect(found.name).toEqual('Adminless');
+
+      const forward = await geocoder.forward('Adminless');
+      expect(forward.id).toEqual(802);
     });
   });
 });

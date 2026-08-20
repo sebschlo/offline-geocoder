@@ -42,6 +42,21 @@ Builders (`scripts/generate_boundary_index.js` and friends):
   that might open the database knows about them; readers treat `NULL` as
   the pre-upgrade behavior.
 
+Not everything in the contract is a column. Two stored conventions are
+just as binding, because a reader and a builder that never meet have to
+agree on them:
+
+- **The `placetype_code` encoding** — `0` locality, `1` localadmin, `2`
+  region, `3` county. `src/reverse.js` hardcodes these numbers in its
+  code-to-name mapping *and* filters strictly to `0-3`, so renumbering
+  makes newly generated places invisible to every released reader while
+  the schema looks untouched.
+- **One owner per geohash** — `compact_geohash_lookup` and
+  `place_geohash_lookup` are keyed by `geohash` alone. Widening that key
+  lets several places claim one cell, which silently transfers the choice
+  of owner from the builder's ranking to whatever the reader's own
+  `ORDER BY` happens to prefer.
+
 ## Known schema generations
 
 Every generation that ever shipped stays supported. A generation may be
@@ -99,9 +114,38 @@ frozen rather than recomputed:
   `generate_boundary_index.js` in `--index-mode compact` and `--index-mode
   full`, and `scripts/schema.sql` (applied verbatim by
   `generate_geonames.sh`), which is checked against both the centroid and
-  the boundary tables it creates, plus the output columns of the
-  `everything` view that centroid, forward and id-lookup readers select
-  from.
+  the boundary tables it creates.
+- **The non-column conventions above are pinned too**: the emitted
+  `placetype_code` for each placetype, the primary key of each lookup
+  table compared as a complete set, and — because a view's structure says
+  nothing about which rows survive it — a feature with no `admin1` row
+  stays visible through `everything`, the shape a supported
+  `GEONAMES_INCLUDE_ADMIN1=0` build produces.
+
+### What this suite deliberately does not pin
+
+The test for inclusion is narrow on purpose: **something belongs here only
+if a released reader's observable output changes when it drifts.** A
+contract that tries to pin everything stops being a contract and becomes a
+second copy of the implementation, which then blocks legitimate work.
+
+Out of scope, deliberately:
+
+- **Builder curation policy** — which places are selected, the isolation,
+  rollup, pruning and ranking heuristics, and the resulting place counts.
+  These are meant to change as the data improves, and a database with
+  different places in it is still perfectly readable. They belong to
+  `spec/boundary_builder_spec.js` and `spec/boundary_builder_merge_spec.js`.
+- **Indexes and performance** — index existence and query plans. Readers
+  return identical results without them.
+- **SQLite engine behavior** — view column affinity, collation defaults
+  and version-specific PRAGMA output. Pinning these tests the host, not
+  the schema.
+- **Data content** — names, coordinates, populations and real-world
+  coverage.
+- **Defaults on generated databases** — a `DEFAULT` says what a builder
+  writes when it omits a column, which is builder-side behavior. Defaults
+  are still frozen on the fixtures.
 
 Rules for contributors:
 
