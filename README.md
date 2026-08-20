@@ -239,10 +239,12 @@ Builder notes:
   - `--region-max-precision`
   - `--region-sparse-max-precision` + `--region-sparse-min-area-km2` for very large sparse regions (for example geohash-3 in Amazon-like interiors)
 - `--promote-locality-over-region` (default `true`) prefers locality labels in shared parent cells when there is no competing locality (keeps city labels sticky against region-only outskirts)
+- `--home-cell-priority` (default `true`) gives a place the cell that contains its own centroid, ahead of the population tie-break, so a border town is not swallowed by the larger city across the border. Placetype ranking still applies first, and a cell holding two centroids is still decided by population. A centroid coordinate outside the place geometry does not receive this priority; this includes bounding-box midpoint fallbacks that land outside concave, holed, or multipart geometry. Because the index is walked by longest matching prefix, the claim is enforced across nested cells too: a place that owns the coarse cell holding its centroid also keeps the finer cells over that point. The dominant-city rollup keeps a foreign town's home cell for the same reason, whether that cell is the promoted parent or one of its descendants; rollups within one country are unaffected. This is a guarantee of the generated, uncurated database; an explicitly applied [curation overlay](curation/README.md) is the final labeling layer and may deliberately reassign matching cells, including an absorbed place's home cell
 - Dominant-city rollup keeps broad city labels sticky in mixed city/suburb cells unless there is competing major-city pressure:
   - `--dominant-locality-population` (default `100000`)
   - `--dominant-locality-ratio` (default `3`)
-  - `--dominant-city-placetypes` (default `locality,localadmin`) placetypes eligible to be the dominant city of a parent cell, whether it wins a competition or is the only city-like owner in that cell. A county wins cells like any other place, but naming a whole parent cell after it reads as a mistake, so it is excluded by default; add `county` to reproduce pre-1.1 builds
+  - `--dominant-city-placetypes` (default `locality,localadmin`) lists placetypes eligible to be the dominant city of a parent cell, whether one wins a competition or is the only city-like owner in that cell. A county still wins cells on its own merits but is excluded from naming a whole parent cell by default; explicitly adding `county` restores the earlier county rollup, including suppression of lower-ranked locality descendants
+  - Without that explicit county override, a rollup only folds a place into a better- or equally-ranked label, so a county cannot absorb a locality and strip the town of the cell holding its own centre
 - Parent-cell takeover guard:
   - `--parent-locality-min-share` (default `0.5`) requires locality ownership of at least that child-cell share before replacing a parent cell label
 - Excludes neighbourhood-like placetypes from default reverse output
@@ -281,6 +283,7 @@ Useful WOF build env vars:
 - `WOF_REGION_SPARSE_MAX_PRECISION` sparse very-large-region precision (default `3`)
 - `WOF_REGION_SPARSE_MIN_AREA_KM2` area threshold for sparse region precision (default `80000`)
 - `WOF_PROMOTE_LOCALITY_OVER_REGION=1|0` prefer locality labels over region in shared parent cells (default `1`)
+- `WOF_HOME_CELL_PRIORITY=1|0` let a place keep the cell that contains its own centroid (default `1`)
 - `WOF_DOMINANT_LOCALITY_POPULATION` major-locality threshold for dominant-city rollup (default `100000`)
 - `WOF_DOMINANT_LOCALITY_RATIO` dominant-vs-next locality population ratio (default `3`)
 - `WOF_DOMINANT_CITY_PLACETYPES` placetypes eligible to be a parent cell's dominant city (default `locality,localadmin`)

@@ -1,5 +1,43 @@
 ### Unreleased
 
+- Give every place the geohash cell that contains its own centroid, ahead of
+  the population tie-break, so a border town no longer loses its own centre to
+  the larger city across the border (for example Calexico resolving to
+  Mexicali, or Heerlen to Aachen). Placetype ranking is unchanged, and cells
+  holding two centroids are still decided by population. Disable with
+  `--home-cell-priority false` (`WOF_HOME_CELL_PRIORITY=0`). Centroid
+  coordinates outside the place geometry, including an exterior bounding-box
+  midpoint fallback, do not receive home-cell priority.
+- Stop the dominant-city rollup absorbing the home cell of a town in another
+  country, whether that cell is a descendant of the promoted parent or the
+  promoted parent itself. Rollups inside a country are unchanged, so a metro
+  still reads as one city.
+- Apply home-cell ownership across nested cover cells, not only within a single
+  hash. A place that owns the coarse cell holding its centroid now also keeps
+  the finer cells over that same point when a neighbour emits them, so the rule
+  holds for the longest-prefix lookup the runtime actually performs. Placetype
+  ranking still decides first, and no cell is added to the index.
+- By default, stop the dominant-city rollup suppressing or replacing a place
+  whose placetype it does not outrank, whether that place owns a descendant cell
+  or the promoted parent itself. A county could absorb the cell holding a town's
+  own centre, which is a downgrade the cell comparator would never make - and
+  because the rollup runs per batch, it left that cell undefended in an
+  `--append` build, so the next country written took it and the town's centre
+  resolved across the border (Douglas AZ reading as Agua Prieta; Mittelberg and
+  Riezlern, the Austrian Kleinwalsertal, reading as Oberstdorf). Rollups between
+  localities are unchanged; explicitly adding `county` to
+  `--dominant-city-placetypes` restores the earlier county suppression behavior.
+- Judge compact-index redundancy against the nearest kept ancestor cell instead
+  of any matching prefix. A row was dropped whenever some coarser cell named the
+  same place, even when a different place owned the cell in between, and the
+  lookup then answered with that other place.
+- Reconcile nested home cells from each place's own cover rather than from the
+  cells it happened to win, so a place that loses the cell holding its centroid
+  to a co-centred neighbour still carries its claim to the finer cells over that
+  point. The pass no longer depends on the order places are read.
+- Report the rollup and home-cell invariants in the build summary (promotions
+  refused, home cells reclaimed or kept, rows kept from a shadowing owner), so a
+  world build shows whether any of these rules ever fires.
 - Keep counties out of the dominant-city rollup. A parent geohash cell rolled
   up to the place that dominates its children on population, and `county`
   counted as a city-like placetype, so a metro could be labelled with its
@@ -7,7 +45,7 @@
   (Brockport and Greece, NY answering "Monroe"). The rollup now only hands a
   parent cell to a placetype listed in `--dominant-city-placetypes`
   (default `locality,localadmin`, env `WOF_DOMINANT_CITY_PLACETYPES`); add
-  `county` to that list to reproduce earlier builds. Counties still win cells
+  `county` to restore county eligibility. Counties still win cells
   through the normal comparator. Both routes into a parent cell -- winning the
   dominant-city competition, and being the only city-like owner in the cell --
   share one eligibility gate, so a county cannot take a parent cell through the

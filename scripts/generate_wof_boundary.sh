@@ -26,6 +26,7 @@ set -euo pipefail
 #   WOF_REGION_SPARSE_MAX_PRECISION  Sparse large-region precision (default: 3)
 #   WOF_REGION_SPARSE_MIN_AREA_KM2 Area threshold for sparse region precision (default: 80000)
 #   WOF_PROMOTE_LOCALITY_OVER_REGION Prefer locality labels over region in shared parent cells (default: 1)
+#   WOF_HOME_CELL_PRIORITY         Let a place keep the cell holding its own centroid (default: 1)
 #   WOF_DOMINANT_LOCALITY_POPULATION Major-locality threshold for dominant-city rollup (default: 100000)
 #   WOF_DOMINANT_LOCALITY_RATIO      Dominant-vs-next locality population ratio (default: 3)
 #   WOF_PARENT_LOCALITY_MIN_SHARE    Minimum child-cell share (0..1) required for locality parent takeover (default: 0.5)
@@ -70,6 +71,7 @@ WOF_REGION_MAX_PRECISION="${WOF_REGION_MAX_PRECISION:-4}"
 WOF_REGION_SPARSE_MAX_PRECISION="${WOF_REGION_SPARSE_MAX_PRECISION:-3}"
 WOF_REGION_SPARSE_MIN_AREA_KM2="${WOF_REGION_SPARSE_MIN_AREA_KM2:-80000}"
 WOF_PROMOTE_LOCALITY_OVER_REGION="${WOF_PROMOTE_LOCALITY_OVER_REGION:-1}"
+WOF_HOME_CELL_PRIORITY="${WOF_HOME_CELL_PRIORITY:-1}"
 WOF_DOMINANT_LOCALITY_POPULATION="${WOF_DOMINANT_LOCALITY_POPULATION:-100000}"
 WOF_DOMINANT_LOCALITY_RATIO="${WOF_DOMINANT_LOCALITY_RATIO:-3}"
 WOF_PARENT_LOCALITY_MIN_SHARE="${WOF_PARENT_LOCALITY_MIN_SHARE:-0.5}"
@@ -150,6 +152,7 @@ COMMON_FLAGS=(
   --region-sparse-max-precision "${WOF_REGION_SPARSE_MAX_PRECISION}"
   --region-sparse-min-area-km2 "${WOF_REGION_SPARSE_MIN_AREA_KM2}"
   --promote-locality-over-region "${WOF_PROMOTE_LOCALITY_OVER_REGION}"
+  --home-cell-priority "${WOF_HOME_CELL_PRIORITY}"
   --dominant-locality-population "${WOF_DOMINANT_LOCALITY_POPULATION}"
   --dominant-locality-ratio "${WOF_DOMINANT_LOCALITY_RATIO}"
   --parent-locality-min-share "${WOF_PARENT_LOCALITY_MIN_SHARE}"

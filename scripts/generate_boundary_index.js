@@ -22,6 +22,12 @@ const PLACETYPE_BY_CODE = {
   3: 'county'
 }
 
+// Precision used to precompute the geohash of a place centroid.  Geohashes are
+// hierarchical, so the cell containing a centroid at any precision <= this
+// value is a prefix of this string; 12 is deeper than any cover precision the
+// builder can emit.
+const HOME_CELL_PRECISION = 12
+
 // Placetypes allowed to play the "dominant city" role in the parent-cell
 // rollup. A county is a city-like placetype for ownership purposes, but naming
 // a metro after its county reads as a mistake, so counties are out by default.
@@ -99,6 +105,7 @@ function parseArgs(argv) {
     regionSparseMaxPrecision: null,
     regionSparseMinAreaKm2: null,
     promoteLocalityOverRegion: true,
+    homeCellPriority: true,
     dominantLocalityPopulation: 100000,
     dominantLocalityRatio: 3,
     parentLocalityMinShare: 0.5,
@@ -170,6 +177,8 @@ function parseArgs(argv) {
       opts.regionSparseMinAreaKm2 = Number.isFinite(sparseAreaKm2) && sparseAreaKm2 > 0 ? sparseAreaKm2 : null
     } else if (arg === '--promote-locality-over-region') {
       opts.promoteLocalityOverRegion = parseBool(argv[++i], true)
+    } else if (arg === '--home-cell-priority') {
+      opts.homeCellPriority = parseBool(argv[++i], true)
     } else if (arg === '--dominant-locality-population') {
       var dominantPopulation = Number(argv[++i])
       opts.dominantLocalityPopulation = Number.isFinite(dominantPopulation) ? dominantPopulation : opts.dominantLocalityPopulation
@@ -227,6 +236,7 @@ function usage() {
     '  --region-sparse-max-precision  Optional precision for very large region polygons (for example 3)',
     '  --region-sparse-min-area-km2   Area threshold to apply sparse region precision',
     '  --promote-locality-over-region Prefer locality over region in shared parent cells when no competing locality exists (default: true)',
+    '  --home-cell-priority <bool>    Let a place keep the cell containing its own centroid, ahead of the population tie-break (default: true)',
     '  --dominant-locality-population Population threshold that marks locality as major for dominant-city rollups (default: 100000)',
     '  --dominant-locality-ratio      Required dominant-vs-next population ratio for locality rollups (default: 3)',
     '  --parent-locality-min-share    Minimum child-cell share (0..1) required to let a locality take over a parent cell (default: 0.5)',
@@ -684,6 +694,17 @@ function normalizeFeature(feature, opts) {
 
   var bbox = geometry.geometryBbox(normalizedGeometry)
   var centroid = extractCentroid(properties, normalizedGeometry)
+  // Generic GeoJSON can omit an explicit centroid, in which case the bbox
+  // midpoint is only a storage fallback: for a concave, holed, or multipart
+  // shape it may not belong to the place at all. Keep the coordinates for the
+  // existing schema, but do not let an exterior point claim a home cell.
+  var homeGeohash = geometry.pointInGeometry(
+    normalizedGeometry,
+    centroid.latitude,
+    centroid.longitude
+  )
+    ? geohash.encode(centroid.latitude, centroid.longitude, HOME_CELL_PRECISION)
+    : null
   var countryId = extractCountryId(properties)
 
   var name = extractName(properties, feature)
@@ -720,6 +741,7 @@ function normalizeFeature(feature, opts) {
     placetypeCode: placetypeCode(placetype),
     centroidLat: centroid.latitude,
     centroidLon: centroid.longitude,
+    homeGeohash: homeGeohash,
     population: population,
     bboxMinLat: bbox.minLat,
     bboxMinLon: bbox.minLon,
@@ -945,11 +967,64 @@ function pointDistanceScore(latitude, longitude, targetLatitude, targetLongitude
     ((lon - targetLon) * (lon - targetLon) * scale)
 }
 
-function comparePlacesForHash(a, b, hash, hashCenterCache) {
+// A place owns the "home cell" of a geohash when its own centroid falls inside
+// that cell.  Cover cells are the terminal nodes of a quadtree walk and never
+// nest, so a place has at most one home cell in its own cover and this prefix
+// test is exact for every cell the comparator can be asked about.
+function ownsHomeCell(place, hash) {
+  if (!place || !hash) {
+    return false
+  }
+
+  var home = place.homeGeohash
+  if (typeof home !== 'string') {
+    return false
+  }
+
+  // Builds deeper than the precomputed precision encode the centroid at the
+  // cell's own length instead of silently dropping the claim.
+  if (home.length < hash.length) {
+    return geohash.encode(place.centroidLat, place.centroidLon, hash.length) === hash
+  }
+
+  return home.slice(0, hash.length) === hash
+}
+
+// Two places are foreign to each other only when both country ids are known
+// and differ; an unknown country is treated as "same country" so the rollup
+// keeps its current behaviour on records without one.
+function isForeignTo(place, other) {
+  if (!place || !other) {
+    return false
+  }
+
+  var placeCountry = place.countryId
+  var otherCountry = other.countryId
+  if (!placeCountry || !otherCountry) {
+    return false
+  }
+
+  return String(placeCountry).toUpperCase() !== String(otherCountry).toUpperCase()
+}
+
+function comparePlacesForHash(a, b, hash, hashCenterCache, homeCellPriority) {
   var typeRankA = placetypeRank(a.placetype)
   var typeRankB = placetypeRank(b.placetype)
   if (typeRankA !== typeRankB) {
     return typeRankA - typeRankB
+  }
+
+  // Within a placetype, a place that sits in the cell keeps it even when a
+  // bigger neighbour also covers it.  Without this, a border town loses the
+  // cell holding its own centroid to the larger city on the other side and
+  // resolves to the wrong country.  When both centroids share the cell the
+  // usual population ordering decides.
+  if (homeCellPriority) {
+    var homeA = ownsHomeCell(a, hash)
+    var homeB = ownsHomeCell(b, hash)
+    if (homeA !== homeB) {
+      return homeA ? -1 : 1
+    }
   }
 
   if (a.population !== b.population) {
@@ -1016,12 +1091,19 @@ function cellCandidateFromCompactRow(row) {
   var area = Number(row.area)
   if (!Number.isFinite(area) || area < 0) area = 0
 
+  var latitude = Number(row.latitude)
+  var longitude = Number(row.longitude)
+  var homeGeohash = Number.isFinite(latitude) && Number.isFinite(longitude)
+    ? geohash.encode(latitude, longitude, HOME_CELL_PRECISION)
+    : null
+
   return {
     id: Number(row.id),
     placetype: PLACETYPE_BY_CODE[Number(row.placetype_code)] || 'region',
     population: population,
-    centroidLat: Number(row.latitude),
-    centroidLon: Number(row.longitude),
+    centroidLat: latitude,
+    centroidLon: longitude,
+    homeGeohash: homeGeohash,
     area: area
   }
 }
@@ -1125,6 +1207,21 @@ function localityShareMeetsThreshold(localityId, group, opts) {
   return localityShareInParent(localityId, group) >= threshold
 }
 
+// Minor localities are folded into the dominant city, which is what makes a
+// metro read as one name.  The exception is a town in another country:
+// absorbing the cell holding its centroid would put its own centre on the
+// wrong side of a border, which no label choice can justify.  Intra-country
+// absorption is deliberate and stays untouched.
+function protectsForeignHomeCell(place, hash, dominantPlace, opts) {
+  if (!opts.homeCellPriority || !place) {
+    return false
+  }
+
+  return isCityPlacetypeCode(place.placetypeCode) &&
+    ownsHomeCell(place, hash) &&
+    isForeignTo(place, dominantPlace)
+}
+
 // The single gate for taking over a parent cell, shared by both roll-up paths
 // -- the lone city-like owner and the winner of a dominant-city competition --
 // so that neither can drift away from the other. A candidate qualifies only if
@@ -1143,15 +1240,108 @@ function localityMayTakeOverParent(localityId, group, placeById, opts) {
   return localityShareMeetsThreshold(localityId, group, opts)
 }
 
-function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
-  if (!opts.promoteLocalityOverRegion) {
-    return
+// The cell map is keyed by exact hash, so the comparator only ever ranks
+// places that emitted the *same* cell.  Cover cells never nest within one
+// place, but they do nest across places: a town can win the coarse cell that
+// holds its centroid while a neighbour emits a finer cell over the same point,
+// and the runtime's longest-prefix walk then answers with the neighbour.
+// Replay the ownership rule down the chain of cells containing the centroid so
+// the home-cell guarantee holds at lookup time, not merely per hash.  Only
+// existing cells are reassigned - no new cell is created, so this cannot grow
+// the index.
+function reconcileNestedHomeCells(bestByHash, placeById, opts) {
+  if (!opts.homeCellPriority) {
+    return 0
   }
 
+  // Collect every claim before applying any of it.  A claimant can lose its
+  // own cell to a coarser claimant partway through the pass, and reading the
+  // owner map as it mutates would then drop the displaced place's claim on the
+  // cells below - which made the result depend on the order places were read.
+  // Each cell is still settled by a running maximum under the comparator, so
+  // applying the claims in any order gives the same map.
+  var hashes = Object.keys(bestByHash)
+  var deepest = 0
+  for (var i = 0; i < hashes.length; i++) {
+    if (hashes[i].length > deepest) {
+      deepest = hashes[i].length
+    }
+  }
+
+  // Claims come from each place's own cover rather than from the cells it
+  // happens to have won.  When two places are centred in the same coarse cell
+  // the population tie-break gives it to one of them, but the loser still
+  // covers the finer cells over its centroid and still outranks a third place
+  // that is not centred there - reading claimants off the owner map would drop
+  // that claim entirely.
+  var claims = []
+  var placeIds = Object.keys(placeById)
+
+  for (var placeIndex = 0; placeIndex < placeIds.length; placeIndex++) {
+    var place = placeById[placeIds[placeIndex]]
+    if (!place || !place.cover) {
+      continue
+    }
+
+    // Cover cells never nest within one place, so at most one of them holds
+    // the centroid.
+    for (var coverIndex = 0; coverIndex < place.cover.length; coverIndex++) {
+      var coverHash = place.cover[coverIndex].geohash
+      if (ownsHomeCell(place, coverHash)) {
+        claims.push({ place: place, precision: coverHash.length })
+        break
+      }
+    }
+  }
+
+  var hashCenterCache = Object.create(null)
+  var reassigned = 0
+
+  for (var claimIndex = 0; claimIndex < claims.length; claimIndex++) {
+    var claimant = claims[claimIndex].place
+
+    for (var length = claims[claimIndex].precision + 1; length <= deepest; length++) {
+      var finerHash = geohash.encode(claimant.centroidLat, claimant.centroidLon, length)
+      var incumbentId = bestByHash[finerHash]
+      if (incumbentId === undefined || Number(incumbentId) === Number(claimant.id)) {
+        continue
+      }
+
+      var incumbent = placeById[String(incumbentId)]
+      if (!incumbent) {
+        continue
+      }
+
+      // Reassign only when the same comparator that governs a single cell
+      // would hand this one over, so placetype rank still outranks the home
+      // cell and a cell shared by two centroids keeps its population ordering.
+      if (comparePlacesForHash(claimant, incumbent, finerHash, hashCenterCache, true) < 0) {
+        bestByHash[finerHash] = claimant.id
+        reassigned += 1
+      }
+    }
+  }
+
+  return reassigned
+}
+
+function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
+  if (!opts.promoteLocalityOverRegion) {
+    return 0
+  }
+
+  var stats = {
+    refusedPromotions: 0,
+    refusedParentRankPromotions: 0,
+    promotionsShadowingAncestorHome: 0,
+    promotionsShadowingForeignAncestorHome: 0,
+    promotionsShadowingBetterRankedAncestorHome: 0,
+    foreignHomeProtectionsBelowRank: 0
+  }
   var minPrecision = Number(opts.basePrecision || 1)
   var maxPrecision = Number(opts.maxPrecision || minPrecision)
   if (maxPrecision <= minPrecision) {
-    return
+    return stats
   }
 
   for (var precision = maxPrecision - 1; precision >= minPrecision; precision--) {
@@ -1243,6 +1433,54 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
         }
       }
 
+      var dominantPlace = placeById[String(promotion.localityId)]
+
+      // The parent cell can itself be the home cell of a town across the
+      // border.  The descendant sweep below only visits hashes longer than
+      // `precision`, so without this check the promotion would overwrite that
+      // town's own centroid cell and never get the chance to protect it.
+      if (protectsForeignHomeCell(existingPlace, parentHash, dominantPlace, opts)) {
+        stats.refusedPromotions += 1
+        continue
+      }
+
+      // The same rank rule the descendant sweep applies: a rollup may not
+      // replace a place with a worse-ranked label.  A locality whose cover
+      // terminates at the parent has no descendant row for the sweep to
+      // protect, so without this its centroid would resolve to the county that
+      // dominated the children.
+      var parentOptedInDominantCounty = dominantPlace &&
+        dominantPlace.placetypeCode === PLACETYPE_CODES.county &&
+        isDominantCityPlacetypeCode(dominantPlace.placetypeCode, opts)
+
+      if (existingPlace && dominantPlace && !parentOptedInDominantCounty &&
+        placetypeRank(dominantPlace.placetype) > placetypeRank(existingPlace.placetype)) {
+        stats.refusedParentRankPromotions += 1
+        continue
+      }
+
+      // Diagnostic only: a promoted parent that did not exist before adds a
+      // longer prefix inside a coarser cell, which can shadow the centroid of
+      // the place that owns that coarser cell.
+      if (existingId === undefined) {
+        for (var ancestorLength = parentHash.length - 1; ancestorLength >= 1; ancestorLength--) {
+          var ancestorId = bestByHash[parentHash.slice(0, ancestorLength)]
+          if (ancestorId === undefined) continue
+
+          var ancestorPlace = placeById[String(ancestorId)]
+          if (ancestorPlace && ownsHomeCell(ancestorPlace, parentHash)) {
+            stats.promotionsShadowingAncestorHome += 1
+            if (isForeignTo(ancestorPlace, dominantPlace)) {
+              stats.promotionsShadowingForeignAncestorHome += 1
+            }
+            if (placetypeRank(ancestorPlace.placetype) <= placetypeRank(dominantPlace.placetype)) {
+              stats.promotionsShadowingBetterRankedAncestorHome += 1
+            }
+          }
+          break
+        }
+      }
+
       bestByHash[parentHash] = promotion.localityId
       promotedParents[parentHash] = promotion
     }
@@ -1277,13 +1515,44 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
         continue
       }
 
+      var promotedPlace = placeById[String(promoted.localityId)]
+      var protectedHomeCell = protectsForeignHomeCell(
+        descendantPlace,
+        descendantHash,
+        promotedPlace,
+        opts
+      )
+
+      // Diagnostic only: the foreign-home exception keeping a row whose
+      // placetype ranks below the place promoted over it.
+      if (protectedHomeCell && promotedPlace &&
+        placetypeRank(descendantPlace.placetype) > placetypeRank(promotedPlace.placetype)) {
+        stats.foreignHomeProtectionsBelowRank += 1
+      }
+
+      // The rollup normally folds a place only into a better- or equally-ranked
+      // label. A county absorbing a locality is a downgrade the comparator
+      // would never make, so counties are excluded from the dominant role by
+      // default. Explicitly listing `county` in --dominant-city-placetypes is
+      // the compatibility escape hatch that restores the earlier suppression
+      // behavior, including over lower-ranked locality descendants.
+      var dominantOutranks = promotedPlace &&
+        placetypeRank(promotedPlace.placetype) <= placetypeRank(descendantPlace.placetype)
+      var optedInDominantCounty = promotedPlace &&
+        promotedPlace.placetypeCode === PLACETYPE_CODES.county &&
+        isDominantCityPlacetypeCode(promotedPlace.placetypeCode, opts)
+
       if (promoted.suppressMinorLocalities &&
         isCityPlacetypeCode(descendantPlace.placetypeCode) &&
-        !isMajorLocality(descendantPlace, opts)) {
+        !isMajorLocality(descendantPlace, opts) &&
+        (dominantOutranks || optedInDominantCounty) &&
+        !protectedHomeCell) {
         delete bestByHash[descendantHash]
       }
     }
   }
+
+  return stats
 }
 
 function buildCompactLookupRows(places, opts) {
@@ -1301,7 +1570,7 @@ function buildCompactLookupRows(places, opts) {
       var cell = place.cover[j]
       var hash = cell.geohash
       var current = bestByHash[hash]
-      if (!current || comparePlacesForHash(place, current, hash, hashCenterCache) < 0) {
+      if (!current || comparePlacesForHash(place, current, hash, hashCenterCache, opts.homeCellPriority) < 0) {
         bestByHash[hash] = place
       }
     }
@@ -1314,7 +1583,11 @@ function buildCompactLookupRows(places, opts) {
     bestByHashId[currentHash] = bestByHash[currentHash].id
   }
 
-  promoteLocalityParentsByRegionCompetition(bestByHashId, placeById, opts)
+  // Runs before the rollup so the metro rollup keeps the last word on which
+  // cells a dominant city absorbs inside its own country.
+  var nestedHomeCellFixes = reconcileNestedHomeCells(bestByHashId, placeById, opts)
+
+  var rollupStats = promoteLocalityParentsByRegionCompetition(bestByHashId, placeById, opts)
 
   var rows = Object.keys(bestByHashId).map(function(hash) {
     return {
@@ -1334,21 +1607,34 @@ function buildCompactLookupRows(places, opts) {
 
   var compact = []
   var selectedByHash = Object.create(null)
+  var shadowedRowsKept = 0
 
   for (var index = 0; index < rows.length; index++) {
     var row = rows[index]
-    var redundant = false
 
-    for (var precision = 1; precision < row.geohash.length; precision++) {
-      var prefix = row.geohash.slice(0, precision)
-      if (selectedByHash[prefix] === row.placeId) {
-        redundant = true
+    // Only the *nearest* kept ancestor decides whether a row can be dropped.
+    // The runtime answers with the longest matching prefix, so a row is
+    // redundant only when the cell that would answer in its place already
+    // names the same place.  Matching any ancestor drops rows that a nearer,
+    // different owner shadows, and the lookup then returns that other place.
+    var nearestAncestor
+    for (var precision = row.geohash.length - 1; precision >= 1; precision--) {
+      var ancestor = selectedByHash[row.geohash.slice(0, precision)]
+      if (ancestor !== undefined) {
+        nearestAncestor = ancestor
         break
       }
     }
 
-    if (redundant) {
+    if (nearestAncestor === row.placeId) {
       continue
+    }
+
+    for (var farther = row.geohash.length - 1; farther >= 1; farther--) {
+      if (selectedByHash[row.geohash.slice(0, farther)] === row.placeId) {
+        shadowedRowsKept += 1
+        break
+      }
     }
 
     selectedByHash[row.geohash] = row.placeId
@@ -1357,7 +1643,10 @@ function buildCompactLookupRows(places, opts) {
 
   return {
     rows: compact,
-    placeById: placeById
+    placeById: placeById,
+    nestedHomeCellFixes: nestedHomeCellFixes,
+    rollupStats: rollupStats,
+    shadowedRowsKept: shadowedRowsKept
   }
 }
 
@@ -1368,7 +1657,7 @@ function buildCompactLookupRows(places, opts) {
 // used within a batch and keep the better match. Cells owned by places that
 // are part of the current batch are always rewritten, because their rows are
 // deleted and replaced by this run.
-async function resolveExistingCellConflicts(db, rows, placeById, batchPlaceIds) {
+async function resolveExistingCellConflicts(db, rows, placeById, batchPlaceIds, homeCellPriority) {
   if (!rows.length) {
     return { rows: rows, skipped: 0 }
   }
@@ -1419,7 +1708,7 @@ async function resolveExistingCellConflicts(db, rows, placeById, batchPlaceIds) 
     var incumbent = cellCandidateFromCompactRow(existing)
     var challenger = placeById[String(row.placeId)]
 
-    if (!challenger || comparePlacesForHash(incumbent, challenger, row.geohash, hashCenterCache) <= 0) {
+    if (!challenger || comparePlacesForHash(incumbent, challenger, row.geohash, hashCenterCache, homeCellPriority) <= 0) {
       skipped += 1
       return
     }
@@ -1998,7 +2287,7 @@ async function main() {
         batchPlaceIds[String(place.id)] = true
       })
 
-      var resolved = await resolveExistingCellConflicts(db, compactBuild.rows, compactBuild.placeById, batchPlaceIds)
+      var resolved = await resolveExistingCellConflicts(db, compactBuild.rows, compactBuild.placeById, batchPlaceIds, options.homeCellPriority)
       compactLookupRows = resolved.rows
       lookupRowsDeferred = resolved.skipped
     }
@@ -2036,6 +2325,18 @@ async function main() {
     if (options.includeRegion) modeLabel += ' + region'
     console.log('Mode: ' + modeLabel)
     console.log('Precision: ' + options.basePrecision + ' -> ' + options.maxPrecision)
+    console.log('Home cell priority: ' + (options.homeCellPriority ? 'true' : 'false'))
+    if (compactBuild) {
+      console.log('Home cells kept from a nested foreign cell: ' + (compactBuild.nestedHomeCellFixes || 0))
+      var rollup = compactBuild.rollupStats || {}
+      console.log('Parent promotions refused over a foreign home cell: ' + (rollup.refusedPromotions || 0))
+      console.log('Parent promotions refused on placetype rank: ' + (rollup.refusedParentRankPromotions || 0))
+      console.log('Promotions shadowing an ancestor home cell: ' + (rollup.promotionsShadowingAncestorHome || 0) +
+        ' (foreign ' + (rollup.promotionsShadowingForeignAncestorHome || 0) +
+        ', better-ranked ' + (rollup.promotionsShadowingBetterRankedAncestorHome || 0) + ')')
+      console.log('Foreign home cells kept below the promoted rank: ' + (rollup.foreignHomeProtectionsBelowRank || 0))
+      console.log('Rows kept from a nearer shadowing owner: ' + (compactBuild.shadowedRowsKept || 0))
+    }
     console.log('Placetype precision caps: locality=' + options.localityMaxPrecision + ', localadmin=' + options.localadminMaxPrecision + ', county=' + options.countyMaxPrecision + ', region=' + options.regionMaxPrecision)
     if (Number.isFinite(options.regionSparseMaxPrecision) && Number.isFinite(options.regionSparseMinAreaKm2)) {
       console.log('Sparse region rule: area_km2>=' + options.regionSparseMinAreaKm2 + ' => max_precision=' + options.regionSparseMaxPrecision)
