@@ -1,0 +1,31 @@
+{
+  "country": "MT",
+  "entries": [
+    {
+      "op": "merge",
+      "into": 101752447,
+      "absorb": [101912869],
+      "absorbForeignTagged": true,
+      "minPrecision": 5,
+      "rationale": "Who's On First carries a duplicate of Mellieħa (101912869) inside whosonfirst-data-admin-ml, the Mali repository: the record has Malta's coordinates (35.9707, 14.3656), Malta's name and Malta's population (5976, identical to the Maltese record 101752447), but wof:country ML, iso:country ML, wof:parent_id -1 and a hierarchy containing nothing but Mali's country id. It is a misfiled record, not a place in Mali. Because it is the only owner of the cells over northern Mellieħa, reverse geocoding there answers with a Malian id while forward search answers with the Maltese one, so a resident and someone picking the town out of search receive different city keys and cannot be grouped together. This needs curation rather than a build rule because every generic rule that could catch it was tried against the world build and measured: (1) flagging places far from any same-country neighbour is useless here, since the four misfiled Maltese records sit beside each other and their nearest ML neighbour is 1 km away, and it is unsafe anyway - 973 places world-wide are more than 100 km from a same-country neighbour and are entirely legitimate (Svalbard, Bonaire, French Polynesia); (2) flagging places with no admin1 parent touches only 20 localities world-wide, but they include Lilongwe, Banjul, Honiara and Tarawa, so it would drop capitals; (3) validating the country tag against the country polygon holding the centroid is impossible from this dataset, because whosonfirst-data-admin-* repositories ship no country records at all - 0 in Mali's 15,060 files, 0 in Malta's 395; (4) matching cross-country duplicates on name and population is narrow enough (14 pairs world-wide, 4 with identical population) but misses this very record, because 'ħ' has no Unicode decomposition to 'h' and the two names never normalise equal. The defect is in one upstream record and only a statement about that record can fix it.",
+      "probes": [
+        { "lat": 35.958386, "lon": 14.367172, "expect": "Mellieha", "note": "Mellieħa's own centre; must be the Maltese record, not the Mali-tagged clone" },
+        { "lat": 35.939221, "lon": 14.400375, "expect": "San Pawl Il-Bahar", "note": "guard: the neighbouring Maltese locality keeps its own identity" },
+        { "lat": 12.650000, "lon": -8.000000, "expect": "Bamako", "country": "ML", "note": "guard: Mali itself is untouched - absorbing a misfiled record must not reach real Malian places" }
+      ]
+    },
+    {
+      "op": "merge",
+      "into": 101752441,
+      "absorb": [101846471],
+      "absorbForeignTagged": true,
+      "minPrecision": 5,
+      "rationale": "The same defect, same repository: Naxxar (101846471) is filed under Mali with Malta's coordinates (35.9418, 14.4590) and Malta's population (10378, identical to the Maltese locality 101752441), and it owns the cell over north-eastern Naxxar outright, so every point in that cell reverse-geocodes into Mali. The target is 101752441 rather than the other Maltese record of the same name (101846467), because 101752441 is parented to the Naxxar region 85686937 while 101846467 is parented to Gharghur, which does not describe it. Two further Mali-tagged records inside Malta's bounding box are deliberately left out. San Giljan 101752435 owns no cells in the world build, so it can produce no wrong answer and absorbing it would be a no-op that only adds a claim to review; Xghajra 101846463 has a population of 837 and does not survive the build's population floor at all. Both are recorded here so a future contributor can see they were considered rather than missed - if a later build gives either of them cells, they belong in this file.",
+      "probes": [
+        { "lat": 35.969238, "lon": 14.436035, "expect": "Naxxar", "note": "centre of the cell the Mali-tagged record owned; must be the Maltese Naxxar" },
+        { "lat": 35.939221, "lon": 14.400375, "expect": "San Pawl Il-Bahar", "note": "guard: the merge must not reach west into San Pawl Il-Bahar" },
+        { "lat": 16.270000, "lon": -0.050000, "expect": "Gao", "country": "ML", "note": "guard: real Malian places keep their own labels" }
+      ]
+    }
+  ]
+}

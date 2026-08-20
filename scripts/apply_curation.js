@@ -10,8 +10,8 @@ const SUPPORTED_OPS = ['merge']
 const MIN_PRECISION_FLOOR = 1
 const MIN_PRECISION_CEILING = 12
 
-const ENTRY_KEYS = ['op', 'into', 'absorb', 'minPrecision', 'rationale', 'probes']
-const PROBE_KEYS = ['lat', 'lon', 'expect', 'note']
+const ENTRY_KEYS = ['op', 'into', 'absorb', 'absorbForeignTagged', 'minPrecision', 'rationale', 'probes']
+const PROBE_KEYS = ['lat', 'lon', 'expect', 'country', 'note']
 const DOCUMENT_KEYS = ['country', 'entries']
 
 function parseArgs(argv) {
@@ -146,10 +146,18 @@ function validateProbe(probe, label) {
     throw new Error(label + ': "note" must be a non-empty string when present')
   }
 
+  // A probe may name the country its expected label belongs to, so a guard can
+  // assert that a coordinate still resolves into a *different* country than
+  // the file curates. Defaults to the file's own country.
+  if (probe.country !== undefined && (typeof probe.country !== 'string' || !/^[A-Z]{2}$/.test(probe.country))) {
+    throw new Error(label + ': "country" must be a two-letter uppercase ISO code when present')
+  }
+
   return {
     lat: lat,
     lon: lon,
     expect: probe.expect.trim(),
+    country: probe.country || null,
     note: probe.note ? probe.note.trim() : null
   }
 }
@@ -192,6 +200,10 @@ function validateEntry(entry, label) {
       MIN_PRECISION_FLOOR + ' and ' + MIN_PRECISION_CEILING)
   }
 
+  if (entry.absorbForeignTagged !== undefined && typeof entry.absorbForeignTagged !== 'boolean') {
+    throw new Error(label + ': "absorbForeignTagged" must be a boolean when present')
+  }
+
   if (typeof entry.rationale !== 'string' || !entry.rationale.trim()) {
     throw new Error(label + ': "rationale" must be a non-empty string explaining the judgment call')
   }
@@ -209,6 +221,7 @@ function validateEntry(entry, label) {
     op: entry.op,
     into: into,
     absorb: absorb,
+    absorbForeignTagged: Boolean(entry.absorbForeignTagged),
     minPrecision: entry.minPrecision,
     rationale: entry.rationale.trim(),
     probes: probes
@@ -415,14 +428,25 @@ async function assertPlaceIdsExist(db, entries) {
   // A referenced id must exist AND belong to the file's declared country: a
   // typo'd id that happens to identify a real place in another country must
   // not silently relabel that foreign place's cells.
+  //
+  // The one exception is a record whose own country tag is the defect - a
+  // place filed under the wrong country while carrying this country's
+  // coordinates. Absorbing it needs "absorbForeignTagged": true, so it is
+  // always a visible, reviewed decision rather than the result of a typo. The
+  // target is never exempt: a file can still only ever produce labels for the
+  // country it is named for.
   function checkId(id, role, entry, problems) {
     var label = entry.source + ' entry ' + entry.index
     if (countryById[id] === undefined) {
       problems.push('place id ' + id + ' ("' + role + '", ' + label + ') not found in compact_places')
-    } else if (countryById[id] !== entry.country) {
-      problems.push('place id ' + id + ' ("' + role + '", ' + label + ') belongs to country ' +
-        (countryById[id] || '<none>') + ', not ' + entry.country)
+      return
     }
+    if (countryById[id] === entry.country) return
+    if (role === 'absorb' && entry.absorbForeignTagged) return
+
+    problems.push('place id ' + id + ' ("' + role + '", ' + label + ') belongs to country ' +
+      (countryById[id] || '<none>') + ', not ' + entry.country +
+      (role === 'absorb' ? '; set "absorbForeignTagged": true if the record is misfiled under that country' : ''))
   }
 
   var problems = []
@@ -465,25 +489,26 @@ async function assertGuardProbes(db, entries) {
 
     for (var j = 0; j < entry.probes.length; j++) {
       var probe = entry.probes[j]
-      if (probe.expect === intoName) {
+      var probeCountry = probe.country || entry.country
+      if (probe.expect === intoName && probeCountry === entry.country) {
         hasPositive = true
       } else {
         hasGuard = true
       }
 
-      var nameKey = entry.country + '|' + probe.expect
+      var nameKey = probeCountry + '|' + probe.expect
       if (nameExistsCache[nameKey] === undefined) {
         var rows = await dbAll(db, `
           SELECT COUNT(*) AS count
           FROM compact_places
           WHERE name = ?
             AND UPPER(country_id) = ?
-        `, [probe.expect, entry.country])
+        `, [probe.expect, probeCountry])
         nameExistsCache[nameKey] = Boolean(rows.length && rows[0].count > 0)
       }
       if (!nameExistsCache[nameKey]) {
         problems.push(entry.source + ' entry ' + entry.index + ': probes[' + j + '] expects "' +
-          probe.expect + '", which does not name any place in country ' + entry.country)
+          probe.expect + '", which does not name any place in country ' + probeCountry)
       }
     }
 
@@ -1008,6 +1033,16 @@ async function entryHasDrainedCells(db, entry) {
 // Completeness: an entry that relabeled cells must have at least one passing
 // positive probe resolving from those cells, or its own effect was never
 // tested (a positive probe can otherwise pass on target-native territory).
+var placeCountryCache = Object.create(null)
+
+async function placeCountry(db, id) {
+  if (placeCountryCache[id] === undefined) {
+    var rows = await dbAll(db, 'SELECT country_id FROM compact_places WHERE id = ?', [id])
+    placeCountryCache[id] = rows.length ? String(rows[0].country_id || '').toUpperCase() : null
+  }
+  return placeCountryCache[id]
+}
+
 async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvability) {
   var createGeocoder = require('../src/index.js')
   var geocoder = createGeocoder({
@@ -1045,14 +1080,23 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       // They must also resolve FROM A LOOKUP CELL: the nearest-centroid
       // fallback can return the target itself for a coordinate no cell
       // covers, which would pass without exercising any relabeled cell.
-      var isPositive = probe.expect === intoName
+      var probeCountry = probe.country || entry.country
+      var isPositive = probe.expect === intoName && probeCountry === entry.country
+      // A country-qualified probe must resolve into that country, so a guard
+      // cannot be satisfied by a same-named place on the other side of it. The
+      // country comes from the database rather than the reverse result, whose
+      // shape differs between reader modes.
+      var resolvedCountry = result && result.id !== undefined
+        ? await placeCountry(db, result.id)
+        : null
+      var countryMatches = !probe.country || resolvedCountry === probeCountry
       var idMatches = !isPositive || Boolean(result && Number(result.id) === entry.into)
       var pathMatches = !isPositive || resolvedVia === 'geohash_lookup'
       var territory = isPositive
         ? await probeTerritory(db, entry, probe, boundary)
         : { onDrainedCell: false, throughDrainedCell: false }
 
-      if (actual === probe.expect && idMatches && pathMatches) {
+      if (actual === probe.expect && idMatches && pathMatches && countryMatches) {
         console.log('PASS ' + context + ' -> "' + actual + '"')
         passed += 1
         if (territory.throughDrainedCell) {
@@ -1061,9 +1105,9 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
         continue
       }
 
-      var expectKey = entry.country + '|' + probe.expect
+      var expectKey = probeCountry + '|' + probe.expect
       if (expectOwnsCache[expectKey] === undefined) {
-        expectOwnsCache[expectKey] = await expectedPlaceOwnsCells(db, probe.expect, entry.country)
+        expectOwnsCache[expectKey] = await expectedPlaceOwnsCells(db, probe.expect, probeCountry)
       }
 
       // A positive probe can end up on a cell still owned by an absorbed
@@ -1086,7 +1130,7 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       var reasons = []
       if (!misplacedPositive) {
         if (!expectOwnsCache[expectKey]) {
-          reasons.push('expected place "' + probe.expect + '" (' + entry.country + ') owns no cells in this database yet')
+          reasons.push('expected place "' + probe.expect + '" (' + probeCountry + ') owns no cells in this database yet')
         }
         if (missingSources.length && isPositive && !territory.onDrainedCell) {
           reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells at precision >= ' + entry.minPrecision + ' in this database yet')
@@ -1109,6 +1153,9 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
           territory.matched.place_id + ' because it is below this entry\'s minPrecision ' + entry.minPrecision +
           '); this probe stands on ground the merge deliberately leaves alone, so it can never pass' +
           ' — move it onto a cell the entry relabels, or make it a guard probe expecting "' + actual + '"'
+      } else if (actual === probe.expect && !countryMatches) {
+        hint = ' — resolved to a place named "' + actual + '" in ' +
+          (resolvedCountry || '?') + ', not ' + probeCountry
       } else if (actual === probe.expect && !idMatches) {
         got = '"' + actual + '" (same-named place ' + (result && result.id) + ', not the merge target ' + entry.into + ')'
       } else if (actual === probe.expect && !pathMatches) {
