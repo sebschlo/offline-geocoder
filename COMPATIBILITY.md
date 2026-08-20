@@ -42,20 +42,32 @@ Builders (`scripts/generate_boundary_index.js` and friends):
   that might open the database knows about them; readers treat `NULL` as
   the pre-upgrade behavior.
 
-Not everything in the contract is a column. Two stored conventions are
+Not everything in the contract is a column. These stored conventions are
 just as binding, because a reader and a builder that never meet have to
 agree on them:
 
-- **The `placetype_code` encoding** — `0` locality, `1` localadmin, `2`
-  region, `3` county. `src/reverse.js` hardcodes these numbers in its
-  code-to-name mapping *and* filters strictly to `0-3`, so renumbering
-  makes newly generated places invisible to every released reader while
-  the schema looks untouched.
+- **The placetype encoding, in both representations** — compact databases
+  store `placetype_code` as `0` locality, `1` localadmin, `2` region, `3`
+  county; full and compact-legacy databases store `placetype` as those
+  same four strings. `src/reverse.js` hardcodes both forms — the integers
+  in its code-to-name mapping and its strict `0-3` filter, the strings in
+  `SUPPORTED_PLACETYPES` — so renaming or renumbering makes newly
+  generated places invisible to every released reader while the schema
+  looks untouched.
 - **One owner per geohash** — `compact_geohash_lookup` and
   `place_geohash_lookup` are keyed by `geohash` alone. Widening that key
   lets several places claim one cell, which silently transfers the choice
   of owner from the builder's ranking to whatever the reader's own
-  `ORDER BY` happens to prefer.
+  `ORDER BY` happens to prefer. Key column *order* is not part of this:
+  reordering a composite key preserves uniqueness exactly.
+- **JSON-encoded GeoJSON geometry** — `place_geometry.encoding` is `json`
+  and the payload is a `MultiPolygon` of `[lon, lat]` rings.
+  `loadPlaceGeometries` selects `encoding` but always `JSON.parse`s the
+  blob, so a new representation breaks polygon containment in released
+  readers no matter what the column says.
+- **The geohash query range** — readers query every precision from
+  `basePrecision` to `maxPrecision` (4-7 by default), so a database may
+  store a cell at any precision in that range and expect it to be found.
 
 ## Known schema generations
 
@@ -69,6 +81,7 @@ so the reader-side guarantee is pinned ahead of the merge. Newest first:
 | 3 | Compact v2 | Shipped | `compact_places` + `compact_geohash_lookup` | Seven-column `compact_places` (`id`, `name`, `country_id`, `admin1_id`, `placetype_code`, `latitude`, `longitude`). This is the generation bundled in shipped apps. No stored country display name — the reader uses `country_id` and resolves the admin1 name via a self-join on the region row. |
 | 2 | Compact legacy | Shipped | `places` + `place_geohash_lookup` | Full-width `places` table with a flat geohash-to-place lookup; the reader joins `countries`/`admin1` for display names. |
 | 1 | Full boundary | Shipped | `places` + `place_geohash_cover` + `place_geometry` | Runtime point-in-polygon over stored geometry. `place_geohash_lookup` exists but may be empty; the reader tries the compact lookup first and falls through to the polygon path. |
+| 0b | Centroid + forward | Shipped | Generation 0 plus `features.asciiname` and `features.population`, both surfaced by the `everything` view | The widened base schema `scripts/schema.sql` produces today, and the generation that made forward geocoding possible. `src/forward.js` probes for `asciiname` to decide whether a database supports forward search at all, and ranks every match by `population DESC`. |
 | 0 | Centroid-only (v1.0.0) | Shipped | `features` + `coordinates` + `countries` + `admin1` + `everything` view | The originally released schema: four-column `features` (no `asciiname`, no `population`) and no boundary tables. Centroid reverse and id lookup work; forward geocoding feature-detects the missing columns and returns `undefined`; a boundary-mode reader falls through to the centroid path. |
 
 The boundary generations (1–4) may additionally carry the GeoNames base
@@ -113,14 +126,26 @@ frozen rather than recomputed:
   happens to support both layouts. Every generator is exercised:
   `generate_boundary_index.js` in `--index-mode compact` and `--index-mode
   full`, and `scripts/schema.sql` (applied verbatim by
-  `generate_geonames.sh`), which is checked against both the centroid and
-  the boundary tables it creates.
+  `generate_geonames.sh`), which is checked against the centroid, widened
+  centroid and boundary tables it creates.
 - **The non-column conventions above are pinned too**: the emitted
-  `placetype_code` for each placetype, the primary key of each lookup
-  table compared as a complete set, and — because a view's structure says
-  nothing about which rows survive it — a feature with no `admin1` row
-  stays visible through `everything`, the shape a supported
-  `GEONAMES_INCLUDE_ADMIN1=0` build produces.
+  `placetype_code` *and* `placetype` string for every placetype, the
+  `json`/GeoJSON representation the builder writes into `place_geometry`,
+  the primary key of each lookup table compared as an unordered set,
+  lookup keys stored at both ends of the 4-7 precision range, and —
+  because a view's structure says nothing about which rows survive it — a
+  feature with no `admin1` row staying visible through `everything`, the
+  shape a supported `GEONAMES_INCLUDE_ADMIN1=0` build produces.
+
+Taken together the enforced surface is **complete for the reader-observable
+contract** as it stands: every generation that has shipped has a permanent
+fixture, every generator that writes a database is checked against the
+generations it must keep producing, every value a reader parses or compares
+rather than merely reads is pinned, and the geohash query range is
+exercised at both endpoints. This set is finished rather than arbitrarily
+stopped — if it grows, it should be because the library gained a new
+generation, generator, or reader-parsed encoding, not because the same
+surface was re-examined.
 
 ### What this suite deliberately does not pin
 
