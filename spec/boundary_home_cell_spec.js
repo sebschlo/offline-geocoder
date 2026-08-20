@@ -400,6 +400,75 @@ describe('boundary builder home cell ownership', () => {
     });
   });
 
+  it('does not restore a home claim for a centroid outside its own geometry', async () => {
+    await withTempDir(async (dir) => {
+      // A place whose centroid falls outside its own shape gets no home cell:
+      // normalization checks the point against the geometry. That decision has
+      // to survive being written to the database, because an --append batch
+      // rebuilds incumbents from their stored coordinates alone.
+      const horseshoe = {
+        type: 'Feature',
+        id: 9001,
+        properties: {
+          // No centroid properties, so the builder falls back to the bounding
+          // box midpoint - which lands in this shape's slot, outside it.
+          name: 'Horseshoe',
+          placetype: 'locality',
+          country_id: 'US',
+          admin1_id: 1,
+          is_current: 1,
+          population: 500000
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[
+            [0.00, 0.00], [0.40, 0.00], [0.40, 0.20], [0.21, 0.20],
+            [0.21, 0.06], [0.19, 0.06], [0.19, 0.20], [0.00, 0.20], [0.00, 0.00]
+          ]]
+        }
+      };
+      // Sits in the slot and is genuinely centred there, in another country.
+      const middletown = place({
+        id: 9002,
+        name: 'Middletown',
+        placetype: 'locality',
+        countryId: 'MX',
+        population: 100000,
+        minLon: 0.185, minLat: 0.07, maxLon: 0.215, maxLat: 0.13,
+        centroid: [0.10, 0.20]
+      });
+
+      // The bbox midpoint's cell still clips both arms, so Horseshoe really
+      // does emit it - the claim is only wrong about being *centred* there.
+      const contested = geohash.encode(0.10, 0.20, 5);
+      const dbPath = path.join(dir, 'concave.sqlite');
+
+      expect(runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'horseshoe.geojson', [horseshoe])
+      ].concat(commonFlags)).status).toEqual(0);
+      expect(runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'middletown.geojson', [middletown]),
+        '--append'
+      ].concat(commonFlags)).status).toEqual(0);
+
+      const owner = await lookupOwner(dbPath, contested);
+      expect(owner.id).toEqual(9002);
+      expect(owner.country_id).toEqual('MX');
+
+      // The decision is stored, not re-derived from the coordinates.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const rows = await all(db, 'SELECT id, centroid_inside FROM compact_places ORDER BY id');
+        expect(rows.find((row) => row.id === 9001).centroid_inside).toEqual(0);
+        expect(rows.find((row) => row.id === 9002).centroid_inside).toEqual(1);
+      } finally {
+        await close(db);
+      }
+    });
+  });
+
   it('resolves the home cell the same way in either append order', async () => {
     await withTempDir(async (dir) => {
       const bigInput = writeFixture(dir, 'big.geojson', [place(BIGVILLE)]);
