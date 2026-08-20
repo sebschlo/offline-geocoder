@@ -174,6 +174,10 @@ Environment variables for customization:
 The default feature codes exclude `PPL` which can include neighbourhood-like
 populated places. The schema is defined in [`scripts/schema.sql`](scripts/schema.sql).
 
+Database files and reader code are versioned independently, so schema
+changes must follow the backwards-compatibility contract in
+[`COMPATIBILITY.md`](COMPATIBILITY.md).
+
 ### Generating a Boundary Index
 
 Build boundary-aware reverse lookup tables from a polygon source (GeoJSON
