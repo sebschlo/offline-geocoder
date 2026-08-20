@@ -15,9 +15,10 @@
   the finer cells over that same point when a neighbour emits them, so the rule
   holds for the longest-prefix lookup the runtime actually performs. Placetype
   ranking still decides first, and no cell is added to the index.
-- By default, stop the dominant-city rollup suppressing a place whose placetype
-  it does not outrank. A county could absorb the cell holding a town's own
-  centre, which is a downgrade the cell comparator would never make - and
+- By default, stop the dominant-city rollup suppressing or replacing a place
+  whose placetype it does not outrank, whether that place owns a descendant cell
+  or the promoted parent itself. A county could absorb the cell holding a town's
+  own centre, which is a downgrade the cell comparator would never make - and
   because the rollup runs per batch, it left that cell undefended in an
   `--append` build, so the next country written took it and the town's centre
   resolved across the border (Douglas AZ reading as Agua Prieta; Mittelberg and
@@ -28,9 +29,13 @@
   of any matching prefix. A row was dropped whenever some coarser cell named the
   same place, even when a different place owned the cell in between, and the
   lookup then answered with that other place.
-- Reconcile nested home cells from a snapshot of cell ownership, so a place that
-  loses its own cell to a coarser claimant still carries its claim to the cells
-  below it. The pass no longer depends on the order places are read.
+- Reconcile nested home cells from each place's own cover rather than from the
+  cells it happened to win, so a place that loses the cell holding its centroid
+  to a co-centred neighbour still carries its claim to the finer cells over that
+  point. The pass no longer depends on the order places are read.
+- Report the rollup and home-cell invariants in the build summary (promotions
+  refused, home cells reclaimed or kept, rows kept from a shadowing owner), so a
+  world build shows whether any of these rules ever fires.
 - Keep counties out of the dominant-city rollup. A parent geohash cell rolled
   up to the place that dominates its children on population, and `county`
   counted as a city-like placetype, so a metro could be labelled with its

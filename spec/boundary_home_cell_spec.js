@@ -246,6 +246,57 @@ describe('boundary builder home cell ownership', () => {
     });
   });
 
+  it('will not let a county rollup take the parent cell from a locality', async () => {
+    await withTempDir(async (dir) => {
+      // Same downgrade one level up: the locality's cover terminates at the
+      // parent, so it owns no descendant row for the sweep to protect. Only a
+      // rank check on the replacement itself keeps its centre out of the
+      // county.
+      const town = {
+        id: 6101,
+        name: 'Parent Town',
+        placetype: 'locality',
+        countryId: 'US',
+        population: 20000,
+        minLon: -0.05, minLat: -0.05, maxLon: 0.40, maxLat: 0.22,
+        centroid: [0.02, 0.02]
+      };
+      const county = {
+        id: 6102,
+        name: 'Wide County',
+        placetype: 'county',
+        countryId: 'US',
+        population: 400000,
+        minLon: 0.088, minLat: -0.05, maxLon: 0.60, maxLat: 0.22,
+        centroid: [0.07, 0.29]
+      };
+      // Reaches below Parent Town's southern edge so the contained-locality
+      // prune leaves it alone; it exists only to make the rollup pick a
+      // dominant place rather than take its single-locality branch.
+      const suburb = {
+        id: 6103,
+        name: 'Second Town',
+        placetype: 'locality',
+        countryId: 'US',
+        population: 10000,
+        minLon: 0.045, minLat: -0.08, maxLon: 0.086, maxLat: 0.085,
+        centroid: [0.04, 0.06]
+      };
+
+      const input = writeFixture(dir, 'parent-rank.geojson', [place(town), place(county), place(suburb)]);
+      const dbPath = path.join(dir, 'parent-rank.sqlite');
+
+      expect(runBuilder([
+        '--database', dbPath, '--input', input, '--include-county', 'true'
+      ].concat(commonFlags)).status).toEqual(0);
+
+      const owner = await lookupOwner(dbPath, geohash.encode(town.centroid[0], town.centroid[1], 5));
+      expect(owner.id).toEqual(town.id);
+
+      expect((await lookupOwner(dbPath, geohash.encode(0.06, 0.285, 5))).id).toEqual(county.id);
+    });
+  });
+
   it('resolves the home cell the same way in either append order', async () => {
     await withTempDir(async (dir) => {
       const bigInput = writeFixture(dir, 'big.geojson', [place(BIGVILLE)]);
