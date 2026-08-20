@@ -359,6 +359,42 @@ describe('locationiq sweep', () => {
       expect(liq.normalizeName('й')).not.toEqual(liq.normalizeName('и'));
     });
 
+    it('folds Latin letters that NFKD leaves undecomposed', () => {
+      // These carry the diacritic inside the letter, so decomposition alone
+      // never reaches the ASCII spelling the other geocoder likely uses.
+      expect(liq.normalizeName('Łódź')).toEqual(liq.normalizeName('Lodz'));
+      expect(liq.normalizeName('Tromsø')).toEqual(liq.normalizeName('Tromso'));
+      expect(liq.normalizeName('Đà Nẵng')).toEqual(liq.normalizeName('Da Nang'));
+      expect(liq.normalizeName('Þingholt')).toEqual(liq.normalizeName('Thingholt'));
+      expect(liq.normalizeName('Großenhain')).toEqual(liq.normalizeName('Grossenhain'));
+
+      const record = liq.comparePoint(
+        point({ country: 'PL' }),
+        { name: 'Łódź', country: { id: 'PL' } },
+        { status: 200, body: { display_name: '', address: { city: 'Lodz', country_code: 'pl' } } }
+      );
+      expect(record.verdict).toEqual('agree');
+    });
+
+    it('classifies an empty offline answer against a country-only response as unverifiable', () => {
+      // LocationIQ supplied no name to have matched, so this is not an
+      // offline failure and must not count as a verifiable mismatch.
+      const sparse = liq.comparePoint(
+        point({ country: 'US' }),
+        null,
+        { status: 200, body: { display_name: 'United States', address: { country_code: 'us' } } }
+      );
+      expect(sparse.verdict).toEqual('liq_name_missing');
+
+      // With a real LocationIQ name, an empty offline answer is still a miss.
+      const genuine = liq.comparePoint(
+        point({ country: 'US' }),
+        null,
+        { status: 200, body: { display_name: '', address: { city: 'Somewhere', country_code: 'us' } } }
+      );
+      expect(genuine.verdict).toEqual('offline_empty');
+    });
+
     it('agrees when the offline name matches a locality field after normalization', () => {
       const record = liq.comparePoint(
         point({ name: 'Kilómetro 18' }),
@@ -705,6 +741,91 @@ describe('locationiq sweep', () => {
           await expectAsync(liq.runSweep(sweepOpts(dir), deps)).toBeRejectedWithError(/quota state/i);
         }
         expect(deps.calls.length).toEqual(0);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('stops instead of resetting when the clock moves backward across midnight mid-run', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        // Two requests land on 2026-01-02, then the clock is corrected back
+        // to 2026-01-01. Resetting there would grant a second full cap.
+        let nowCalls = 0;
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        deps.now = () => {
+          nowCalls += 1;
+          return nowCalls <= 3
+            ? new Date('2026-01-02T00:10:00Z')
+            : new Date('2026-01-01T23:50:00Z');
+        };
+
+        const summary = await liq.runSweep(sweepOpts(dir, { dailyCap: 10 }), deps);
+
+        expect(deps.calls.length).toEqual(2);
+        expect(summary.stopReason).toEqual('clock_backward');
+        const state = readState(dir);
+        expect(state.date).toEqual('2026-01-02');
+        expect(state.count).toEqual(2);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a malformed endpoint before any quota is spent', async () => {
+      // Parse-level guard: the cache is never stamped with an unusable value.
+      expect(() => liq.parseSweepArgs(['--endpoint', 'not-a-url'])).toThrowError(/--endpoint/);
+      expect(() => liq.parseSweepArgs(['--endpoint', 'ftp://example.invalid/reverse'])).toThrowError(/--endpoint/);
+      expect(liq.parseSweepArgs(['--endpoint', 'https://eu1.locationiq.com/v1/reverse']).endpoint)
+        .toEqual('https://eu1.locationiq.com/v1/reverse');
+
+      // Defense in depth: if an unusable endpoint reaches runSweep anyway,
+      // the URL is built before the count is persisted.
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const summary = await liq.runSweep(sweepOpts(dir, { endpoint: 'not-a-url' }), deps);
+
+        expect(deps.calls.length).toEqual(0);
+        expect(summary.stopReason).toEqual('bad_request');
+        // No request was made, so nothing may be counted against the quota —
+        // the state file is not even created.
+        expect(summary.quota.count).toEqual(0);
+        expect(fs.existsSync(path.join(dir, 'quota.json'))).toBeFalse();
+        // The report is still written rather than the run throwing.
+        expect(fs.existsSync(path.join(dir, 'report.md'))).toBeTrue();
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a populated unstamped cache during dry runs too', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const legacy = {
+          key: liq.sweepCoordKey(WORLD_POINTS[0].lat, WORLD_POINTS[0].lon),
+          lat: WORLD_POINTS[0].lat,
+          lon: WORLD_POINTS[0].lon,
+          status: 200,
+          body: { display_name: '', address: { city: 'Testville', country_code: 'us' } }
+        };
+        writeCacheFile(dir, JSON.stringify(legacy) + '\n', { stamped: false });
+
+        const deps = makeDeps(() => {
+          throw new Error('dry-run must not touch the network');
+        });
+        // Provenance matters for a rebuilt report just as much as for a fetch.
+        await expectAsync(liq.runSweep(sweepOpts(dir, { dryRun: true, apiKey: '' }), deps))
+          .toBeRejectedWithError(/no configuration record/i);
+
+        // A dry run over an absent cache still works and writes nothing.
+        fs.rmSync(path.join(dir, 'cache.jsonl'));
+        const summary = await liq.runSweep(sweepOpts(dir, { dryRun: true, apiKey: '' }), deps);
+        expect(summary.evaluated).toEqual(0);
+        expect(fs.existsSync(path.join(dir, 'cache.jsonl'))).toBeFalse();
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }

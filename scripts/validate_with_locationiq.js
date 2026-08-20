@@ -430,6 +430,32 @@ async function ensureSamplePoints(sourceDb, cacheDb, lookupTable, targetCount, s
 
 var LATIN_BASE_RE = /\p{Script=Latin}/u
 
+// Latin letters that NFKD does not decompose: their diacritic or ligature is
+// part of the letter itself. LocationIQ and the offline database often differ
+// exactly here (Łódź/Lodz, Tromsø/Tromso, Đà Nẵng/Da Nang), so fold them to
+// the ASCII spelling the other side is likely to use.
+var LATIN_FOLD_MAP = {
+  'ł': 'l', 'ŀ': 'l',
+  'đ': 'd', 'ð': 'd',
+  'ø': 'o', 'œ': 'oe',
+  'æ': 'ae',
+  'þ': 'th',
+  'ß': 'ss',
+  'ħ': 'h',
+  'ŧ': 't',
+  'ı': 'i',
+  'ĸ': 'k'
+}
+
+function foldLatinLetters(value) {
+  var out = ''
+  for (var ch of value) {
+    var mapped = LATIN_FOLD_MAP[ch]
+    out += mapped === undefined ? ch : mapped
+  }
+  return out
+}
+
 function normalizeName(value) {
   if (!value) return ''
 
@@ -471,8 +497,7 @@ function normalizeName(value) {
     lastBaseIsLatin = LATIN_BASE_RE.test(ch)
   }
 
-  return kept
-    .toLowerCase()
+  return foldLatinLetters(kept.toLowerCase())
     .replace(/[^\p{L}\p{M}\p{N}]+/gu, ' ')
     .trim()
     .replace(/\s+/g, ' ')
@@ -1453,7 +1478,8 @@ function readSweepCacheMeta(cachePath) {
   return null
 }
 
-function ensureSweepCacheConfig(cachePath, config) {
+function ensureSweepCacheConfig(cachePath, config, options) {
+  var dryRun = Boolean(options && options.dryRun)
   // Cached responses depend on the request-shaping options, so the cache is
   // stamped with them and a run using different options is rejected loudly:
   // silently evaluating stale responses (or silently refetching everything)
@@ -1471,9 +1497,13 @@ function ensureSweepCacheConfig(cachePath, config) {
         'the cache to refetch under the current settings (endpoint=' + config.endpoint +
         ' accept-language=' + (config.acceptLanguage || '(none)') + ').')
     }
-    appendSweepCache(cachePath, { meta: config })
+    // A dry run evaluates without fetching, so it has nothing to stamp.
+    if (!dryRun) appendSweepCache(cachePath, { meta: config })
     return
   }
+  // Only a fetching run must agree with the cache's settings: a dry run
+  // re-reports whatever the cache holds, whatever options it was given.
+  if (dryRun) return
   if (meta.endpoint !== config.endpoint || meta.acceptLanguage !== config.acceptLanguage) {
     throw new Error('Cache ' + cachePath + ' was built with endpoint=' + meta.endpoint +
       ' accept-language=' + (meta.acceptLanguage || '(none)') +
@@ -1616,16 +1646,20 @@ function comparePoint(point, offlineResult, cacheEntry) {
 
   if (!liqOk) {
     record.verdict = offlineName ? 'liq_empty' : 'both_empty'
+  } else if (offlineCountry && record.liq_country && offlineCountry !== record.liq_country) {
+    // The severe check outranks every name-level classification.
+    record.verdict = 'country_mismatch'
   } else if (!offlineName) {
-    record.verdict = 'offline_empty'
+    // An empty offline answer is only a failure if LocationIQ actually
+    // supplied a name to have matched; a country-only response gives
+    // nothing to verify against either way.
+    record.verdict = liqHasComparableName(address) ? 'offline_empty' : 'liq_name_missing'
   } else if (!offlineCountry || !record.liq_country) {
     // One side lacks a country code, so the severe check cannot run and the
     // point must not inflate agreement either: classify it as unverifiable.
     // Any name match is still recorded in match_via for context.
     record.match_via = findLiqNameMatch(normalizeName(offlineName), address, record.liq_display_name) || ''
     record.verdict = 'country_unknown'
-  } else if (offlineCountry !== record.liq_country) {
-    record.verdict = 'country_mismatch'
   } else {
     // Attempt the match first: display_name segments count as agreement even
     // when the address block carries no name fields at all.
@@ -1829,11 +1863,15 @@ async function runSweep(opts, deps) {
   }
 
   fs.mkdirSync(path.dirname(opts.cachePath), { recursive: true })
-  if (!opts.dryRun) {
-    // Dry runs only evaluate what is already cached, so the request-shaping
-    // options are irrelevant there; network runs must match the cache.
-    ensureSweepCacheConfig(opts.cachePath, { endpoint: opts.endpoint, acceptLanguage: opts.acceptLanguage })
-  }
+  // Provenance is checked in both modes — responses of unknown endpoint or
+  // language corrupt a report just as much when it is rebuilt offline. Only
+  // the comparison against the current request options is skipped for a dry
+  // run, which re-reports the cache rather than extending it.
+  ensureSweepCacheConfig(
+    opts.cachePath,
+    { endpoint: opts.endpoint, acceptLanguage: opts.acceptLanguage },
+    { dryRun: opts.dryRun }
+  )
   var cache = loadSweepCache(opts.cachePath)
   var todayUtc = utcDateString(nowImpl())
   var state
@@ -1876,6 +1914,15 @@ async function runSweep(opts, deps) {
       // otherwise a later invocation would reset the stale date and allow
       // nearly twice the cap within the new UTC day.
       var attemptDate = utcDateString(nowImpl())
+      if (attemptDate < state.date) {
+        // The clock moved backward across midnight mid-run. Resetting here
+        // would grant a second full cap for requests LocationIQ already
+        // counted, so stop instead — the mirror of the fail-closed rule for
+        // a persisted future date.
+        stopReason = 'clock_backward'
+        stopDetail = 'state date ' + state.date + ' is later than the current UTC date ' + attemptDate
+        break
+      }
       if (attemptDate !== state.date) {
         // The count resets per UTC day; the pacing timestamp does not.
         state = { date: attemptDate, count: 0, lastRequestAt: state.lastRequestAt || 0 }
@@ -1884,6 +1931,18 @@ async function runSweep(opts, deps) {
 
       if (state.count >= opts.dailyCap) {
         stopReason = 'daily_cap'
+        break
+      }
+
+      // Build the URL before spending anything: a malformed endpoint would
+      // otherwise throw after the count was persisted, recording a request
+      // that was never made and bypassing the report entirely.
+      var url
+      try {
+        url = buildLocationIqUrl(opts.endpoint, opts.apiKey, point.lat, point.lon, opts.acceptLanguage)
+      } catch (err) {
+        stopReason = 'bad_request'
+        stopDetail = 'could not build request URL: ' + String(err && err.message ? err.message : err)
         break
       }
 
@@ -1896,7 +1955,6 @@ async function runSweep(opts, deps) {
       saveQuotaState(opts.statePath, state)
       requestsThisRun += 1
 
-      var url = buildLocationIqUrl(opts.endpoint, opts.apiKey, point.lat, point.lon, opts.acceptLanguage)
       var response
       try {
         response = await deps.fetchJson(url, SWEEP_TIMEOUT_MS)
@@ -1998,6 +2056,8 @@ async function runSweep(opts, deps) {
       unfetched + ' points still unfetched. Re-run the same command after the next UTC day starts to resume; cached points are never re-queried.')
   } else if (stopReason === 'rate_limited') {
     log('LocationIQ returned HTTP 429 (rate limited). Backing off and stopping this run cleanly; all fetched responses are cached. Wait for the quota window to reset, then re-run the same command to resume.')
+  } else if (stopReason === 'clock_backward') {
+    log('The host clock moved backward across a UTC day boundary mid-run (' + stopDetail + '). Stopping instead of resetting the daily count, which would allow a second full cap for requests LocationIQ already counted. Fix the clock, then re-run to resume.')
   } else if (stopReason === 'bad_endpoint') {
     log('LocationIQ returned HTTP 404 for the route itself, not for the coordinate (' + stopDetail + '). This usually means --endpoint is wrong or a proxy intercepted the request, so the response was not cached and the run stopped before spending more quota. Fix the endpoint, then re-run to resume.')
   } else if (stopReason === 'bad_request') {
@@ -2070,7 +2130,19 @@ function parseSweepArgs(argv) {
     } else if (arg === '--api-key') {
       opts.apiKey = requireValueArg('--api-key', argv[++i])
     } else if (arg === '--endpoint') {
-      opts.endpoint = requireValueArg('--endpoint', argv[++i])
+      // Fail here rather than mid-run: an unusable endpoint would otherwise
+      // only surface once the cache had been stamped with it.
+      var endpoint = requireValueArg('--endpoint', argv[++i])
+      var endpointUrl
+      try {
+        endpointUrl = new URL(endpoint)
+      } catch (err) {
+        throw new Error('--endpoint must be a valid URL, got: ' + endpoint)
+      }
+      if (endpointUrl.protocol !== 'https:' && endpointUrl.protocol !== 'http:') {
+        throw new Error('--endpoint must be an http(s) URL, got: ' + endpoint)
+      }
+      opts.endpoint = endpoint
     } else if (arg === '--accept-language') {
       // '' is a documented value (disables the header), but a following
       // option token means the value was omitted.
