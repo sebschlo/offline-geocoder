@@ -474,9 +474,16 @@ describe('boundary builder home cell ownership', () => {
       // The one cross-batch shape the exact-hash conflict resolver cannot see:
       // the horseshoe owns the fine cell holding Bigtown's centre, and Bigtown
       // answers for that point only through the coarse cell it fully covers,
-      // so no hash collides and longest-prefix keeps the horseshoe. The
-      // builder does not reconcile this - it counts it, so that the claim that
-      // real boundaries never produce it stays falsifiable.
+      // so no hash collides and longest-prefix keeps the horseshoe.
+      //
+      // Bigtown's polygon is the precision-4 cell exactly, so the appended
+      // batch emits ONE row and nothing deeper. That is the case that matters:
+      // a scan bounded by the batch's own deepest row cannot look past it, and
+      // it is the very condition the counter exists to find. A fixture whose
+      // geometry spills into neighbouring cells would keep the bound large and
+      // pass without ever testing it.
+      const coarseHash = 's000';
+      const cell = geohash.decodeBbox(coarseHash);
       const horseshoe = {
         type: 'Feature',
         id: 9101,
@@ -496,17 +503,28 @@ describe('boundary builder home cell ownership', () => {
           ]]
         }
       };
-      // Swallows the whole precision-4 cell, and is centred inside the
-      // precision-5 cell the horseshoe already owns.
-      const bigtown = place({
+      const bigtown = {
+        type: 'Feature',
         id: 9102,
-        name: 'Bigtown',
-        placetype: 'locality',
-        countryId: 'MX',
-        population: 100000,
-        minLon: -0.05, minLat: -0.05, maxLon: 0.40, maxLat: 0.22,
-        centroid: [0.10, 0.20]
-      });
+        properties: {
+          name: 'Bigtown',
+          placetype: 'locality',
+          country_id: 'MX',
+          admin1_id: 1,
+          is_current: 1,
+          population: 100000,
+          centroid_lat: 0.10,
+          centroid_lon: 0.20
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[
+            [cell.minLon, cell.minLat], [cell.maxLon, cell.minLat],
+            [cell.maxLon, cell.maxLat], [cell.minLon, cell.maxLat],
+            [cell.minLon, cell.minLat]
+          ]]
+        }
+      };
 
       const dbPath = path.join(dir, 'shadowed.sqlite');
       expect(runBuilder([
@@ -520,6 +538,16 @@ describe('boundary builder home cell ownership', () => {
         '--append'
       ].concat(commonFlags));
       expect(appended.status).toEqual(0);
+
+      // The appended batch really did emit only the coarse cell - without this
+      // the assertion below could pass on a bound that was never exercised.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const owned = await all(db, 'SELECT geohash FROM compact_geohash_lookup WHERE place_id = 9102');
+        expect(owned.map((row) => row.geohash)).toEqual([coarseHash]);
+      } finally {
+        await close(db);
+      }
 
       expect(appended.stdout).toContain('Home cells shadowed by a finer existing row: 1');
 
