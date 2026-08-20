@@ -99,6 +99,25 @@ function writeDominantCountyFixture(inputPath) {
   return inputPath;
 }
 
+// The same shape with the towns taken out: the county is then the only
+// city-like owner inside the parent cell, which sends the roll-up down its
+// single-candidate path instead of the dominant-city competition.
+function writeLoneCountyFixture(inputPath) {
+  const bbox = geohash.decodeBbox(DOMINANT_COUNTY_PARENT_HASH);
+  const height = bbox.maxLat - bbox.minLat;
+
+  fs.writeFileSync(inputPath, JSON.stringify({
+    type: 'FeatureCollection',
+    features: [
+      regionFeature(8101, 'Fallback Region', bbox),
+      polygonFeature(8102, 'Monroe County', 'county', 748482,
+        rectangleRing(bbox.minLon, bbox.minLat, bbox.maxLon, bbox.maxLat - (height / 100)))
+    ]
+  }));
+
+  return inputPath;
+}
+
 describe('boundary builder', () => {
   it('drops contained localities when pruning is enabled', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
@@ -801,6 +820,77 @@ describe('boundary builder', () => {
 
         const largerTownCells = await all(db, descendantCountSql(DOMINANT_COUNTY_PARENT_HASH, 8004));
         expect(largerTownCells[0].count).toEqual(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not roll a parent cell up to a county that is its only city-like owner', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'lone-county.geojson');
+      const dbPath = path.join(dir, 'lone-county.sqlite');
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', writeLoneCountyFixture(inputPath),
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--include-county', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        // The county is the sole city-like child owner and covers the whole
+        // parent cell, so it clears the child-share threshold -- but taking
+        // the parent cell over would still label the metro with the county's
+        // name, which is what the placetype gate exists to prevent.
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${DOMINANT_COUNTY_PARENT_HASH}'`);
+        expect(parentRow).toEqual([{ geohash: DOMINANT_COUNTY_PARENT_HASH, place_id: 8101 }]);
+
+        // Losing the roll-up costs the county nothing below the parent cell.
+        const countyCells = await all(db, descendantCountSql(DOMINANT_COUNTY_PARENT_HASH, 8102));
+        expect(countyCells[0].count).toBeGreaterThan(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls a parent cell up to a lone county when county is opted back in', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'lone-county-opt-in.geojson');
+      const dbPath = path.join(dir, 'lone-county-opt-in.sqlite');
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', writeLoneCountyFixture(inputPath),
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--include-county', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--dominant-city-placetypes', 'locality,localadmin,county'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${DOMINANT_COUNTY_PARENT_HASH}'`);
+        expect(parentRow).toEqual([{ geohash: DOMINANT_COUNTY_PARENT_HASH, place_id: 8102 }]);
       } finally {
         await close(db);
       }

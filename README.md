@@ -220,7 +220,7 @@ The builder uses a multi-stage pipeline to decide which localities make it into 
 3. **Country guarantee** (`--ensure-country-locality`): after the isolation pass, any country that still has zero localities gets its highest-population candidate promoted unconditionally.
 4. **Contained-locality pruning** (`--drop-contained-localities`): removes localities whose polygon is fully contained inside a larger locality in the same country/admin1 group.
 5. **Dominant-city rollup**: in the geohash index, when a major city (population >= `--dominant-locality-population`) dominates its neighbours by a ratio of `--dominant-locality-ratio`, smaller nearby localities are absorbed into the major city label. Only the placetypes listed in `--dominant-city-placetypes` (default `locality,localadmin`) may play that dominant role, so a metro is never named after the county it sits in; counties still own cells on their own merits.
-6. **Locality-over-region promotion**: when a locality and a region compete for the same parent geohash cell, the locality wins if it covers >= `--parent-locality-min-share` of child cells.
+6. **Locality-over-region promotion**: when a locality and a region compete for the same parent geohash cell, the locality wins if it covers >= `--parent-locality-min-share` of child cells and its placetype is listed in `--dominant-city-placetypes`. Both routes to a parent cell share that eligibility gate, so a lone county cannot take a parent cell that the dominant-city rollup would have refused it.
 
 Builder notes:
 
@@ -238,7 +238,7 @@ Builder notes:
 - Dominant-city rollup keeps broad city labels sticky in mixed city/suburb cells unless there is competing major-city pressure:
   - `--dominant-locality-population` (default `100000`)
   - `--dominant-locality-ratio` (default `3`)
-  - `--dominant-city-placetypes` (default `locality,localadmin`) placetypes eligible to be the dominant city of a parent cell. A county wins cells like any other place, but naming a whole parent cell after it reads as a mistake, so it is excluded by default; add `county` to reproduce pre-1.1 builds
+  - `--dominant-city-placetypes` (default `locality,localadmin`) placetypes eligible to be the dominant city of a parent cell, whether it wins a competition or is the only city-like owner in that cell. A county wins cells like any other place, but naming a whole parent cell after it reads as a mistake, so it is excluded by default; add `county` to reproduce pre-1.1 builds
 - Parent-cell takeover guard:
   - `--parent-locality-min-share` (default `0.5`) requires locality ownership of at least that child-cell share before replacing a parent cell label
 - Excludes neighbourhood-like placetypes from default reverse output

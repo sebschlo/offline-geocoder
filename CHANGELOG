@@ -8,7 +8,10 @@
   parent cell to a placetype listed in `--dominant-city-placetypes`
   (default `locality,localadmin`, env `WOF_DOMINANT_CITY_PLACETYPES`); add
   `county` to that list to reproduce earlier builds. Counties still win cells
-  through the normal comparator.
+  through the normal comparator. Both routes into a parent cell -- winning the
+  dominant-city competition, and being the only city-like owner in the cell --
+  share one eligibility gate, so a county cannot take a parent cell through the
+  single-candidate path either.
 
 - Fix `--append` builds handing contested geohash cells to whichever batch ran
   last. Cells that already belong to a better-ranked place (by placetype, then

@@ -24,7 +24,7 @@ set -euo pipefail
 #   WOF_DOMINANT_LOCALITY_POPULATION Major-locality threshold for dominant-city rollup (default: 100000)
 #   WOF_DOMINANT_LOCALITY_RATIO      Dominant-vs-next locality population ratio (default: 3)
 #   WOF_PARENT_LOCALITY_MIN_SHARE    Minimum child-cell share (0..1) required for locality parent takeover (default: 0.5)
-#   WOF_DOMINANT_CITY_PLACETYPES     Placetypes eligible to be a parent cell's dominant city (default: locality,localadmin)
+#   WOF_DOMINANT_CITY_PLACETYPES     Placetypes eligible to take over a parent cell (default: locality,localadmin)
 #   WOF_INCLUDE_LOCALADMIN         Include localadmin placetypes (default: 0)
 #   WOF_INCLUDE_COUNTY             Include county placetypes (default: 1)
 #   WOF_INCLUDE_REGION             Include region placetypes (default: 1)

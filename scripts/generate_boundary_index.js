@@ -218,7 +218,7 @@ function usage() {
     '  --dominant-locality-population Population threshold that marks locality as major for dominant-city rollups (default: 100000)',
     '  --dominant-locality-ratio      Required dominant-vs-next population ratio for locality rollups (default: 3)',
     '  --parent-locality-min-share    Minimum child-cell share (0..1) required to let a locality take over a parent cell (default: 0.5)',
-    '  --dominant-city-placetypes     Comma-separated placetypes eligible to be the dominant city of a parent cell (default: ' + DEFAULT_DOMINANT_CITY_PLACETYPES.join(',') + ')',
+    '  --dominant-city-placetypes     Comma-separated placetypes eligible to take over a parent cell, by competition or as its only city-like owner (default: ' + DEFAULT_DOMINANT_CITY_PLACETYPES.join(',') + ')',
     '  --append                       Keep existing boundary rows and append/replace by place id',
     '  --replace                      Clear boundary rows first (default)',
     '  --help, -h                     Show this help message'
@@ -1065,14 +1065,6 @@ function selectDominantLocalityId(localityIds, placeById, opts) {
   }
 
   var top = ranked[0]
-  if (!isDominantCityPlacetypeCode(top.placetypeCode, opts)) {
-    // The cell competition was won by a placetype that may not name a parent
-    // cell -- a county, by default. Handing the parent to the runner-up city
-    // would promote a place that lost that competition, so nothing is rolled
-    // up and every child keeps the cell it owns.
-    return null
-  }
-
   if (top.population < threshold) {
     return null
   }
@@ -1110,6 +1102,24 @@ function localityShareMeetsThreshold(localityId, group, opts) {
   }
 
   return localityShareInParent(localityId, group) >= threshold
+}
+
+// The single gate for taking over a parent cell, shared by both roll-up paths
+// -- the lone city-like owner and the winner of a dominant-city competition --
+// so that neither can drift away from the other. A candidate qualifies only if
+// its placetype may name a parent cell (counties may not, by default) and it
+// owns enough of the parent's child cells to stand in for the whole of it.
+// A candidate rejected here is not replaced by a runner-up: the runner-up lost
+// the cell competition, so promoting it would name the parent after a place
+// that owns less of it. The parent keeps its existing owner instead, and every
+// child keeps the cell it won.
+function localityMayTakeOverParent(localityId, group, placeById, opts) {
+  var place = placeById[String(localityId)]
+  if (!place || !isDominantCityPlacetypeCode(place.placetypeCode, opts)) {
+    return false
+  }
+
+  return localityShareMeetsThreshold(localityId, group, opts)
 }
 
 function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
@@ -1170,7 +1180,7 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
 
       if (localityIds.length === 1) {
         var localityId = Number(localityIds[0])
-        if (!localityShareMeetsThreshold(localityId, group, opts)) {
+        if (!localityMayTakeOverParent(localityId, group, placeById, opts)) {
           continue
         }
 
@@ -1195,7 +1205,7 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
         if (dominantLocalityId === null) {
           continue
         }
-        if (!localityShareMeetsThreshold(dominantLocalityId, group, opts)) {
+        if (!localityMayTakeOverParent(dominantLocalityId, group, placeById, opts)) {
           continue
         }
 
