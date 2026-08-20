@@ -135,6 +135,55 @@ describe('boundary builder home cell ownership', () => {
     });
   });
 
+  it('does not grant home priority to a fallback bbox midpoint outside the geometry', async () => {
+    await withTempDir(async (dir) => {
+      // The C-shaped place has no explicit centroid, so its fallback is the
+      // bbox midpoint (0.1, 0.3), in the open notch rather than the polygon.
+      // Its upper arm still intersects the same geohash cell as Notch Town;
+      // treating that exterior fallback as a home point would let population
+      // hand the town's real centre to the wrong country.
+      const cShape = {
+        type: 'Feature',
+        id: 3001,
+        properties: {
+          name: 'C Province',
+          placetype: 'locality',
+          country_id: 'MX',
+          admin1_id: 1,
+          is_current: 1,
+          population: 690000
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[
+            [0, 0], [0.6, 0], [0.6, 0.08], [0.25, 0.08],
+            [0.25, 0.12], [0.6, 0.12], [0.6, 0.2], [0, 0.2], [0, 0]
+          ]]
+        }
+      };
+      const notchTown = place({
+        id: 3002,
+        name: 'Notch Town',
+        placetype: 'locality',
+        countryId: 'US',
+        population: 38000,
+        minLon: 0.27, minLat: 0.085, maxLon: 0.33, maxLat: 0.115,
+        centroid: [0.1, 0.3]
+      });
+
+      const input = writeFixture(dir, 'exterior-fallback.geojson', [cShape, notchTown]);
+      const dbPath = path.join(dir, 'exterior-fallback.sqlite');
+
+      expect(runBuilder([
+        '--database', dbPath, '--input', input, '--dominant-locality-population', '0'
+      ].concat(commonFlags)).status).toEqual(0);
+
+      const owner = await lookupOwner(dbPath, geohash.encode(0.1, 0.3, 5));
+      expect(owner.id).toEqual(notchTown.id);
+      expect(owner.country_id).toEqual('US');
+    });
+  });
+
   it('falls back to population when the rule is disabled', async () => {
     await withTempDir(async (dir) => {
       const input = writeFixture(dir, 'border.geojson', [place(BIGVILLE), place(SMALLTOWN)]);
@@ -246,12 +295,13 @@ describe('boundary builder home cell ownership', () => {
     });
   });
 
-  it('will not let a county rollup take the parent cell from a locality', async () => {
+  it('will not let a rollup take the parent cell from a place it outranks', async () => {
     await withTempDir(async (dir) => {
-      // Same downgrade one level up: the locality's cover terminates at the
-      // parent, so it owns no descendant row for the sweep to protect. Only a
+      // Same downgrade one level up. The locality's cover terminates at the
+      // parent, so it owns no descendant row for the sweep to protect - only a
       // rank check on the replacement itself keeps its centre out of the
-      // county.
+      // localadmin. A localadmin is an eligible dominant placetype by default,
+      // unlike a county, so this is the case the parent guard still answers.
       const town = {
         id: 6101,
         name: 'Parent Town',
@@ -261,10 +311,10 @@ describe('boundary builder home cell ownership', () => {
         minLon: -0.05, minLat: -0.05, maxLon: 0.40, maxLat: 0.22,
         centroid: [0.02, 0.02]
       };
-      const county = {
+      const municipality = {
         id: 6102,
-        name: 'Wide County',
-        placetype: 'county',
+        name: 'Wide Municipality',
+        placetype: 'localadmin',
         countryId: 'US',
         population: 400000,
         minLon: 0.088, minLat: -0.05, maxLon: 0.60, maxLat: 0.22,
@@ -272,7 +322,7 @@ describe('boundary builder home cell ownership', () => {
       };
       // Reaches below Parent Town's southern edge so the contained-locality
       // prune leaves it alone; it exists only to make the rollup pick a
-      // dominant place rather than take its single-locality branch.
+      // dominant place rather than take its single-candidate branch.
       const suburb = {
         id: 6103,
         name: 'Second Town',
@@ -283,17 +333,70 @@ describe('boundary builder home cell ownership', () => {
         centroid: [0.04, 0.06]
       };
 
-      const input = writeFixture(dir, 'parent-rank.geojson', [place(town), place(county), place(suburb)]);
+      const input = writeFixture(dir, 'parent-rank.geojson', [place(town), place(municipality), place(suburb)]);
       const dbPath = path.join(dir, 'parent-rank.sqlite');
 
       expect(runBuilder([
-        '--database', dbPath, '--input', input, '--include-county', 'true'
+        '--database', dbPath, '--input', input, '--include-localadmin', 'true'
       ].concat(commonFlags)).status).toEqual(0);
 
       const owner = await lookupOwner(dbPath, geohash.encode(town.centroid[0], town.centroid[1], 5));
       expect(owner.id).toEqual(town.id);
 
-      expect((await lookupOwner(dbPath, geohash.encode(0.06, 0.285, 5))).id).toEqual(county.id);
+      expect((await lookupOwner(dbPath, geohash.encode(0.06, 0.285, 5))).id).toEqual(municipality.id);
+    });
+  });
+
+  it('keeps the home-cell claim of a place that lost that cell on population', async () => {
+    await withTempDir(async (dir) => {
+      // Two towns across a border both swallow the same coarse cell and are
+      // both centred in it, so population decides who owns it. The loser still
+      // covers the finer cells over its own centre, and still outranks a third
+      // place that is not centred there - reading claimants off the cells a
+      // place happens to have won drops that claim entirely.
+      const winner = {
+        id: 7001,
+        name: 'Bigger Twin',
+        placetype: 'locality',
+        countryId: 'MX',
+        population: 500000,
+        minLon: -0.05, minLat: -0.05, maxLon: 0.40, maxLat: 0.22,
+        centroid: [0.02, 0.02]
+      };
+      const loser = {
+        id: 7002,
+        name: 'Smaller Twin',
+        placetype: 'locality',
+        countryId: 'US',
+        population: 300000,
+        minLon: -0.06, minLat: -0.06, maxLon: 0.41, maxLat: 0.23,
+        centroid: [0.11, 0.11]
+      };
+      const neighbour = {
+        id: 7003,
+        name: 'Third City',
+        placetype: 'locality',
+        countryId: 'MX',
+        population: 690000,
+        minLon: 0.088, minLat: -0.05, maxLon: 0.60, maxLat: 0.22,
+        centroid: [0.07, 0.29]
+      };
+
+      const input = writeFixture(dir, 'twins.geojson', [place(winner), place(loser), place(neighbour)]);
+      const dbPath = path.join(dir, 'twins.sqlite');
+
+      expect(runBuilder(['--database', dbPath, '--input', input].concat(commonFlags)).status).toEqual(0);
+
+      // The coarse cell goes to the more populous twin, as documented.
+      expect((await lookupOwner(dbPath, geohash.encode(winner.centroid[0], winner.centroid[1], 5))).id)
+        .toEqual(winner.id);
+
+      // The loser still takes the finer cell holding its own centre.
+      const owner = await lookupOwner(dbPath, geohash.encode(loser.centroid[0], loser.centroid[1], 5));
+      expect(owner.id).toEqual(loser.id);
+      expect(owner.country_id).toEqual('US');
+
+      expect((await lookupOwner(dbPath, geohash.encode(0.06, 0.285, 5))).id).toEqual(neighbour.id);
     });
   });
 

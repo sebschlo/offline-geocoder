@@ -5,7 +5,9 @@
   the larger city across the border (for example Calexico resolving to
   Mexicali, or Heerlen to Aachen). Placetype ranking is unchanged, and cells
   holding two centroids are still decided by population. Disable with
-  `--home-cell-priority false` (`WOF_HOME_CELL_PRIORITY=0`).
+  `--home-cell-priority false` (`WOF_HOME_CELL_PRIORITY=0`). Centroid
+  coordinates outside the place geometry, including an exterior bounding-box
+  midpoint fallback, do not receive home-cell priority.
 - Stop the dominant-city rollup absorbing the home cell of a town in another
   country, whether that cell is a descendant of the promoted parent or the
   promoted parent itself. Rollups inside a country are unchanged, so a metro

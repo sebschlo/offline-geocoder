@@ -694,6 +694,17 @@ function normalizeFeature(feature, opts) {
 
   var bbox = geometry.geometryBbox(normalizedGeometry)
   var centroid = extractCentroid(properties, normalizedGeometry)
+  // Generic GeoJSON can omit an explicit centroid, in which case the bbox
+  // midpoint is only a storage fallback: for a concave, holed, or multipart
+  // shape it may not belong to the place at all. Keep the coordinates for the
+  // existing schema, but do not let an exterior point claim a home cell.
+  var homeGeohash = geometry.pointInGeometry(
+    normalizedGeometry,
+    centroid.latitude,
+    centroid.longitude
+  )
+    ? geohash.encode(centroid.latitude, centroid.longitude, HOME_CELL_PRECISION)
+    : null
   var countryId = extractCountryId(properties)
 
   var name = extractName(properties, feature)
@@ -730,7 +741,7 @@ function normalizeFeature(feature, opts) {
     placetypeCode: placetypeCode(placetype),
     centroidLat: centroid.latitude,
     centroidLon: centroid.longitude,
-    homeGeohash: geohash.encode(centroid.latitude, centroid.longitude, HOME_CELL_PRECISION),
+    homeGeohash: homeGeohash,
     population: population,
     bboxMinLat: bbox.minLat,
     bboxMinLon: bbox.minLon,
