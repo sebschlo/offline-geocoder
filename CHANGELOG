@@ -12,6 +12,7 @@
   candidates against previously written places. Existing databases are
   upgraded in place when appending; the new columns are nullable and readers
   are unaffected.
+- Add optional dense-county precision rule (`--county-dense-max-precision` / `--county-dense-max-area-km2`, env `WOF_COUNTY_DENSE_MAX_PRECISION` / `WOF_COUNTY_DENSE_MAX_AREA_KM2`): small county polygons get a finer geohash cap so municipality-sized counties are not swallowed by neighbors in coarse cells; enabling the rule without an explicit county cap (`--county-max-precision` / `WOF_COUNTY_MAX_PRECISION`) defaults the cap to one below the clamped dense precision so the area threshold actually differentiates
 - Add `sample` and `sweep` subcommands to `scripts/validate_with_locationiq.js`: a quota-aware, resumable world validation sweep against LocationIQ (JSONL response cache keyed by rounded coordinates, persisted per-UTC-day request cap, per-country Markdown mismatch report plus machine-readable mismatch JSONL, `--dry-run` for cache-only evaluation) and a GeoNames-TSV sampler that picks the top-N most populous places per country. Name comparison now preserves non-Latin scripts.
 - Run the test suite in GitHub Actions on pushes to master and all pull
   requests (Node 20.x and 22.x); raise Jasmine's per-hook timeout so

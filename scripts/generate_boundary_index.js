@@ -60,6 +60,8 @@ function parseArgs(argv) {
     localityMaxPrecision: null,
     localadminMaxPrecision: null,
     countyMaxPrecision: null,
+    countyDenseMaxPrecision: null,
+    countyDenseMaxAreaKm2: null,
     regionMaxPrecision: null,
     regionSparseMaxPrecision: null,
     regionSparseMinAreaKm2: null,
@@ -117,6 +119,12 @@ function parseArgs(argv) {
     } else if (arg === '--county-max-precision') {
       var countyMax = Number(argv[++i])
       opts.countyMaxPrecision = Number.isFinite(countyMax) ? Math.trunc(countyMax) : null
+    } else if (arg === '--county-dense-max-precision') {
+      var countyDenseMax = Number(argv[++i])
+      opts.countyDenseMaxPrecision = Number.isFinite(countyDenseMax) ? Math.trunc(countyDenseMax) : null
+    } else if (arg === '--county-dense-max-area-km2') {
+      var denseAreaKm2 = Number(argv[++i])
+      opts.countyDenseMaxAreaKm2 = Number.isFinite(denseAreaKm2) && denseAreaKm2 > 0 ? denseAreaKm2 : null
     } else if (arg === '--region-max-precision') {
       var regionMax = Number(argv[++i])
       opts.regionMaxPrecision = Number.isFinite(regionMax) ? Math.trunc(regionMax) : null
@@ -175,6 +183,10 @@ function usage() {
     '  --locality-max-precision       Max precision override for locality placetype',
     '  --localadmin-max-precision     Max precision override for localadmin placetype',
     '  --county-max-precision         Max precision override for county placetype',
+    '  --county-dense-max-precision   Optional precision for very small county polygons (for example 5).',
+    '                                 When set together with the area threshold and no explicit',
+    '                                 --county-max-precision, the county cap defaults to one below this',
+    '  --county-dense-max-area-km2    Bbox area threshold to apply dense county precision',
     '  --region-max-precision         Max precision override for region placetype',
     '  --region-sparse-max-precision  Optional precision for very large region polygons (for example 3)',
     '  --region-sparse-min-area-km2   Area threshold to apply sparse region precision',
@@ -862,7 +874,16 @@ function placetypeCode(placetype) {
 function resolveMaxPrecisionForPlacetype(opts, placetype, bbox) {
   if (placetype === 'locality') return opts.localityMaxPrecision
   if (placetype === 'localadmin') return opts.localadminMaxPrecision
-  if (placetype === 'county') return opts.countyMaxPrecision
+  if (placetype === 'county') {
+    var countyPrecision = opts.countyMaxPrecision
+    if (Number.isFinite(opts.countyDenseMaxPrecision) && Number.isFinite(opts.countyDenseMaxAreaKm2)) {
+      var countyAreaKm2 = bboxAreaKm2(bbox)
+      if (countyAreaKm2 <= opts.countyDenseMaxAreaKm2) {
+        countyPrecision = Math.max(countyPrecision, opts.countyDenseMaxPrecision)
+      }
+    }
+    return countyPrecision
+  }
   if (placetype === 'region') {
     var regionPrecision = opts.regionMaxPrecision
     if (Number.isFinite(opts.regionSparseMaxPrecision) && Number.isFinite(opts.regionSparseMinAreaKm2)) {
@@ -1812,6 +1833,26 @@ async function main() {
     throw new Error('--index-mode must be either compact or full')
   }
 
+  if (options.countyDenseMaxPrecision !== null) {
+    if (!Number.isFinite(options.countyDenseMaxPrecision) || options.countyDenseMaxPrecision < 1) {
+      options.countyDenseMaxPrecision = null
+    } else {
+      options.countyDenseMaxPrecision = Math.trunc(options.countyDenseMaxPrecision)
+      if (options.countyDenseMaxPrecision > options.maxPrecision) {
+        options.countyDenseMaxPrecision = options.maxPrecision
+      }
+    }
+  }
+  if (options.countyMaxPrecision === null &&
+    Number.isFinite(options.countyDenseMaxPrecision) &&
+    Number.isFinite(options.countyDenseMaxAreaKm2)) {
+    // The dense rule only differentiates when the regular county cap is
+    // coarser than the dense precision. Without an explicit
+    // --county-max-precision, default the cap to one below the (clamped)
+    // dense precision instead of the global max.
+    options.countyMaxPrecision = Math.max(options.basePrecision, options.countyDenseMaxPrecision - 1)
+  }
+
   options.localityMaxPrecision = clampPrecision(options.localityMaxPrecision, options.basePrecision, options.maxPrecision)
   options.localadminMaxPrecision = clampPrecision(options.localadminMaxPrecision, options.basePrecision, options.maxPrecision)
   options.countyMaxPrecision = clampPrecision(options.countyMaxPrecision, options.basePrecision, options.maxPrecision)
@@ -1842,7 +1883,6 @@ async function main() {
       }
     }
   }
-
   var files = collectInputFiles(options)
   if (!files.length) {
     throw new Error('No input files were found after filtering')
@@ -1918,6 +1958,9 @@ async function main() {
     console.log('Placetype precision caps: locality=' + options.localityMaxPrecision + ', localadmin=' + options.localadminMaxPrecision + ', county=' + options.countyMaxPrecision + ', region=' + options.regionMaxPrecision)
     if (Number.isFinite(options.regionSparseMaxPrecision) && Number.isFinite(options.regionSparseMinAreaKm2)) {
       console.log('Sparse region rule: area_km2>=' + options.regionSparseMinAreaKm2 + ' => max_precision=' + options.regionSparseMaxPrecision)
+    }
+    if (Number.isFinite(options.countyDenseMaxPrecision) && Number.isFinite(options.countyDenseMaxAreaKm2)) {
+      console.log('Dense county rule: area_km2<=' + options.countyDenseMaxAreaKm2 + ' => max_precision=' + options.countyDenseMaxPrecision)
     }
     if (options.dominantLocalityPopulation > 0) {
       console.log('Dominant locality rollup: major_population>=' + options.dominantLocalityPopulation + ', ratio>=' + options.dominantLocalityRatio)
