@@ -1,5 +1,14 @@
 ### Unreleased
 
+- Give every place the geohash cell that contains its own centroid, ahead of
+  the population tie-break, so a border town no longer loses its own centre to
+  the larger city across the border (for example Calexico resolving to
+  Mexicali, or Heerlen to Aachen). Placetype ranking is unchanged, and cells
+  holding two centroids are still decided by population. Disable with
+  `--home-cell-priority false` (`WOF_HOME_CELL_PRIORITY=0`).
+- Stop the dominant-city rollup absorbing the home cell of a town in another
+  country. Rollups inside a country are unchanged, so a metro still reads as
+  one city.
 - Fix `--append` builds handing contested geohash cells to whichever batch ran
   last. Cells that already belong to a better-ranked place (by placetype, then
   population, then centroid distance) now keep their existing owner, so border

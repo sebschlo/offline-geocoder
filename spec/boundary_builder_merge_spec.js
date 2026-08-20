@@ -215,13 +215,15 @@ describe('boundary builder append merge', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-merge-'));
     try {
       const dbPath = path.join(dir, 'legacy.sqlite');
+      // Oldtown owns the contested cell but is centred outside it, so the
+      // population ordering is what decides this one.
       await createLegacyDatabase(dbPath, {
         id: 9001,
         name: 'Oldtown',
         countryId: 'AA',
         placetypeCode: 0,
         latitude: 0.066,
-        longitude: 0.286
+        longitude: 0.10
       }, contestedHash);
 
       const newvilleInput = writeFixture(dir, 'newville.geojson', [
@@ -248,6 +250,42 @@ describe('boundary builder append merge', () => {
       } finally {
         await close(db);
       }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a contested cell with the existing place that is centred in it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-merge-'));
+    try {
+      const dbPath = path.join(dir, 'legacy.sqlite');
+      // Oldtown's centroid is inside the contested cell, so the appended city
+      // takes the rest of the shared strip but not Oldtown's own cell.
+      await createLegacyDatabase(dbPath, {
+        id: 9001,
+        name: 'Oldtown',
+        countryId: 'AA',
+        placetypeCode: 0,
+        latitude: 0.066,
+        longitude: 0.286
+      }, contestedHash);
+
+      const newvilleInput = writeFixture(dir, 'newville.geojson', [
+        boxFeature(2101, 'Newville', 'locality', 'BB', 750000, 0.28, 0, 0.60, 0.15)
+      ]);
+
+      const result = runBuilder([
+        '--database', dbPath,
+        '--input', newvilleInput,
+        '--append',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--index-mode', 'compact'
+      ]);
+
+      expect(result.status).toEqual(0);
+      expect(await lookupOwner(dbPath, contestedHash)).toEqual(9001);
+      expect(await lookupOwner(dbPath, smallOnlyHash)).toEqual(2101);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
