@@ -240,6 +240,17 @@ This lets a curation file ship ahead of the data build that makes it
 effective — see below — while on a fully built database mismatches fail even
 with the flag.
 
+One failure is never deferred, because no future data can fix it: a positive
+probe that lands on a cell **still owned by an absorbed place whose other
+cells the entry did relabel**. That can only happen below `minPrecision`, so
+the probe is standing on ground the merge deliberately leaves alone and can
+never pass — an authoring mistake, not a data gap. `--verify` names the cell,
+its precision, and the two ways out (move the probe onto a cell the entry
+relabels, or turn it into a guard probe expecting the original owner). When
+the source owning that cell has no relabelable cells at all, the same
+situation *is* a data gap — the build simply has not reached this precision
+here — and stays deferrable.
+
 ### A note on the Guatemala probes
 
 Every coordinate in `gt.json` was chosen **empirically against a world build

@@ -946,10 +946,15 @@ async function matchedLookupRow(db, probe, boundary) {
 //     third place is exactly the case that must stay strict).
 //   throughDrainedCell — additionally, that row is still owned by the merge
 //     target, so a passing probe genuinely demonstrates this entry's effect.
+//   onExcludedSourceCell — the matched row STILL belongs to one of the
+//     absorbed places after the merge ran, which can only mean it sits below
+//     minPrecision, i.e. on ground this entry deliberately does not cover. A
+//     positive probe there can never pass; that is an authoring mistake, not
+//     a data gap, so it is reported rather than deferred.
 async function probeTerritory(db, entry, probe, boundary) {
   var matched = await matchedLookupRow(db, probe, boundary)
   if (!matched) {
-    return { onDrainedCell: false, throughDrainedCell: false }
+    return { onDrainedCell: false, throughDrainedCell: false, onExcludedSourceCell: false, matched: null }
   }
 
   var absorbPlaceholders = entry.absorb.map(function() { return '?' }).join(', ')
@@ -963,9 +968,12 @@ async function probeTerritory(db, entry, probe, boundary) {
   `, [entry.into].concat(entry.absorb).concat([matched.geohash]))
 
   var journaled = rows.length > 0
+  var owner = Number(matched.place_id)
   return {
     onDrainedCell: journaled,
-    throughDrainedCell: journaled && Number(matched.place_id) === entry.into
+    throughDrainedCell: journaled && owner === entry.into,
+    onExcludedSourceCell: entry.absorb.indexOf(owner) !== -1,
+    matched: matched
   }
 }
 
@@ -1058,12 +1066,31 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
         expectOwnsCache[expectKey] = await expectedPlaceOwnsCells(db, probe.expect, entry.country)
       }
 
+      // A positive probe can end up on a cell still owned by an absorbed
+      // source, which only happens below minPrecision. Two very different
+      // things look like that, and the owning source tells them apart:
+      //
+      //   - that source DOES have relabelable cells (it is not missing), so
+      //     the build already produces this entry's precision and the probe
+      //     was simply placed on ground the merge deliberately leaves alone.
+      //     An authoring mistake: report it, never defer, or a broken
+      //     curation file would commit silently.
+      //   - that source has none, so the build has not reached this entry's
+      //     precision here at all. That is the documented ship-ahead case
+      //     and stays deferrable.
+      var excludedCellOwner = territory.matched ? Number(territory.matched.place_id) : null
+      var misplacedPositive = isPositive &&
+        territory.onExcludedSourceCell &&
+        missingSources.indexOf(excludedCellOwner) === -1
+
       var reasons = []
-      if (!expectOwnsCache[expectKey]) {
-        reasons.push('expected place "' + probe.expect + '" (' + entry.country + ') owns no cells in this database yet')
-      }
-      if (missingSources.length && isPositive && !territory.onDrainedCell) {
-        reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells at precision >= ' + entry.minPrecision + ' in this database yet')
+      if (!misplacedPositive) {
+        if (!expectOwnsCache[expectKey]) {
+          reasons.push('expected place "' + probe.expect + '" (' + entry.country + ') owns no cells in this database yet')
+        }
+        if (missingSources.length && isPositive && !territory.onDrainedCell) {
+          reasons.push('merge source(s) ' + missingSources.join(', ') + ' own no cells at precision >= ' + entry.minPrecision + ' in this database yet')
+        }
       }
 
       if (reasons.length && skipUnresolvable) {
@@ -1076,7 +1103,13 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
         ? ' (' + reasons.join('; ') + '; rerun with --skip-unresolvable to defer this probe)'
         : ''
       var got = '"' + (actual || '<nothing>') + '"'
-      if (actual === probe.expect && !idMatches) {
+      if (misplacedPositive) {
+        got = '"' + (actual || '<nothing>') + '" from cell ' + territory.matched.geohash +
+          ' (precision ' + territory.matched.geohash.length + ', still owned by absorbed place ' +
+          territory.matched.place_id + ' because it is below this entry\'s minPrecision ' + entry.minPrecision +
+          '); this probe stands on ground the merge deliberately leaves alone, so it can never pass' +
+          ' — move it onto a cell the entry relabels, or make it a guard probe expecting "' + actual + '"'
+      } else if (actual === probe.expect && !idMatches) {
         got = '"' + actual + '" (same-named place ' + (result && result.id) + ', not the merge target ' + entry.into + ')'
       } else if (actual === probe.expect && !pathMatches) {
         got = '"' + actual + '" via ' + (resolvedVia || 'an unknown path') +

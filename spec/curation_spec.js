@@ -1689,6 +1689,68 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
+  it('reports a positive probe below minPrecision as an authoring error, never defers it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // East County is available and drains its fine cell; Ghost Town is an
+      // unavailable source. The second positive probe sits on East County's
+      // COARSE cell, which minPrecision deliberately leaves alone, so it can
+      // never pass. That is a broken curation file, not a data gap: Ghost
+      // Town's absence must not excuse it, even though a first positive
+      // probe already satisfies the completeness rule.
+      const doc = {
+        country: 'US',
+        entries: [
+          {
+            op: 'merge',
+            into: CITY,
+            absorb: [EAST, GHOST],
+            minPrecision: 5,
+            rationale: 'Synthetic: available source with coarse cells plus an unavailable source.',
+            probes: [
+              { lat: points.east.lat, lon: points.east.lon, expect: 'Big City', note: 'positive on the drained fine cell' },
+              { lat: coarseEastProbe.lat, lon: coarseEastProbe.lon, expect: 'Big City', note: 'misplaced: sits on a coarse cell the merge leaves alone' },
+              { lat: points.bystander.lat, lon: points.bystander.lon, expect: 'Bystander County', note: 'guard' }
+            ]
+          }
+        ]
+      };
+      const docPath = writeDoc(dir, 'us.json', doc);
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify', '--skip-unresolvable']);
+      expect(result.status).toEqual(1);
+      expect(result.stderr).toContain('below this entry\'s minPrecision 5');
+      expect(result.stderr).toContain(`still owned by absorbed place ${EAST}`);
+      expect(result.stdout).toContain('skipped: 0');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still accepts a coarse-cell probe that guards the original owner', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // The same coordinate is legitimate when it expects the ORIGINAL owner:
+      // that is the guard proving coarse cells keep their identity. baseDoc
+      // uses exactly this probe, so it must keep passing.
+      const docPath = writeDoc(dir, 'us.json', baseDoc());
+
+      const result = runCurate(['--database', dbPath, '--curation', docPath, '--verify']);
+      expect(result.status).toEqual(0);
+      expect(result.stdout).toContain('Probes passed: 3, skipped: 0, failed: 0');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('ships a structurally valid Guatemala curation file', () => {
     const gtPath = path.join(__dirname, '..', 'curation', 'gt.json');
     const doc = JSON.parse(fs.readFileSync(gtPath, 'utf8'));
