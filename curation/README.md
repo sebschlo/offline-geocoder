@@ -39,6 +39,20 @@ Community contributions are welcome: propose changes to these files via pull
 request, with the rationale in the entry itself and, ideally, the output of a
 `--dry-run` in the PR description.
 
+## Precedence: curation is the final labeling layer
+
+The builder establishes ownership in the generated database first, including
+generic guarantees such as `--home-cell-priority`. Curation is applied after
+generation and is an explicit, reviewed exception to those rules: for every
+cell matched by an overlay, the overlay's relabeling takes precedence. An
+absorbed place may therefore no longer own the cell containing its centroid in
+the curated database. That is intentional only where the entry's rationale and
+positive and guard probes approve the final label.
+
+The probe-verified, overlay-applied database is the result intended for
+shipping. After a replace-mode rebuild, re-apply curation; for append-mode
+refreshes, follow the revert, refresh, and re-apply sequence documented below.
+
 ## File format
 
 Exactly one JSON file per country, named by lowercase ISO 3166-1 alpha-2 code
