@@ -3,6 +3,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const http = require('http')
 const https = require('https')
 
@@ -429,6 +430,7 @@ async function ensureSamplePoints(sourceDb, cacheDb, lookupTable, targetCount, s
 }
 
 var LATIN_BASE_RE = /\p{Script=Latin}/u
+var GREEK_BASE_RE = /\p{Script=Greek}/u
 
 // Latin letters that NFKD does not decompose: their diacritic or ligature is
 // part of the letter itself. LocationIQ and the offline database often differ
@@ -473,10 +475,18 @@ function normalizeName(value) {
   var decomposed = String(value).normalize('NFKD')
   var kept = ''
   var lastBaseIsLatin = false
+  var lastBaseIsGreek = false
   for (var ch of decomposed) {
     var code = ch.codePointAt(0)
     if (code >= 0x0300 && code <= 0x036f) {
-      if (!lastBaseIsLatin) kept += ch
+      // Strip when the base is Latin (é → e), and for the Greek tonos on a
+      // Greek base (ή → η): it marks stress and is routinely dropped in
+      // uppercase or accent-stripped place data, so Αθήνα must equal ΑΘΗΝΑ.
+      // Every other mark on a non-Latin base is part of the letter (Cyrillic
+      // и + breve = й), including the Greek dialytika, which distinguishes
+      // letters rather than marking stress.
+      var isGreekTonos = code === 0x0301 && lastBaseIsGreek
+      if (!lastBaseIsLatin && !isGreekTonos) kept += ch
       continue
     }
     // Hebrew: strip only the actual combining marks (cantillation, niqqud,
@@ -495,6 +505,7 @@ function normalizeName(value) {
     // that never decompose themselves, yet their accented forms do (ǿ is
     // ø + U+0301 under NFKD) and must fold the same way as e/é.
     lastBaseIsLatin = LATIN_BASE_RE.test(ch)
+    lastBaseIsGreek = GREEK_BASE_RE.test(ch)
   }
 
   return foldLatinLetters(kept.toLowerCase())
@@ -1055,6 +1066,8 @@ var SWEEP_DEFAULT_WORKDIR = 'tmp/locationiq-sweep'
 // per endpoint/language configuration must still share one daily cap,
 // because they all spend requests against the same API key.
 var SWEEP_DEFAULT_STATE_PATH = 'tmp/locationiq-quota.json'
+// A base32 geohash carries no useful precision past 12 characters.
+var MAX_GEOHASH_PRECISION = 12
 // Fixed seed for the sampler's country-order shuffle: stable across runs, but
 // not alphabetical, so a small --max-points does not bias the world sample
 // toward alphabetically-early country codes.
@@ -1113,9 +1126,12 @@ function sweepUsage() {
     '  --database <path>        Offline geocoder SQLite database (required)',
     '  --workdir <path>         Directory for cache/report files (default: ' + SWEEP_DEFAULT_WORKDIR + ')',
     '  --cache <path>           LocationIQ response cache (default: <workdir>/cache.jsonl)',
-    '  --state <path>           Daily quota state file (default: ' + SWEEP_DEFAULT_STATE_PATH + ').',
-    '                           Deliberately outside the workdir: all sweep configurations',
-    '                           share one daily cap because they spend the same API key.',
+    '  --state <path>           Daily quota state file (default: ' + SWEEP_DEFAULT_STATE_PATH + ', suffixed',
+    '                           with a non-reversible fingerprint of the API key).',
+    '                           Deliberately outside the workdir, so every endpoint/language',
+    '                           configuration using the same key shares one daily cap; keys are',
+    '                           metered separately by LocationIQ, so each gets its own tally.',
+    '                           Pass this explicitly to force several keys to share one cap.',
     '  --report <path>          Markdown report output (default: <workdir>/report.md)',
     '  --mismatches <path>      Mismatch JSONL output (default: <workdir>/mismatches.jsonl)',
     '  --api-key <key>          LocationIQ API key (or env LOCATIONIQ_API_KEY)',
@@ -1141,6 +1157,23 @@ function sweepUsage() {
 
 function utcDateString(date) {
   return date.toISOString().slice(0, 10)
+}
+
+function apiKeyFingerprint(apiKey) {
+  // Non-reversible and never logged in full: only used to keep one
+  // credential's tally separate from another's.
+  return crypto.createHash('sha256').update(String(apiKey), 'utf8').digest('hex').slice(0, 12)
+}
+
+function defaultStatePath(apiKey) {
+  // LocationIQ meters each key separately, so the default state is scoped
+  // per credential: sharing one file across keys would stop a fresh key's
+  // sweep at another key's spent cap. Scoping stays independent of the
+  // workdir, so endpoint/language configurations on the SAME key still
+  // share one tally. Pass --state explicitly to force sharing.
+  if (!apiKey) return path.resolve(SWEEP_DEFAULT_STATE_PATH)
+  var parsed = path.parse(path.resolve(SWEEP_DEFAULT_STATE_PATH))
+  return path.join(parsed.dir, parsed.name + '-' + apiKeyFingerprint(apiKey) + parsed.ext)
 }
 
 function isCanonicalUtcDateString(value) {
@@ -1905,7 +1938,11 @@ async function runSweep(opts, deps) {
         break
       }
 
-      var waitMs = lastRequestAt + delayMs - Date.now()
+      // Cap the wait at the configured interval: if the clock moved backward
+      // after this process issued a request, lastRequestAt sits ahead of now
+      // and the raw difference would sleep for the entire offset — long
+      // enough to stall the run and to delay the clock_backward check below.
+      var waitMs = Math.min(delayMs, lastRequestAt + delayMs - Date.now())
       if (waitMs > 0) await sleepImpl(waitMs)
 
       // A long run can cross midnight UTC — including during the rate-limit
@@ -2185,9 +2222,16 @@ function parseSweepArgs(argv) {
   if (opts.maxPrecision < opts.basePrecision) {
     throw new Error('--max-precision (' + opts.maxPrecision + ') must be >= --base-precision (' + opts.basePrecision + ')')
   }
+  // A base32 geohash saturates at 12 characters (sub-millimetre), and the
+  // reverse lookup encodes one hash per precision level, so an accidental
+  // extra digit would otherwise hang the run doing meaningless work.
+  if (opts.basePrecision > MAX_GEOHASH_PRECISION || opts.maxPrecision > MAX_GEOHASH_PRECISION) {
+    throw new Error('geohash precision must be between 1 and ' + MAX_GEOHASH_PRECISION +
+      ', got --base-precision ' + opts.basePrecision + ' --max-precision ' + opts.maxPrecision)
+  }
 
   if (!opts.cachePath) opts.cachePath = path.join(opts.workdir, 'cache.jsonl')
-  if (!opts.statePath) opts.statePath = path.resolve(SWEEP_DEFAULT_STATE_PATH)
+  if (!opts.statePath) opts.statePath = defaultStatePath(opts.apiKey)
   if (!opts.reportPath) opts.reportPath = path.join(opts.workdir, 'report.md')
   if (!opts.mismatchesPath) opts.mismatchesPath = path.join(opts.workdir, 'mismatches.jsonl')
 

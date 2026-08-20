@@ -342,8 +342,10 @@ Every LocationIQ response is cached as JSONL keyed by coordinates rounded to
 four decimals, so re-running the same command never re-queries a cached point —
 if a run stops at the daily cap or on HTTP 429, just run it again later to
 resume. The daily-cap state lives outside the workdir (default
-`tmp/locationiq-quota.json`), so multiple sweep configurations share one cap
-for the same API key. Outputs land under `--workdir` (default `tmp/locationiq-sweep/`):
+`tmp/locationiq-quota.json`, suffixed with a non-reversible fingerprint of the
+API key), so every sweep configuration using one key shares a single cap, while
+separate keys — which LocationIQ meters separately — keep their own tallies.
+Outputs land under `--workdir` (default `tmp/locationiq-sweep/`):
 `report.md` (per-country point counts, agreement %, country mismatches, worst
 examples) and `mismatches.jsonl` (machine-readable list of all mismatches).
 See `sweep --help` and `sample --help` for all options.

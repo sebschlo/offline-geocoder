@@ -359,6 +359,18 @@ describe('locationiq sweep', () => {
       expect(liq.normalizeName('й')).not.toEqual(liq.normalizeName('и'));
     });
 
+    it('treats the Greek tonos as optional while keeping the dialytika', () => {
+      // Uppercase and accent-stripped place data routinely drop the stress
+      // accent, so these spellings must compare equal.
+      expect(liq.normalizeName('Αθήνα')).toEqual(liq.normalizeName('ΑΘΗΝΑ'));
+      expect(liq.normalizeName('Αθήνα')).toEqual(liq.normalizeName('Αθηνα'));
+      expect(liq.normalizeName('Θεσσαλονίκη')).toEqual(liq.normalizeName('ΘΕΣΣΑΛΟΝΙΚΗ'));
+      // The dialytika distinguishes letters rather than marking stress.
+      expect(liq.normalizeName('Μαϊάμι')).not.toEqual(liq.normalizeName('Μαιαμι'));
+      // Marks on other non-Latin bases are still preserved.
+      expect(liq.normalizeName('й')).not.toEqual(liq.normalizeName('и'));
+    });
+
     it('folds Latin letters that NFKD leaves undecomposed', () => {
       // These carry the diacritic inside the letter, so decomposition alone
       // never reaches the ASCII spelling the other geocoder likely uses.
@@ -771,6 +783,65 @@ describe('locationiq sweep', () => {
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
+    });
+
+    it('caps the pacing wait when the clock rolls back mid-process', async () => {
+      const dir = makeTmpDir();
+      try {
+        writePointsFile(dir, WORLD_POINTS);
+        const deps = makeDeps(() => okResponse({ city: 'Testville', country_code: 'us' }));
+        const waits = [];
+        deps.sleep = async (ms) => { waits.push(ms); };
+        // The clock is an hour ahead while the first request is recorded,
+        // then corrected backward. lastRequestAt is now an hour in the
+        // future, so the raw difference would sleep for that whole offset;
+        // the wait must stay bounded by the configured interval instead.
+        const realNow = Date.now;
+        let calls = 0;
+        spyOn(Date, 'now').and.callFake(() => {
+          calls += 1;
+          const base = realNow.call(Date);
+          return calls <= 2 ? base + 3600 * 1000 : base;
+        });
+
+        const summary = await liq.runSweep(sweepOpts(dir, { rps: 1, dailyCap: 3 }), deps);
+
+        expect(summary.requestsThisRun).toBeGreaterThan(1);
+        expect(waits.length).toBeGreaterThan(0);
+        waits.forEach((ms) => expect(ms).toBeLessThanOrEqual(1000));
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('scopes the default quota state per API key', () => {
+      // LocationIQ meters each key separately, so one key's spent cap must
+      // not stop another key's sweep.
+      const a = liq.parseSweepArgs(['--api-key', 'key-a']).statePath;
+      const b = liq.parseSweepArgs(['--api-key', 'key-b']).statePath;
+      expect(a).not.toEqual(b);
+      // The key itself never appears in the path.
+      expect(a).not.toContain('key-a');
+
+      // The same key shares one tally across workdirs and languages.
+      const sameKeyElsewhere = liq.parseSweepArgs([
+        '--api-key', 'key-a', '--workdir', path.join(os.tmpdir(), 'liq-fr'), '--accept-language', 'fr'
+      ]).statePath;
+      expect(sameKeyElsewhere).toEqual(a);
+
+      // An explicit --state still forces sharing across keys.
+      const shared = path.join(os.tmpdir(), 'shared-quota.json');
+      expect(liq.parseSweepArgs(['--api-key', 'key-a', '--state', shared]).statePath)
+        .toEqual(liq.parseSweepArgs(['--api-key', 'key-b', '--state', shared]).statePath);
+    });
+
+    it('rejects geohash precisions beyond the format maximum', () => {
+      // reverseHashes encodes one geohash per precision level, so an
+      // accidental extra digit would hang the run doing meaningless work.
+      expect(() => liq.parseSweepArgs(['--max-precision', '100000'])).toThrowError(/precision must be between 1 and 12/);
+      expect(() => liq.parseSweepArgs(['--base-precision', '50'])).toThrowError(/precision must be between 1 and 12/);
+      expect(liq.parseSweepArgs(['--base-precision', '4', '--max-precision', '7']).maxPrecision).toEqual(7);
+      expect(liq.parseSweepArgs(['--base-precision', '12', '--max-precision', '12']).maxPrecision).toEqual(12);
     });
 
     it('rejects a malformed endpoint before any quota is spent', async () => {
