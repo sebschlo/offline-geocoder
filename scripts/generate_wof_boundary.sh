@@ -29,6 +29,7 @@ set -euo pipefail
 #   WOF_DOMINANT_LOCALITY_POPULATION Major-locality threshold for dominant-city rollup (default: 100000)
 #   WOF_DOMINANT_LOCALITY_RATIO      Dominant-vs-next locality population ratio (default: 3)
 #   WOF_PARENT_LOCALITY_MIN_SHARE    Minimum child-cell share (0..1) required for locality parent takeover (default: 0.5)
+#   WOF_DOMINANT_CITY_PLACETYPES     Placetypes eligible to take over a parent cell (default: locality,localadmin)
 #   WOF_INCLUDE_LOCALADMIN         Include localadmin placetypes (default: 0)
 #   WOF_INCLUDE_COUNTY             Include county placetypes (default: 1)
 #   WOF_INCLUDE_REGION             Include region placetypes (default: 1)
@@ -72,6 +73,7 @@ WOF_PROMOTE_LOCALITY_OVER_REGION="${WOF_PROMOTE_LOCALITY_OVER_REGION:-1}"
 WOF_DOMINANT_LOCALITY_POPULATION="${WOF_DOMINANT_LOCALITY_POPULATION:-100000}"
 WOF_DOMINANT_LOCALITY_RATIO="${WOF_DOMINANT_LOCALITY_RATIO:-3}"
 WOF_PARENT_LOCALITY_MIN_SHARE="${WOF_PARENT_LOCALITY_MIN_SHARE:-0.5}"
+WOF_DOMINANT_CITY_PLACETYPES="${WOF_DOMINANT_CITY_PLACETYPES:-locality,localadmin}"
 WOF_INCLUDE_LOCALADMIN="${WOF_INCLUDE_LOCALADMIN:-0}"
 WOF_INCLUDE_COUNTY="${WOF_INCLUDE_COUNTY:-1}"
 WOF_INCLUDE_REGION="${WOF_INCLUDE_REGION:-1}"
@@ -151,6 +153,7 @@ COMMON_FLAGS=(
   --dominant-locality-population "${WOF_DOMINANT_LOCALITY_POPULATION}"
   --dominant-locality-ratio "${WOF_DOMINANT_LOCALITY_RATIO}"
   --parent-locality-min-share "${WOF_PARENT_LOCALITY_MIN_SHARE}"
+  --dominant-city-placetypes "${WOF_DOMINANT_CITY_PLACETYPES}"
   --include-localadmin "${WOF_INCLUDE_LOCALADMIN}"
   --include-county "${WOF_INCLUDE_COUNTY}"
   --include-region "${WOF_INCLUDE_REGION}"

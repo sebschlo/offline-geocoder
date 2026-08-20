@@ -22,6 +22,11 @@ const PLACETYPE_BY_CODE = {
   3: 'county'
 }
 
+// Placetypes allowed to play the "dominant city" role in the parent-cell
+// rollup. A county is a city-like placetype for ownership purposes, but naming
+// a metro after its county reads as a mistake, so counties are out by default.
+const DEFAULT_DOMINANT_CITY_PLACETYPES = ['locality', 'localadmin']
+
 function parseBool(value, defaultValue) {
   if (value === undefined || value === null || value === '') {
     return defaultValue
@@ -36,6 +41,34 @@ function parseBool(value, defaultValue) {
   }
 
   return defaultValue
+}
+
+function parsePlacetypeList(value, defaultValue) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return defaultValue
+  }
+
+  var parts = String(value).split(',')
+  var placetypes = []
+  for (var i = 0; i < parts.length; i++) {
+    var name = parts[i].toLowerCase().trim()
+    if (!name) continue
+    if (!Object.prototype.hasOwnProperty.call(PLACETYPE_CODES, name)) {
+      throw new Error('Unknown placetype in --dominant-city-placetypes: ' + parts[i].trim())
+    }
+    if (!isCityPlacetypeCode(PLACETYPE_CODES[name])) {
+      throw new Error('--dominant-city-placetypes only accepts city-like placetypes: ' + parts[i].trim())
+    }
+    if (placetypes.indexOf(name) === -1) {
+      placetypes.push(name)
+    }
+  }
+
+  if (!placetypes.length) {
+    throw new Error('--dominant-city-placetypes requires at least one placetype')
+  }
+
+  return placetypes
 }
 
 function parseArgs(argv) {
@@ -68,7 +101,8 @@ function parseArgs(argv) {
     promoteLocalityOverRegion: true,
     dominantLocalityPopulation: 100000,
     dominantLocalityRatio: 3,
-    parentLocalityMinShare: 0.5
+    parentLocalityMinShare: 0.5,
+    dominantCityPlacetypes: DEFAULT_DOMINANT_CITY_PLACETYPES.slice()
   }
 
   for (var i = 0; i < argv.length; i++) {
@@ -142,6 +176,8 @@ function parseArgs(argv) {
     } else if (arg === '--dominant-locality-ratio') {
       var dominantRatio = Number(argv[++i])
       opts.dominantLocalityRatio = Number.isFinite(dominantRatio) ? dominantRatio : opts.dominantLocalityRatio
+    } else if (arg === '--dominant-city-placetypes') {
+      opts.dominantCityPlacetypes = parsePlacetypeList(argv[++i], opts.dominantCityPlacetypes)
     } else if (arg === '--parent-locality-min-share') {
       var minShare = Number(argv[++i])
       opts.parentLocalityMinShare = Number.isFinite(minShare) ? minShare : opts.parentLocalityMinShare
@@ -194,6 +230,7 @@ function usage() {
     '  --dominant-locality-population Population threshold that marks locality as major for dominant-city rollups (default: 100000)',
     '  --dominant-locality-ratio      Required dominant-vs-next population ratio for locality rollups (default: 3)',
     '  --parent-locality-min-share    Minimum child-cell share (0..1) required to let a locality take over a parent cell (default: 0.5)',
+    '  --dominant-city-placetypes     Comma-separated placetypes eligible to take over a parent cell, by competition or as its only city-like owner (default: ' + DEFAULT_DOMINANT_CITY_PLACETYPES.join(',') + ')',
     '  --append                       Keep existing boundary rows and append/replace by place id',
     '  --replace                      Clear boundary rows first (default)',
     '  --help, -h                     Show this help message'
@@ -946,6 +983,28 @@ function isCityPlacetypeCode(code) {
   return code === PLACETYPE_CODES.locality || code === PLACETYPE_CODES.localadmin || code === PLACETYPE_CODES.county
 }
 
+// Owning a cell and standing in for a whole metro are different jobs. Every
+// city-like placetype (county included) can win a cell through the comparator;
+// only these placetypes may become the dominant city a parent cell is named
+// after, so a metro never ends up labelled with its county's name.
+function isDominantCityPlacetypeCode(code, opts) {
+  if (!isCityPlacetypeCode(code)) {
+    return false
+  }
+
+  var names = opts && Array.isArray(opts.dominantCityPlacetypes) && opts.dominantCityPlacetypes.length
+    ? opts.dominantCityPlacetypes
+    : DEFAULT_DOMINANT_CITY_PLACETYPES
+
+  for (var i = 0; i < names.length; i++) {
+    if (PLACETYPE_CODES[names[i]] === code) {
+      return true
+    }
+  }
+
+  return false
+}
+
 // Rebuild a comparable place record from a stored compact_places row so that
 // appended batches can be ranked against places written by earlier batches.
 // Databases created before population/area were stored yield NULL for those
@@ -1011,6 +1070,7 @@ function selectDominantLocalityId(localityIds, placeById, opts) {
       var place = placeById[String(id)]
       return {
         id: Number(id),
+        placetypeCode: place ? place.placetypeCode : null,
         population: placePopulation(place)
       }
     })
@@ -1063,6 +1123,24 @@ function localityShareMeetsThreshold(localityId, group, opts) {
   }
 
   return localityShareInParent(localityId, group) >= threshold
+}
+
+// The single gate for taking over a parent cell, shared by both roll-up paths
+// -- the lone city-like owner and the winner of a dominant-city competition --
+// so that neither can drift away from the other. A candidate qualifies only if
+// its placetype may name a parent cell (counties may not, by default) and it
+// owns enough of the parent's child cells to stand in for the whole of it.
+// A candidate rejected here is not replaced by a runner-up: the runner-up lost
+// the cell competition, so promoting it would name the parent after a place
+// that owns less of it. The parent keeps its existing owner instead, and every
+// child keeps the cell it won.
+function localityMayTakeOverParent(localityId, group, placeById, opts) {
+  var place = placeById[String(localityId)]
+  if (!place || !isDominantCityPlacetypeCode(place.placetypeCode, opts)) {
+    return false
+  }
+
+  return localityShareMeetsThreshold(localityId, group, opts)
 }
 
 function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
@@ -1123,7 +1201,7 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
 
       if (localityIds.length === 1) {
         var localityId = Number(localityIds[0])
-        if (!localityShareMeetsThreshold(localityId, group, opts)) {
+        if (!localityMayTakeOverParent(localityId, group, placeById, opts)) {
           continue
         }
 
@@ -1148,7 +1226,7 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
         if (dominantLocalityId === null) {
           continue
         }
-        if (!localityShareMeetsThreshold(dominantLocalityId, group, opts)) {
+        if (!localityMayTakeOverParent(dominantLocalityId, group, placeById, opts)) {
           continue
         }
 
@@ -1865,6 +1943,9 @@ async function main() {
   if (!Number.isFinite(options.dominantLocalityRatio) || options.dominantLocalityRatio < 1) {
     options.dominantLocalityRatio = 1
   }
+  if (!Array.isArray(options.dominantCityPlacetypes) || !options.dominantCityPlacetypes.length) {
+    options.dominantCityPlacetypes = DEFAULT_DOMINANT_CITY_PLACETYPES.slice()
+  }
   if (!Number.isFinite(options.parentLocalityMinShare)) {
     options.parentLocalityMinShare = 0.5
   }
@@ -1963,7 +2044,7 @@ async function main() {
       console.log('Dense county rule: area_km2<=' + options.countyDenseMaxAreaKm2 + ' => max_precision=' + options.countyDenseMaxPrecision)
     }
     if (options.dominantLocalityPopulation > 0) {
-      console.log('Dominant locality rollup: major_population>=' + options.dominantLocalityPopulation + ', ratio>=' + options.dominantLocalityRatio)
+      console.log('Dominant locality rollup: major_population>=' + options.dominantLocalityPopulation + ', ratio>=' + options.dominantLocalityRatio + ', placetypes=' + options.dominantCityPlacetypes.join(','))
     } else {
       console.log('Dominant locality rollup: disabled')
     }

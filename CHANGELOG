@@ -1,5 +1,18 @@
 ### Unreleased
 
+- Keep counties out of the dominant-city rollup. A parent geohash cell rolled
+  up to the place that dominates its children on population, and `county`
+  counted as a city-like placetype, so a metro could be labelled with its
+  county's name while the smaller localities under it lost their own cells
+  (Brockport and Greece, NY answering "Monroe"). The rollup now only hands a
+  parent cell to a placetype listed in `--dominant-city-placetypes`
+  (default `locality,localadmin`, env `WOF_DOMINANT_CITY_PLACETYPES`); add
+  `county` to that list to reproduce earlier builds. Counties still win cells
+  through the normal comparator. Both routes into a parent cell -- winning the
+  dominant-city competition, and being the only city-like owner in the cell --
+  share one eligibility gate, so a county cannot take a parent cell through the
+  single-candidate path either.
+
 - Document the database backwards-compatibility contract in COMPATIBILITY.md
   and enforce it with permanent per-generation reader fixtures in
   spec/reader_compatibility_spec.js

@@ -17,6 +17,107 @@ function close(db) {
   });
 }
 
+const DOMINANT_COUNTY_PARENT_HASH = 's000';
+
+function rectangleRing(minLon, minLat, maxLon, maxLat) {
+  return [[
+    [minLon, minLat],
+    [maxLon, minLat],
+    [maxLon, maxLat],
+    [minLon, maxLat],
+    [minLon, minLat]
+  ]];
+}
+
+function polygonFeature(id, name, placetype, population, ring) {
+  const properties = {
+    name,
+    placetype,
+    country_id: 'US',
+    admin1_id: 36,
+    is_current: 1
+  };
+
+  if (population !== null) {
+    properties.population = population;
+  }
+
+  return {
+    type: 'Feature',
+    id,
+    properties,
+    geometry: { type: 'Polygon', coordinates: ring }
+  };
+}
+
+// Covers the whole parent cell, so it owns that cell outright and stands in as
+// the fallback label the rollup competes against.
+function regionFeature(id, name, bbox) {
+  return polygonFeature(id, name, 'region', null, rectangleRing(bbox.minLon, bbox.minLat, bbox.maxLon, bbox.maxLat));
+}
+
+// A town sitting inside one child cell, inset so that it never touches a
+// neighbouring cell: a polygon that shares an edge with the next cell claims
+// that cell too, which would put both towns in competition for the same cells.
+function childCellFeature(id, name, placetype, population, childHash) {
+  const cell = geohash.decodeBbox(childHash);
+  const insetLon = (cell.maxLon - cell.minLon) / 4;
+  const insetLat = (cell.maxLat - cell.minLat) / 4;
+
+  return polygonFeature(id, name, placetype, population, rectangleRing(
+    cell.minLon + insetLon,
+    cell.minLat + insetLat,
+    cell.maxLon - insetLon,
+    cell.maxLat - insetLat
+  ));
+}
+
+function descendantCountSql(parentHash, placeId) {
+  return `SELECT COUNT(*) AS count FROM compact_geohash_lookup WHERE geohash LIKE '${parentHash}%' AND geohash <> '${parentHash}' AND place_id = ${placeId}`;
+}
+
+// The Rochester shape: a county that outpopulates every town inside it, two
+// small towns that each own their own child cells, and a region as fallback.
+function writeDominantCountyFixture(inputPath) {
+  const bbox = geohash.decodeBbox(DOMINANT_COUNTY_PARENT_HASH);
+  const height = bbox.maxLat - bbox.minLat;
+  const children = geohash.children(DOMINANT_COUNTY_PARENT_HASH);
+
+  fs.writeFileSync(inputPath, JSON.stringify({
+    type: 'FeatureCollection',
+    features: [
+      regionFeature(8001, 'Fallback Region', bbox),
+      // Stops short of the cell's northern edge, the way a real county
+      // boundary does, so it owns the child cells and not the parent itself.
+      polygonFeature(8002, 'Monroe County', 'county', 748482,
+        rectangleRing(bbox.minLon, bbox.minLat, bbox.maxLon, bbox.maxLat - (height / 100))),
+      childCellFeature(8003, 'Brockport', 'locality', 8366, children[0]),
+      childCellFeature(8004, 'Greece', 'locality', 14519, children[20])
+    ]
+  }));
+
+  return inputPath;
+}
+
+// The same shape with the towns taken out: the county is then the only
+// city-like owner inside the parent cell, which sends the roll-up down its
+// single-candidate path instead of the dominant-city competition.
+function writeLoneCountyFixture(inputPath) {
+  const bbox = geohash.decodeBbox(DOMINANT_COUNTY_PARENT_HASH);
+  const height = bbox.maxLat - bbox.minLat;
+
+  fs.writeFileSync(inputPath, JSON.stringify({
+    type: 'FeatureCollection',
+    features: [
+      regionFeature(8101, 'Fallback Region', bbox),
+      polygonFeature(8102, 'Monroe County', 'county', 748482,
+        rectangleRing(bbox.minLon, bbox.minLat, bbox.maxLon, bbox.maxLat - (height / 100)))
+    ]
+  }));
+
+  return inputPath;
+}
+
 describe('boundary builder', () => {
   it('drops contained localities when pruning is enabled', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
@@ -641,6 +742,252 @@ describe('boundary builder', () => {
       } finally {
         await close(db);
       }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('does not roll a parent cell up to a dominant county', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'dominant-county.geojson');
+      const dbPath = path.join(dir, 'dominant-county.sqlite');
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', writeDominantCountyFixture(inputPath),
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--include-county', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--dominant-locality-population', '100000',
+        '--dominant-locality-ratio', '3'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        // The county outranks every town on population, so it must not carry
+        // the parent cell -- and the runner-up town must not inherit the
+        // rollup either, because it lost the same competition.
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${DOMINANT_COUNTY_PARENT_HASH}'`);
+        expect(parentRow).toEqual([{ geohash: DOMINANT_COUNTY_PARENT_HASH, place_id: 8001 }]);
+
+        const smallTownCells = await all(db, descendantCountSql(DOMINANT_COUNTY_PARENT_HASH, 8003));
+        expect(smallTownCells[0].count).toBeGreaterThan(0);
+
+        const largerTownCells = await all(db, descendantCountSql(DOMINANT_COUNTY_PARENT_HASH, 8004));
+        expect(largerTownCells[0].count).toBeGreaterThan(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls a parent cell up to a dominant county when county is opted back in', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'dominant-county-opt-in.geojson');
+      const dbPath = path.join(dir, 'dominant-county-opt-in.sqlite');
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', writeDominantCountyFixture(inputPath),
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--include-county', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--dominant-locality-population', '100000',
+        '--dominant-locality-ratio', '3',
+        '--dominant-city-placetypes', 'locality,localadmin,county'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${DOMINANT_COUNTY_PARENT_HASH}'`);
+        expect(parentRow).toEqual([{ geohash: DOMINANT_COUNTY_PARENT_HASH, place_id: 8002 }]);
+
+        const smallTownCells = await all(db, descendantCountSql(DOMINANT_COUNTY_PARENT_HASH, 8003));
+        expect(smallTownCells[0].count).toEqual(0);
+
+        const largerTownCells = await all(db, descendantCountSql(DOMINANT_COUNTY_PARENT_HASH, 8004));
+        expect(largerTownCells[0].count).toEqual(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not roll a parent cell up to a county that is its only city-like owner', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'lone-county.geojson');
+      const dbPath = path.join(dir, 'lone-county.sqlite');
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', writeLoneCountyFixture(inputPath),
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--include-county', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        // The county is the sole city-like child owner and covers the whole
+        // parent cell, so it clears the child-share threshold -- but taking
+        // the parent cell over would still label the metro with the county's
+        // name, which is what the placetype gate exists to prevent.
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${DOMINANT_COUNTY_PARENT_HASH}'`);
+        expect(parentRow).toEqual([{ geohash: DOMINANT_COUNTY_PARENT_HASH, place_id: 8101 }]);
+
+        // Losing the roll-up costs the county nothing below the parent cell.
+        const countyCells = await all(db, descendantCountSql(DOMINANT_COUNTY_PARENT_HASH, 8102));
+        expect(countyCells[0].count).toBeGreaterThan(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls a parent cell up to a lone county when county is opted back in', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'lone-county-opt-in.geojson');
+      const dbPath = path.join(dir, 'lone-county-opt-in.sqlite');
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', writeLoneCountyFixture(inputPath),
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--include-county', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--dominant-city-placetypes', 'locality,localadmin,county'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${DOMINANT_COUNTY_PARENT_HASH}'`);
+        expect(parentRow).toEqual([{ geohash: DOMINANT_COUNTY_PARENT_HASH, place_id: 8102 }]);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still rolls a parent cell up to a dominant city when a county owns cells beside it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'dominant-city-with-county.geojson');
+      const parentHash = 's000';
+      const parentBbox = geohash.decodeBbox(parentHash);
+      const width = parentBbox.maxLon - parentBbox.minLon;
+      const height = parentBbox.maxLat - parentBbox.minLat;
+      // The eastern quarter of the parent cell is left to the hamlet, the
+      // county and the region; the metro takes everything west of it.
+      const metroMaxLon = parentBbox.minLon + (width * 0.75) - (width / 1000);
+      const eastern = geohash.children(parentHash)
+        .filter((child) => geohash.decodeBbox(child).minLon > metroMaxLon);
+
+      fs.writeFileSync(inputPath, JSON.stringify({
+        type: 'FeatureCollection',
+        features: [
+          regionFeature(9001, 'Fallback Region', parentBbox),
+          // Sprawls over the parent cell without filling it, so it owns child
+          // cells rather than the parent cell itself.
+          polygonFeature(9002, 'Metro Core', 'locality', 1200000,
+            rectangleRing(parentBbox.minLon, parentBbox.minLat, metroMaxLon, parentBbox.maxLat - (height / 100))),
+          childCellFeature(9003, 'Rural Hamlet', 'locality', 18000, eastern[0]),
+          childCellFeature(9004, 'Rural County', 'county', 30000, eastern[eastern.length - 1])
+        ]
+      }));
+
+      const build = (dbPath, dominantPopulation) => spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', inputPath,
+        '--index-mode', 'compact',
+        '--include-region', 'true',
+        '--include-county', 'true',
+        '--base-precision', '4',
+        '--max-precision', '5',
+        '--dominant-locality-population', dominantPopulation,
+        '--dominant-locality-ratio', '3'
+      ], { encoding: 'utf8' });
+
+      // With the rollup out of reach, the hamlet and the county each hold a
+      // child cell of their own: the rollup below has something to fold in.
+      const withoutRollupPath = path.join(dir, 'without-rollup.sqlite');
+      expect(build(withoutRollupPath, '5000000').status).toEqual(0);
+
+      const withoutRollup = new sqlite3.Database(withoutRollupPath);
+      try {
+        const hamletCells = await all(withoutRollup, descendantCountSql(parentHash, 9003));
+        expect(hamletCells[0].count).toBeGreaterThan(0);
+
+        const countyCells = await all(withoutRollup, descendantCountSql(parentHash, 9004));
+        expect(countyCells[0].count).toBeGreaterThan(0);
+      } finally {
+        await close(withoutRollup);
+      }
+
+      const dbPath = path.join(dir, 'dominant-city-with-county.sqlite');
+      expect(build(dbPath, '100000').status).toEqual(0);
+
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const parentRow = await all(db, `SELECT geohash, place_id FROM compact_geohash_lookup WHERE geohash='${parentHash}'`);
+        expect(parentRow).toEqual([{ geohash: parentHash, place_id: 9002 }]);
+
+        const hamletCells = await all(db, descendantCountSql(parentHash, 9003));
+        expect(hamletCells[0].count).toEqual(0);
+      } finally {
+        await close(db);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('rejects a dominant-city placetype that cannot own a city label', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'dominant-city-placetypes.geojson');
+      const dbPath = path.join(dir, 'dominant-city-placetypes.sqlite');
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', writeDominantCountyFixture(inputPath),
+        '--index-mode', 'compact',
+        '--dominant-city-placetypes', 'locality,region'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).not.toEqual(0);
+      expect(result.stderr).toContain('--dominant-city-placetypes only accepts city-like placetypes');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
