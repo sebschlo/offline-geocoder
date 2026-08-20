@@ -1,0 +1,1656 @@
+// Reader/database compatibility contract — see COMPATIBILITY.md.
+//
+// Shipped database files and reader code can be paired across versions in
+// both directions, so the reader must keep working against every schema
+// generation that ever shipped. Each describe block below builds a fixture
+// database with the FROZEN schema of one generation (tables and columns as
+// they shipped — deliberately not derived from scripts/schema.sql or the
+// builder, which move forward over time) and asserts the reader paths that
+// generation supports.
+//
+// Rules:
+// - Never modify the block of a generation that has shipped. If a new
+//   schema generation ships, add a new block (and a row to
+//   COMPATIBILITY.md) instead.
+// - Fixtures omit performance indexes: they don't affect reader-visible
+//   behavior. Tables and columns are exact.
+// - The boundary-generation fixtures deliberately omit the GeoNames base
+//   tables (`features`, `coordinates`, the `everything` view), so if the
+//   boundary path ever falls through to the legacy centroid fallback the
+//   spec fails loudly ("no such table: everything") instead of silently
+//   passing. The centroid-only generation consists of exactly those base
+//   tables and pins the centroid paths directly.
+// - Lookup test points are cross-mapped: the geohash cell maps to one
+//   place while another place's centroid is nearer, so a broken geohash
+//   lookup cannot sneak through via the nearest-centroid fallback.
+// - Stored geohash keys are frozen literals, never computed here. See
+//   FROZEN_GEOHASH below.
+// - Each generation pins its exact column set, and generated databases
+//   are checked to remain supersets of it. See FROZEN_COLUMNS below.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const sqlite3 = require('sqlite3');
+const createGeocoder = require('../src/index.js');
+const geohash = require('../src/geohash');
+const geometry = require('../src/geometry');
+
+// Frozen precision-5 geohash lookup keys, stored as literals.
+//
+// These must NOT be computed with src/geohash: the reader queries with
+// that same encoder, so computing both sides would make the fixtures
+// self-referential — an incompatible encoder change would regenerate the
+// stored keys and the query keys together, leaving every spec green while
+// real databases persisted by older builders became unreadable.
+//
+// The encoder conformance block below pins these literals (alongside
+// published reference vectors from the geohash specification), so an
+// encoder change fails immediately and names the drifted coordinate
+// instead of surfacing as a mysterious lookup miss.
+const FROZEN_GEOHASH = {
+  '40.5,10.95': 'sppy3',
+  '40.5,11.85': 'sr0qm',
+  '-20.65,130.65': 'qukft',
+  '-20.3,130.3': 'qukst',
+  '47.6,-3.2': 'gbmwz',
+  '47.3,-3.7': 'gbmm5'
+};
+
+// Frozen column signatures, in declaration order, for every generation.
+//
+// Each entry is `name TYPE [NOT NULL] [DEFAULT x] [PK]` — the fields of
+// PRAGMA table_info that are part of the compatibility contract:
+//
+// - `name` and `type` are asserted everywhere. Affinity is reader-visible:
+//   flipping `latitude REAL` to TEXT hands arithmetic a string.
+// - `NOT NULL` and `PK` are asserted exactly on fixtures (frozen history,
+//   nothing legitimately changes them) and DIRECTIONALLY on generated
+//   databases: a column frozen as NOT NULL or PRIMARY KEY must stay that
+//   way, while a historically nullable column may be tightened. That
+//   asymmetry is the contract — relaxing NOT NULL is reader-visible (a
+//   value readers always had can arrive null), whereas tightening only
+//   constrains builders, and scripts/schema.sql has already tightened
+//   `features.name` / `features.country_id` relative to v1.0.0 without
+//   breaking any reader.
+// - `DEFAULT` is asserted on fixtures only. On generated databases it says
+//   what a builder writes when it omits a column, which is builder-side
+//   behavior already covered by the builders' own specs.
+// - `cid` (ordinal position) is deliberately excluded: the contract
+//   requires readers to select by name, so column order is not binding.
+//   These lists are written in declaration order purely for legibility.
+//
+// Two jobs: each fixture asserts its own tables match EXACTLY (so a
+// fixture cannot be quietly widened to make a new reader pass), and the
+// generated-database block at the bottom asserts freshly built databases
+// are a SUPERSET of the shipped sets (so a builder that drops, renames or
+// retypes a shipped column fails here, even while the current reader still
+// happens to support both layouts).
+const FROZEN_COLUMNS = {
+  // Generation 0 as v1.0.0 actually declared it: no NOT NULL anywhere.
+  // scripts/schema.sql has since tightened several of these columns, which
+  // is why the generated-database check compares name+type only.
+  centroid: {
+    coordinates: ['feature_id INTEGER PK', 'latitude REAL', 'longitude REAL'],
+    features: ['id INTEGER PK', 'name TEXT', 'country_id TEXT', 'admin1_id INTEGER'],
+    admin1: ['country_id TEXT PK', 'id INTEGER PK', 'name TEXT'],
+    countries: ['id TEXT PK', 'name TEXT']
+  },
+  // Generation 0b: the widened GeoNames base schema currently produced by
+  // scripts/schema.sql. `asciiname` and `population` are what made forward
+  // geocoding possible, and src/forward.js depends on both — it probes for
+  // `asciiname` to decide whether the database supports forward search at
+  // all, and orders every match by `population DESC`.
+  centroidForward: {
+    coordinates: [
+      'feature_id INTEGER PK', 'latitude REAL NOT NULL', 'longitude REAL NOT NULL'
+    ],
+    features: [
+      'id INTEGER PK', 'name TEXT NOT NULL', 'asciiname TEXT',
+      'country_id TEXT NOT NULL', 'admin1_id INTEGER',
+      'population INTEGER NOT NULL DEFAULT 0'
+    ],
+    admin1: ['country_id TEXT NOT NULL PK', 'id INTEGER NOT NULL PK', 'name TEXT NOT NULL'],
+    countries: ['id TEXT PK', 'name TEXT NOT NULL']
+  },
+  full: {
+    countries: ['id TEXT PK', 'name TEXT NOT NULL'],
+    admin1: ['country_id TEXT NOT NULL PK', 'id INTEGER NOT NULL PK', 'name TEXT NOT NULL'],
+    places: [
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype TEXT NOT NULL',
+      'centroid_lat REAL NOT NULL', 'centroid_lon REAL NOT NULL',
+      'bbox_min_lat REAL NOT NULL', 'bbox_min_lon REAL NOT NULL',
+      'bbox_max_lat REAL NOT NULL', 'bbox_max_lon REAL NOT NULL',
+      'priority_rank INTEGER NOT NULL DEFAULT 0', 'area REAL NOT NULL DEFAULT 0',
+      'country_name TEXT', 'admin1_name TEXT'
+    ],
+    place_geohash_cover: [
+      'geohash TEXT NOT NULL PK', 'precision INTEGER NOT NULL PK',
+      'place_id INTEGER NOT NULL PK', 'coverage_type TEXT NOT NULL'
+    ],
+    place_geometry: [
+      'place_id INTEGER PK', "encoding TEXT NOT NULL DEFAULT 'json'",
+      'geometry BLOB NOT NULL'
+    ],
+    place_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
+  },
+  compactLegacy: {
+    countries: ['id TEXT PK', 'name TEXT NOT NULL'],
+    admin1: ['country_id TEXT NOT NULL PK', 'id INTEGER NOT NULL PK', 'name TEXT NOT NULL'],
+    places: [
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype TEXT NOT NULL',
+      'centroid_lat REAL NOT NULL', 'centroid_lon REAL NOT NULL',
+      'bbox_min_lat REAL NOT NULL', 'bbox_min_lon REAL NOT NULL',
+      'bbox_max_lat REAL NOT NULL', 'bbox_max_lon REAL NOT NULL',
+      'priority_rank INTEGER NOT NULL DEFAULT 0', 'area REAL NOT NULL DEFAULT 0',
+      'country_name TEXT', 'admin1_name TEXT'
+    ],
+    place_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
+  },
+  compactV2: {
+    compact_places: [
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype_code INTEGER NOT NULL',
+      'latitude REAL NOT NULL', 'longitude REAL NOT NULL'
+    ],
+    compact_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
+  },
+  compactV2Population: {
+    compact_places: [
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype_code INTEGER NOT NULL',
+      'latitude REAL NOT NULL', 'longitude REAL NOT NULL',
+      'population REAL', 'area REAL'
+    ],
+    compact_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
+  }
+};
+
+// Output columns of the `everything` view as generation 0 exposed them.
+// Readers select from this view and read fields by name, so its output
+// column set is contract surface even though no table declares it.
+//
+// Names only: a view's reported column affinity is derived from the
+// underlying expression and varies with the SQLite version, so pinning
+// types here would test the host, not the schema.
+const FROZEN_EVERYTHING_COLUMNS = [
+  'id', 'name', 'admin1_id', 'admin1_name',
+  'country_id', 'country_name', 'latitude', 'longitude'
+];
+
+// The same view once generation 0b widened it. src/forward.js selects
+// `asciiname` and ranks by `population`, so both are contract surface.
+const FROZEN_EVERYTHING_COLUMNS_FORWARD = FROZEN_EVERYTHING_COLUMNS
+  .concat(['asciiname', 'population']);
+
+// The complete set of tables and views each generation's fixture contains.
+//
+// Asserted exactly, because boundary readers select their query path by
+// feature-detecting tables (see getBoundarySchemaStatus in src/reverse.js).
+// A fixture that gained, say, compact_places would quietly let a future
+// reader take the compact path against a database generation that never
+// had it — the precise failure these fixtures exist to prevent.
+// The compact placetype encoding, shared by two components that never see
+// each other: the builder writes these integers into
+// compact_places.placetype_code, and src/reverse.js hardcodes the same
+// numbers — both in its CASE that maps code back to a placetype name and
+// in SUPPORTED_PLACETYPE_CODES, which filters strictly to 0-3.
+//
+// Renumbering therefore breaks readers silently and structurally
+// invisibly: a database whose localities are written with a new code
+// resolves to nothing at all in a released reader, while every column
+// assertion in this file stays green.
+const FROZEN_PLACETYPE_CODES = {
+  locality: 0,
+  localadmin: 1,
+  region: 2,
+  county: 3
+};
+
+const FROZEN_OBJECTS = {
+  centroid: ['admin1', 'coordinates', 'countries', 'everything', 'features'],
+  centroidForward: ['admin1', 'coordinates', 'countries', 'everything', 'features'],
+  full: [
+    'admin1', 'countries', 'place_geohash_cover', 'place_geohash_lookup',
+    'place_geometry', 'places'
+  ],
+  compactLegacy: ['admin1', 'countries', 'place_geohash_lookup', 'places'],
+  compactV2: ['compact_geohash_lookup', 'compact_places'],
+  compactV2Population: ['compact_geohash_lookup', 'compact_places']
+};
+
+function exec(db, sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+function run(db, sql, params) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params || [], (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+function all(db, sql) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, [], (err, rows) => (err ? reject(err) : resolve(rows || [])));
+  });
+}
+
+function close(db) {
+  return new Promise((resolve, reject) => {
+    db.close((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+// Renders one PRAGMA table_info row in the frozen-signature format.
+function formatSignature(row) {
+  let signature = `${row.name} ${row.type}`;
+  if (row.notnull) signature += ' NOT NULL';
+  if (row.dflt_value !== null && row.dflt_value !== undefined) {
+    signature += ` DEFAULT ${row.dflt_value}`;
+  }
+  if (row.pk) signature += ' PK';
+  return signature;
+}
+
+// Parses a frozen signature string back into the fields compared against
+// generated databases.
+function parseSignature(entry) {
+  const parts = entry.split(' ');
+  return {
+    name: parts[0],
+    type: parts[1],
+    notnull: / NOT NULL/.test(entry),
+    pk: / PK$/.test(entry)
+  };
+}
+
+// Reads column signatures in declaration order via PRAGMA table_info.
+async function readSignatures(databasePath, table) {
+  const db = new sqlite3.Database(databasePath);
+  try {
+    const rows = await all(db, `PRAGMA table_info(${table})`);
+    return rows.map((row) => ({ row: row, signature: formatSignature(row) }));
+  } finally {
+    await close(db);
+  }
+}
+
+// Reads every table and view, excluding SQLite's own bookkeeping objects.
+async function readObjects(databasePath) {
+  const db = new sqlite3.Database(databasePath);
+  try {
+    const rows = await all(db, `
+      SELECT name FROM sqlite_master
+      WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `);
+    return rows.map((row) => row.name);
+  } finally {
+    await close(db);
+  }
+}
+
+// Registers both frozen-schema assertions for one generation's fixture:
+// the exact column signatures, and the exact set of tables and views.
+function expectFrozenSchema(getDatabasePath, generation) {
+  const frozen = FROZEN_COLUMNS[generation];
+  const objects = FROZEN_OBJECTS[generation];
+
+  it('preserves the exact frozen column signatures of this generation', async () => {
+    for (const table of Object.keys(frozen)) {
+      const actual = await readSignatures(getDatabasePath(), table);
+      // Compared as strings so a failure names the table and both lists.
+      expect(`${table}: ${actual.map((column) => column.signature).join(', ')}`)
+        .toEqual(`${table}: ${frozen[table].join(', ')}`);
+    }
+  });
+
+  // A fixture that silently gains a table is not frozen history any more:
+  // boundary readers pick their query path by feature-detecting tables, so
+  // an extra table would let a future reader exercise a path this
+  // generation never shipped while every signature check stayed green.
+  it('contains exactly the tables and views this generation shipped', async () => {
+    const actual = await readObjects(getDatabasePath());
+    expect(actual.join(', ')).toEqual(objects.slice().sort().join(', '));
+  });
+}
+
+// Asserts a generated database still carries every frozen column.
+//
+// Columns are compared directionally: name and declared type must match
+// exactly, a column frozen as NOT NULL must stay NOT NULL, and extra
+// columns (or NOT NULL added to a historically nullable column) are
+// allowed, because that direction is reader-safe.
+//
+// The PRIMARY KEY is compared as a complete set instead, because a key is
+// not a per-column property: widening `PRIMARY KEY (geohash)` to
+// `PRIMARY KEY (geohash, place_id)` leaves every individual column still
+// flagged PK while destroying the uniqueness readers rely on — released
+// readers consume compact_geohash_lookup as one owner per hash.
+async function expectSuperset(databasePath, frozen) {
+  for (const table of Object.keys(frozen)) {
+    const actual = await readSignatures(databasePath, table);
+    const problems = [];
+
+    for (const entry of frozen[table]) {
+      const required = parseSignature(entry);
+      const match = actual.find((column) => column.row.name === required.name);
+
+      if (!match) {
+        problems.push(`${required.name}: missing`);
+        continue;
+      }
+      if (match.row.type !== required.type) {
+        problems.push(`${required.name}: type ${match.row.type}, expected ${required.type}`);
+      }
+      if (required.notnull && !match.row.notnull) {
+        problems.push(`${required.name}: NOT NULL was relaxed to nullable`);
+      }
+    }
+
+    // Compared as an unordered set: reordering a composite key preserves
+    // uniqueness exactly, and the only thing key order changes is index
+    // layout, which COMPATIBILITY.md puts out of scope.
+    const frozenKey = frozen[table]
+      .map(parseSignature)
+      .filter((column) => column.pk)
+      .map((column) => column.name)
+      .sort();
+    const actualKey = actual
+      .filter((column) => column.row.pk)
+      .map((column) => column.row.name)
+      .sort();
+
+    if (actualKey.join(', ') !== frozenKey.join(', ')) {
+      problems.push(
+        `PRIMARY KEY {${actualKey.join(', ')}}, expected {${frozenKey.join(', ')}}`);
+    }
+
+    // Compared as strings so a failure names the table and every problem.
+    expect(`${table}: ${problems.join('; ')}`).toEqual(`${table}: `);
+  }
+}
+
+function createTempDatabase(name) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `offline-geocoder-compat-${name}-`));
+  const databasePath = path.join(dir, 'fixture.sqlite');
+  return {
+    db: new sqlite3.Database(databasePath),
+    databasePath: databasePath,
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true })
+  };
+}
+
+function boundaryGeocoder(databasePath) {
+  return createGeocoder({
+    database: databasePath,
+    reverseMode: 'boundary',
+    boundary: {
+      basePrecision: 4,
+      maxPrecision: 7
+    }
+  });
+}
+
+// The encoder is the one piece of reader logic that must agree with bytes
+// written by builders that ran months or years ago. Pin it against
+// published geohash reference vectors and against every literal key the
+// fixtures below store.
+describe('reader compatibility: geohash encoder conformance', () => {
+  it('matches published geohash reference vectors', () => {
+    expect(geohash.encode(42.6, -5.6, 5)).toEqual('ezs42');
+    expect(geohash.encode(57.64911, 10.40744, 11)).toEqual('u4pruydqqvj');
+    expect(geohash.encode(0, 0, 5)).toEqual('s0000');
+  });
+
+  it('still produces the frozen lookup keys stored in shipped databases', () => {
+    for (const coordinate of Object.keys(FROZEN_GEOHASH)) {
+      const parts = coordinate.split(',');
+      const encoded = geohash.encode(Number(parts[0]), Number(parts[1]), 5);
+      expect(`${coordinate} -> ${encoded}`)
+        .toEqual(`${coordinate} -> ${FROZEN_GEOHASH[coordinate]}`);
+    }
+  });
+});
+
+// Generation 0: GeoNames centroid-only schema, as generated by the
+// released v1.0.0 code (scripts/generate_geonames.sh at tag time).
+//
+// Tables: features (four columns — no asciiname, no population),
+// coordinates, countries, admin1, and the everything view. No boundary
+// tables at all. Pins four pairings that must keep working:
+// centroid-mode reverse, boundary-mode reverse falling through to the
+// centroid path, id lookup, and forward geocoding returning undefined
+// because the columns it needs are absent.
+describe('reader compatibility: centroid-only schema generation (v1.0.0)', () => {
+  let fixture;
+  let centroidGeocoder;
+  let boundaryModeGeocoder;
+
+  const schema = `
+    CREATE TABLE coordinates(
+      feature_id INTEGER,
+      latitude REAL,
+      longitude REAL,
+      PRIMARY KEY (feature_id)
+    );
+
+    CREATE TABLE features(
+      id INTEGER,
+      name TEXT,
+      country_id TEXT,
+      admin1_id INTEGER,
+      PRIMARY KEY (id)
+    );
+
+    CREATE TABLE admin1(
+      country_id TEXT,
+      id INTEGER,
+      name TEXT,
+      PRIMARY KEY (country_id, id)
+    );
+
+    CREATE TABLE countries(
+      id TEXT,
+      name TEXT,
+      PRIMARY KEY (id)
+    );
+
+    CREATE VIEW everything AS
+      SELECT
+        features.id,
+        features.name,
+        admin1.id AS admin1_id,
+        admin1.name AS admin1_name,
+        countries.id AS country_id,
+        countries.name AS country_name,
+        coordinates.latitude AS latitude,
+        coordinates.longitude AS longitude
+      FROM features
+        LEFT JOIN countries ON features.country_id = countries.id
+        LEFT JOIN admin1 ON features.country_id = admin1.country_id AND features.admin1_id = admin1.id
+        JOIN coordinates ON features.id = coordinates.feature_id;
+  `;
+
+  beforeAll(async () => {
+    fixture = createTempDatabase('centroid-v1');
+    const db = fixture.db;
+
+    await exec(db, schema);
+    await exec(db, `
+      INSERT INTO countries(id, name) VALUES ('XD', 'Vetusia');
+      INSERT INTO admin1(country_id, id, name) VALUES ('XD', 4, 'Old March');
+      INSERT INTO features(id, name, country_id, admin1_id) VALUES
+        (701, 'Oldbridge', 'XD', 4),
+        (702, 'Newford', 'XD', 4);
+      INSERT INTO coordinates(feature_id, latitude, longitude) VALUES
+        (701, 10.25, 55.25),
+        (702, 10.75, 55.75);
+    `);
+    await close(db);
+
+    centroidGeocoder = createGeocoder({ database: fixture.databasePath });
+    boundaryModeGeocoder = boundaryGeocoder(fixture.databasePath);
+  });
+
+  afterAll(() => {
+    fixture.cleanup();
+  });
+
+  it('resolves centroid-mode reverse lookups', async () => {
+    const result = await centroidGeocoder.reverse(10.3, 55.3);
+    expect(result.id).toEqual(701);
+    expect(result.name).toEqual('Oldbridge');
+    expect(result.formatted).toEqual('Oldbridge, Old March, Vetusia');
+    expect(result.country).toEqual({ id: 'XD', name: 'Vetusia' });
+    expect(result.admin1).toEqual({ id: 4, name: 'Old March' });
+  });
+
+  it('falls through to the centroid path when a boundary-mode reader opens it', async () => {
+    const result = await boundaryModeGeocoder.reverse(10.7, 55.7);
+    expect(result.id).toEqual(702);
+    expect(result.name).toEqual('Newford');
+    expect(result.formatted).toEqual('Newford, Old March, Vetusia');
+  });
+
+  it('resolves id lookups', async () => {
+    const result = await centroidGeocoder.location.find(701);
+    expect(result.id).toEqual(701);
+    expect(result.name).toEqual('Oldbridge');
+  });
+
+  it('degrades forward geocoding to undefined instead of erroring', async () => {
+    const result = await centroidGeocoder.forward('Oldbridge');
+    expect(result).toBeUndefined();
+  });
+
+  expectFrozenSchema(() => fixture.databasePath, 'centroid');
+});
+
+// Generation 0b: the widened GeoNames base schema — generation 0 plus
+// `features.asciiname` and `features.population`, both surfaced by the
+// `everything` view. This is the generation that made forward geocoding
+// possible, and src/forward.js depends on both columns: it probes for
+// `asciiname` to decide whether a database supports forward search at all,
+// and ranks every match by `population DESC`.
+describe('reader compatibility: widened centroid schema generation (forward geocoding)', () => {
+  let fixture;
+  let geocoder;
+
+  const schema = `
+    CREATE TABLE coordinates(
+      feature_id INTEGER PRIMARY KEY,
+      latitude REAL NOT NULL,
+      longitude REAL NOT NULL
+    );
+
+    CREATE TABLE features(
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      asciiname TEXT,
+      country_id TEXT NOT NULL,
+      admin1_id INTEGER,
+      population INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE admin1(
+      country_id TEXT NOT NULL,
+      id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      PRIMARY KEY (country_id, id)
+    );
+
+    CREATE TABLE countries(
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL
+    );
+
+    CREATE VIEW everything AS
+      SELECT
+        features.id AS id,
+        features.name AS name,
+        features.asciiname AS asciiname,
+        features.population AS population,
+        admin1.id AS admin1_id,
+        admin1.name AS admin1_name,
+        countries.id AS country_id,
+        countries.name AS country_name,
+        coordinates.latitude AS latitude,
+        coordinates.longitude AS longitude
+      FROM features
+        LEFT JOIN countries ON features.country_id = countries.id
+        LEFT JOIN admin1 ON features.country_id = admin1.country_id AND features.admin1_id = admin1.id
+        JOIN coordinates ON features.id = coordinates.feature_id;
+  `;
+
+  beforeAll(async () => {
+    fixture = createTempDatabase('centroid-forward');
+    const db = fixture.db;
+
+    await exec(db, schema);
+    // Two cases the forward reader depends on: an accented name whose
+    // only ASCII spelling lives in `asciiname`, and two same-named places
+    // that can only be ordered by `population`.
+    await exec(db, `
+      INSERT INTO countries(id, name) VALUES ('XG', 'Graphia');
+      INSERT INTO admin1(country_id, id, name) VALUES ('XG', 2, 'Umlaut Vale');
+      INSERT INTO features(id, name, asciiname, country_id, admin1_id, population) VALUES
+        (901, 'Zürichton', 'Zurichton', 'XG', 2, 120000),
+        (902, 'Twinsburg', 'Twinsburg', 'XG', 2, 900000),
+        (903, 'Twinsburg', 'Twinsburg', 'XG', 2, 15000);
+      INSERT INTO coordinates(feature_id, latitude, longitude) VALUES
+        (901, 25.25, 55.25),
+        (902, 25.75, 55.75),
+        (903, 26.25, 56.25);
+    `);
+    await close(db);
+
+    geocoder = createGeocoder({ database: fixture.databasePath });
+  });
+
+  afterAll(() => {
+    fixture.cleanup();
+  });
+
+  it('resolves centroid-mode reverse lookups', async () => {
+    const result = await geocoder.reverse(25.3, 55.3);
+    expect(result.id).toEqual(901);
+    expect(result.formatted).toEqual('Zürichton, Umlaut Vale, Graphia');
+  });
+
+  it('matches an ASCII spelling that only exists in asciiname', async () => {
+    const result = await geocoder.forward('Zurichton');
+    expect(result.id).toEqual(901);
+    expect(result.name).toEqual('Zürichton');
+  });
+
+  it('ranks equally named matches by population', async () => {
+    const result = await geocoder.forward('Twinsburg');
+    expect(result.id).toEqual(902);
+    expect(result.coordinates).toEqual({ latitude: 25.75, longitude: 55.75 });
+  });
+
+  expectFrozenSchema(() => fixture.databasePath, 'centroidForward');
+});
+
+// Generation 1: full boundary schema.
+//
+// Tables: places + place_geohash_cover + place_geometry (+ countries,
+// admin1, and an empty place_geohash_lookup, all created by the full-mode
+// builder of that era). The empty lookup table is faithful to real full
+// builds and additionally pins the runtime chain: the compact-legacy
+// lookup runs first, misses, and hands over to the polygon path.
+describe('reader compatibility: full boundary schema generation', () => {
+  let fixture;
+  let geocoder;
+
+  const schema = `
+    CREATE TABLE countries(
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL
+    );
+
+    CREATE TABLE admin1(
+      country_id TEXT NOT NULL,
+      id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      PRIMARY KEY (country_id, id)
+    );
+
+    CREATE TABLE places(
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      country_id TEXT NOT NULL,
+      admin1_id INTEGER,
+      placetype TEXT NOT NULL,
+      centroid_lat REAL NOT NULL,
+      centroid_lon REAL NOT NULL,
+      bbox_min_lat REAL NOT NULL,
+      bbox_min_lon REAL NOT NULL,
+      bbox_max_lat REAL NOT NULL,
+      bbox_max_lon REAL NOT NULL,
+      priority_rank INTEGER NOT NULL DEFAULT 0,
+      area REAL NOT NULL DEFAULT 0,
+      country_name TEXT,
+      admin1_name TEXT
+    );
+
+    CREATE TABLE place_geohash_cover(
+      geohash TEXT NOT NULL,
+      precision INTEGER NOT NULL,
+      place_id INTEGER NOT NULL,
+      coverage_type TEXT NOT NULL CHECK (coverage_type IN ('full', 'partial')),
+      PRIMARY KEY (geohash, precision, place_id),
+      FOREIGN KEY (place_id) REFERENCES places(id)
+    );
+
+    CREATE TABLE place_geometry(
+      place_id INTEGER PRIMARY KEY,
+      encoding TEXT NOT NULL DEFAULT 'json',
+      geometry BLOB NOT NULL,
+      FOREIGN KEY (place_id) REFERENCES places(id)
+    );
+
+    CREATE TABLE place_geohash_lookup(
+      geohash TEXT PRIMARY KEY,
+      place_id INTEGER NOT NULL,
+      FOREIGN KEY (place_id) REFERENCES places(id)
+    );
+  `;
+
+  beforeAll(async () => {
+    fixture = createTempDatabase('full');
+    const db = fixture.db;
+
+    await exec(db, schema);
+    await exec(db, `
+      INSERT INTO countries(id, name) VALUES ('XA', 'Atlantis');
+      INSERT INTO admin1(country_id, id, name) VALUES ('XA', 7, 'Coral Province');
+    `);
+
+    // Two adjacent 1x1 degree localities. Harborview's test point
+    // (40.5, 10.95) sits inside its polygon but nearer to Milltown's
+    // centroid, so only the polygon path can answer it correctly.
+    //
+    // Notchford is a decoy that makes polygon containment itself
+    // load-bearing: it shares the test point's cover cell, its bbox
+    // contains the point, its centroid is by far the nearest, and its
+    // small area would win the contained-places tie-break — but its
+    // C-shaped polygon has a notch that excludes the point. If geometry
+    // loading or point-in-polygon regresses (returning nothing, or
+    // matching everything), Notchford wins and the spec fails.
+    const places = [
+      {
+        id: 501, name: 'Harborview', centroidLat: 40.5, centroidLon: 10.5,
+        polygon: { type: 'Polygon', coordinates: [[[10, 40], [11, 40], [11, 41], [10, 41], [10, 40]]] },
+        bbox: { minLat: 40, minLon: 10, maxLat: 41, maxLon: 11 },
+        priorityRank: 10, area: 1.0,
+        coverCells: [FROZEN_GEOHASH['40.5,10.95']]
+      },
+      {
+        id: 502, name: 'Milltown', centroidLat: 40.5, centroidLon: 11.05,
+        polygon: { type: 'Polygon', coordinates: [[[11, 40], [12, 40], [12, 41], [11, 41], [11, 40]]] },
+        bbox: { minLat: 40, minLon: 11, maxLat: 41, maxLon: 12 },
+        priorityRank: 20, area: 1.0,
+        coverCells: [FROZEN_GEOHASH['40.5,11.85']]
+      },
+      {
+        id: 503, name: 'Notchford', centroidLat: 40.46, centroidLon: 10.95,
+        // Covers the 10.90..11.00 x 40.45..40.55 rectangle except an
+        // east-opening notch (lon 10.93..11.00, lat 40.48..40.52) that
+        // contains the test point (40.5, 10.95).
+        polygon: {
+          type: 'Polygon',
+          coordinates: [[
+            [10.90, 40.45], [11.00, 40.45], [11.00, 40.48], [10.93, 40.48],
+            [10.93, 40.52], [11.00, 40.52], [11.00, 40.55], [10.90, 40.55],
+            [10.90, 40.45]
+          ]]
+        },
+        bbox: { minLat: 40.45, minLon: 10.90, maxLat: 40.55, maxLon: 11.00 },
+        priorityRank: 5, area: 0.01,
+        coverCells: [FROZEN_GEOHASH['40.5,10.95']]
+      }
+    ];
+
+    for (const place of places) {
+      await run(db, `
+        INSERT INTO places(
+          id, name, country_id, admin1_id, placetype,
+          centroid_lat, centroid_lon,
+          bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon,
+          priority_rank, area, country_name, admin1_name
+        ) VALUES (?, ?, 'XA', 7, 'locality', ?, ?, ?, ?, ?, ?, ?, ?, 'Atlantis', 'Coral Province')
+      `, [
+        place.id, place.name, place.centroidLat, place.centroidLon,
+        place.bbox.minLat, place.bbox.minLon, place.bbox.maxLat, place.bbox.maxLon,
+        place.priorityRank, place.area
+      ]);
+
+      await run(db, `
+        INSERT INTO place_geometry(place_id, encoding, geometry) VALUES (?, 'json', ?)
+      `, [place.id, JSON.stringify(place.polygon)]);
+
+      // Cover cells at precision 5, as the builder of this generation
+      // persisted them (frozen literals, not recomputed here).
+      for (const cell of place.coverCells) {
+        await run(db, `
+          INSERT INTO place_geohash_cover(geohash, precision, place_id, coverage_type)
+          VALUES (?, 5, ?, 'partial')
+        `, [cell, place.id]);
+      }
+    }
+
+    await close(db);
+    geocoder = boundaryGeocoder(fixture.databasePath);
+  });
+
+  afterAll(() => {
+    fixture.cleanup();
+  });
+
+  it('resolves a point through polygon containment, not centroid distance', async () => {
+    const result = await geocoder.reverse(40.5, 10.95);
+    expect(result.id).toEqual(501);
+    expect(result.name).toEqual('Harborview');
+    expect(result.formatted).toEqual('Harborview, Coral Province, Atlantis');
+    expect(result.country).toEqual({ id: 'XA', name: 'Atlantis' });
+    expect(result.admin1).toEqual({ id: 7, name: 'Coral Province' });
+  });
+
+  it('resolves points in the neighbouring polygon to the neighbour', async () => {
+    const result = await geocoder.reverse(40.5, 11.85);
+    expect(result.id).toEqual(502);
+    expect(result.name).toEqual('Milltown');
+    expect(result.formatted).toEqual('Milltown, Coral Province, Atlantis');
+  });
+
+  expectFrozenSchema(() => fixture.databasePath, 'full');
+});
+
+// Generation 2: compact legacy schema.
+//
+// Tables: places + place_geohash_lookup (+ countries and admin1, which the
+// reader's legacy query joins against). No cover or geometry tables, so
+// schema detection must choose the compact-legacy path.
+describe('reader compatibility: compact legacy schema generation', () => {
+  let fixture;
+  let geocoder;
+
+  const schema = `
+    CREATE TABLE countries(
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL
+    );
+
+    CREATE TABLE admin1(
+      country_id TEXT NOT NULL,
+      id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      PRIMARY KEY (country_id, id)
+    );
+
+    CREATE TABLE places(
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      country_id TEXT NOT NULL,
+      admin1_id INTEGER,
+      placetype TEXT NOT NULL,
+      centroid_lat REAL NOT NULL,
+      centroid_lon REAL NOT NULL,
+      bbox_min_lat REAL NOT NULL,
+      bbox_min_lon REAL NOT NULL,
+      bbox_max_lat REAL NOT NULL,
+      bbox_max_lon REAL NOT NULL,
+      priority_rank INTEGER NOT NULL DEFAULT 0,
+      area REAL NOT NULL DEFAULT 0,
+      country_name TEXT,
+      admin1_name TEXT
+    );
+
+    CREATE TABLE place_geohash_lookup(
+      geohash TEXT PRIMARY KEY,
+      place_id INTEGER NOT NULL,
+      FOREIGN KEY (place_id) REFERENCES places(id)
+    );
+  `;
+
+  beforeAll(async () => {
+    fixture = createTempDatabase('compact-legacy');
+    const db = fixture.db;
+
+    await exec(db, schema);
+    await exec(db, `
+      INSERT INTO countries(id, name) VALUES ('XB', 'Bordonia');
+      INSERT INTO admin1(country_id, id, name) VALUES ('XB', 3, 'Northmark');
+    `);
+
+    const places = [
+      { id: 611, name: 'Eastport', centroidLat: -20.25, centroidLon: 130.25 },
+      { id: 612, name: 'Westport', centroidLat: -20.70, centroidLon: 130.70 }
+    ];
+
+    for (const place of places) {
+      await run(db, `
+        INSERT INTO places(
+          id, name, country_id, admin1_id, placetype,
+          centroid_lat, centroid_lon,
+          bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon,
+          priority_rank, area, country_name, admin1_name
+        ) VALUES (?, ?, 'XB', 3, 'locality', ?, ?, ?, ?, ?, ?, 10, 1.0, 'Bordonia', 'Northmark')
+      `, [
+        place.id, place.name, place.centroidLat, place.centroidLon,
+        place.centroidLat - 0.4, place.centroidLon - 0.4,
+        place.centroidLat + 0.4, place.centroidLon + 0.4
+      ]);
+    }
+
+    // Cross-mapped lookup cells (frozen literals): each test point's cell
+    // maps to the place whose centroid is FARTHER away.
+    await run(db, 'INSERT INTO place_geohash_lookup(geohash, place_id) VALUES (?, ?)',
+      [FROZEN_GEOHASH['-20.65,130.65'], 611]);
+    await run(db, 'INSERT INTO place_geohash_lookup(geohash, place_id) VALUES (?, ?)',
+      [FROZEN_GEOHASH['-20.3,130.3'], 612]);
+
+    await close(db);
+    geocoder = boundaryGeocoder(fixture.databasePath);
+  });
+
+  afterAll(() => {
+    fixture.cleanup();
+  });
+
+  it('resolves via the legacy geohash lookup table', async () => {
+    const result = await geocoder.reverse(-20.65, 130.65);
+    expect(result.id).toEqual(611);
+    expect(result.name).toEqual('Eastport');
+    expect(result.formatted).toEqual('Eastport, Northmark, Bordonia');
+    expect(result.country).toEqual({ id: 'XB', name: 'Bordonia' });
+    expect(result.admin1).toEqual({ id: 3, name: 'Northmark' });
+  });
+
+  it('resolves the cross-mapped counterpart cell', async () => {
+    const result = await geocoder.reverse(-20.30, 130.30);
+    expect(result.id).toEqual(612);
+    expect(result.name).toEqual('Westport');
+    expect(result.formatted).toEqual('Westport, Northmark, Bordonia');
+  });
+
+  expectFrozenSchema(() => fixture.databasePath, 'compactLegacy');
+});
+
+// Shared seed data for the two compact v2 generations. Both blocks insert
+// the same logical places so their expected results are identical — that
+// identity is the compatibility guarantee under test in generation 4.
+const COMPACT_V2_ROWS = {
+  region: { id: 71, name: 'Meridian Province', countryId: 'XC', placetypeCode: 2, lat: 47.5, lon: -3.5 },
+  localities: [
+    { id: 81, name: 'Alphaville', countryId: 'XC', admin1Id: 71, placetypeCode: 0, lat: 47.25, lon: -3.75 },
+    { id: 82, name: 'Betaton', countryId: 'XC', admin1Id: 71, placetypeCode: 0, lat: 47.70, lon: -3.10 }
+  ],
+  // Cross-mapped lookup cells (frozen literals): each test point's cell
+  // maps to the place whose centroid is FARTHER away, so a broken lookup
+  // that degrades to the nearest-centroid fallback returns the wrong place
+  // and fails the spec.
+  lookups: [
+    { geohash: FROZEN_GEOHASH['47.6,-3.2'], placeId: 81 },
+    { geohash: FROZEN_GEOHASH['47.3,-3.7'], placeId: 82 }
+  ]
+};
+
+function expectCompactV2Results(getGeocoder) {
+  it('resolves via the compact geohash lookup', async () => {
+    const result = await getGeocoder().reverse(47.60, -3.20);
+    expect(result.id).toEqual(81);
+    expect(result.name).toEqual('Alphaville');
+    // Compact v2 stores no country display name; the reader uses the
+    // country id and resolves the admin1 name via a self-join on the
+    // region row.
+    expect(result.formatted).toEqual('Alphaville, Meridian Province, XC');
+    expect(result.country).toEqual({ id: 'XC', name: 'XC' });
+    expect(result.admin1).toEqual({ id: 71, name: 'Meridian Province' });
+  });
+
+  it('resolves the cross-mapped counterpart cell', async () => {
+    const result = await getGeocoder().reverse(47.30, -3.70);
+    expect(result.id).toEqual(82);
+    expect(result.name).toEqual('Betaton');
+    expect(result.formatted).toEqual('Betaton, Meridian Province, XC');
+  });
+}
+
+// Generation 3: compact v2 schema, as shipped in bundled app databases.
+//
+// Tables: compact_places + compact_geohash_lookup only. compact_places has
+// exactly seven columns — in particular NO population or area columns.
+describe('reader compatibility: compact v2 schema generation (shipped)', () => {
+  let fixture;
+  let geocoder;
+
+  const schema = `
+    CREATE TABLE compact_places(
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      country_id TEXT NOT NULL,
+      admin1_id INTEGER,
+      placetype_code INTEGER NOT NULL,
+      latitude REAL NOT NULL,
+      longitude REAL NOT NULL
+    );
+
+    CREATE TABLE compact_geohash_lookup(
+      geohash TEXT PRIMARY KEY,
+      place_id INTEGER NOT NULL,
+      FOREIGN KEY (place_id) REFERENCES compact_places(id)
+    );
+  `;
+
+  beforeAll(async () => {
+    fixture = createTempDatabase('compact-v2');
+    const db = fixture.db;
+
+    await exec(db, schema);
+
+    const rows = [COMPACT_V2_ROWS.region].concat(COMPACT_V2_ROWS.localities);
+    for (const row of rows) {
+      await run(db, `
+        INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [row.id, row.name, row.countryId, row.admin1Id || null, row.placetypeCode, row.lat, row.lon]);
+    }
+
+    for (const lookup of COMPACT_V2_ROWS.lookups) {
+      await run(db, 'INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES (?, ?)',
+        [lookup.geohash, lookup.placeId]);
+    }
+
+    await close(db);
+    geocoder = boundaryGeocoder(fixture.databasePath);
+  });
+
+  afterAll(() => {
+    fixture.cleanup();
+  });
+
+  expectCompactV2Results(() => geocoder);
+  expectFrozenSchema(() => fixture.databasePath, 'compactV2');
+});
+
+// Generation 4: compact v2 schema with nullable population/area columns,
+// added by the append/merge work (#3), which upgrades older databases in
+// place with ALTER TABLE ... ADD COLUMN.
+//
+// Same tables as generation 3 plus two nullable REAL columns that the
+// reader does not select. The fixture stores values on one locality and
+// NULLs on the other, and the expected results are identical to
+// generation 3 — extra builder-only columns must be invisible to readers.
+describe('reader compatibility: compact v2 schema generation with population/area', () => {
+  let fixture;
+  let geocoder;
+
+  const schema = `
+    CREATE TABLE compact_places(
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      country_id TEXT NOT NULL,
+      admin1_id INTEGER,
+      placetype_code INTEGER NOT NULL,
+      latitude REAL NOT NULL,
+      longitude REAL NOT NULL,
+      population REAL,
+      area REAL
+    );
+
+    CREATE TABLE compact_geohash_lookup(
+      geohash TEXT PRIMARY KEY,
+      place_id INTEGER NOT NULL,
+      FOREIGN KEY (place_id) REFERENCES compact_places(id)
+    );
+  `;
+
+  const populationById = {
+    81: { population: 125000, area: 42.5 },
+    82: { population: null, area: null }
+  };
+
+  beforeAll(async () => {
+    fixture = createTempDatabase('compact-v2-population');
+    const db = fixture.db;
+
+    await exec(db, schema);
+
+    const rows = [COMPACT_V2_ROWS.region].concat(COMPACT_V2_ROWS.localities);
+    for (const row of rows) {
+      const extras = populationById[row.id] || { population: null, area: null };
+      await run(db, `
+        INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude, population, area)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        row.id, row.name, row.countryId, row.admin1Id || null, row.placetypeCode,
+        row.lat, row.lon, extras.population, extras.area
+      ]);
+    }
+
+    for (const lookup of COMPACT_V2_ROWS.lookups) {
+      await run(db, 'INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES (?, ?)',
+        [lookup.geohash, lookup.placeId]);
+    }
+
+    await close(db);
+    geocoder = boundaryGeocoder(fixture.databasePath);
+  });
+
+  afterAll(() => {
+    fixture.cleanup();
+  });
+
+  // Identical expectations to the shipped compact v2 generation: the new
+  // columns (valued or NULL) must not change any reader-visible result.
+  expectCompactV2Results(() => geocoder);
+  expectFrozenSchema(() => fixture.databasePath, 'compactV2Population');
+});
+
+// The opposite direction of the contract: an older reader opening a NEWLY
+// generated database. The fixtures above cannot see that regression —
+// they only run the current reader against hand-written historical
+// databases, so a builder that drops or renames a shipped column stays
+// green as long as the current reader still supports both layouts.
+//
+// Instead of vendoring copies of released readers (which would rot, and
+// whose git history is unavailable under CI's shallow checkout), assert
+// the structural property those readers depend on: every database the
+// builder produces today must remain a SUPERSET of the frozen column set
+// of every generation that mode has shipped. Additive columns pass;
+// removals and renames fail.
+describe('reader compatibility: generated databases stay supersets of shipped generations', () => {
+  const BUILDER = path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js');
+
+  // One locality is enough — this asserts schema, not place selection.
+  const INPUT = {
+    type: 'FeatureCollection',
+    features: [{
+      type: 'Feature',
+      id: 3001,
+      properties: {
+        name: 'Buildertown',
+        placetype: 'locality',
+        country_id: 'US',
+        admin1_id: 5,
+        is_current: 1
+      },
+      geometry: {
+        type: 'Polygon',
+        coordinates: [[[-5, -5], [5, -5], [5, 5], [-5, 5], [-5, -5]]]
+      }
+    }]
+  };
+
+  function build(indexMode, input, extraArgs) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `offline-geocoder-compat-build-${indexMode}-`));
+    const inputPath = path.join(dir, 'input.geojson');
+    const databasePath = path.join(dir, 'built.sqlite');
+
+    fs.writeFileSync(inputPath, JSON.stringify(input || INPUT));
+
+    const result = spawnSync('node', [
+      BUILDER,
+      '--database', databasePath,
+      '--input', inputPath,
+      '--base-precision', '4',
+      '--max-precision', '5',
+      '--index-mode', indexMode
+    ].concat(extraArgs || []), { encoding: 'utf8' });
+
+    return {
+      status: result.status,
+      stderr: result.stderr,
+      databasePath: databasePath,
+      cleanup: () => fs.rmSync(dir, { recursive: true, force: true })
+    };
+  }
+
+  it('keeps every shipped compact v2 column in --index-mode compact', async () => {
+    const built = build('compact');
+    try {
+      expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
+      // Generation 3 first: those seven columns are what readers shipped
+      // before population/area existed, and they must survive every
+      // future widening of this table.
+      await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactV2);
+      await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactV2Population);
+    } finally {
+      built.cleanup();
+    }
+  }, 30000);
+
+  // The one piece of stored data that is contract rather than content:
+  // placetype_code is an encoding two components agree on without ever
+  // meeting (see FROZEN_PLACETYPE_CODES). Column checks cannot see a
+  // renumbering, so assert the emitted integers themselves.
+  const PLACETYPES = Object.keys(FROZEN_PLACETYPE_CODES);
+
+  // One feature per placetype, each in its own longitude band.
+  const PLACETYPE_INPUT = {
+    type: 'FeatureCollection',
+    features: PLACETYPES.map((placetype, index) => ({
+      type: 'Feature',
+      id: 4001 + index,
+      properties: {
+        name: `Coded ${placetype}`,
+        placetype: placetype,
+        country_id: 'US',
+        admin1_id: 5,
+        is_current: 1,
+        population: 500000
+      },
+      geometry: {
+        type: 'Polygon',
+        coordinates: [[
+          [index * 10, -2], [(index * 10) + 1, -2],
+          [(index * 10) + 1, 2], [index * 10, 2], [index * 10, -2]
+        ]]
+      }
+    }))
+  };
+
+  const PLACETYPE_ARGS = [
+    '--include-localadmin', 'true',
+    '--include-region', 'true',
+    '--include-county', 'true'
+  ];
+
+  it('emits the frozen placetype codes in --index-mode compact', async () => {
+    const placetypes = PLACETYPES;
+    const built = build('compact', PLACETYPE_INPUT, PLACETYPE_ARGS);
+
+    try {
+      expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
+
+      const db = new sqlite3.Database(built.databasePath);
+      let rows;
+      try {
+        rows = await all(db, 'SELECT name, placetype_code FROM compact_places ORDER BY id');
+      } finally {
+        await close(db);
+      }
+
+      const emitted = rows
+        .map((row) => `${row.name.replace('Coded ', '')}=${row.placetype_code}`)
+        .join(', ');
+      const expected = placetypes
+        .map((placetype) => `${placetype}=${FROZEN_PLACETYPE_CODES[placetype]}`)
+        .join(', ');
+
+      expect(emitted).toEqual(expected);
+    } finally {
+      built.cleanup();
+    }
+  }, 30000);
+
+  it('keeps every shipped full and compact-legacy column in --index-mode full', async () => {
+    const built = build('full');
+    try {
+      expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
+      await expectSuperset(built.databasePath, FROZEN_COLUMNS.full);
+      await expectSuperset(built.databasePath, FROZEN_COLUMNS.compactLegacy);
+    } finally {
+      built.cleanup();
+    }
+  }, 30000);
+
+  // The same argument as the compact codes, one representation over: full
+  // and compact-legacy readers filter `places.placetype` by these exact
+  // strings (SUPPORTED_PLACETYPES in src/reverse.js) and rank by them, so
+  // a renamed value is invisible to a released reader.
+  it('emits the frozen placetype names in --index-mode full', async () => {
+    const built = build('full', PLACETYPE_INPUT, PLACETYPE_ARGS);
+    try {
+      expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
+
+      const db = new sqlite3.Database(built.databasePath);
+      let rows;
+      try {
+        rows = await all(db, 'SELECT name, placetype FROM places ORDER BY id');
+      } finally {
+        await close(db);
+      }
+
+      const emitted = rows
+        .map((row) => `${row.name.replace('Coded ', '')}=${row.placetype}`)
+        .join(', ');
+      const expected = PLACETYPES
+        .map((placetype) => `${placetype}=${placetype}`)
+        .join(', ');
+
+      expect(emitted).toEqual(expected);
+    } finally {
+      built.cleanup();
+    }
+  }, 30000);
+
+  // place_geometry holds the one payload a reader parses rather than
+  // reads. loadPlaceGeometries selects `encoding` but always runs
+  // JSON.parse on the blob, so a builder that switched representations
+  // would leave every structural check green while released readers
+  // silently lost polygon containment on newly generated geometry.
+  it('writes JSON-encoded GeoJSON geometry in --index-mode full', async () => {
+    const built = build('full', PLACETYPE_INPUT, PLACETYPE_ARGS);
+    try {
+      expect(`exit ${built.status}: ${built.stderr}`).toEqual('exit 0: ');
+
+      const db = new sqlite3.Database(built.databasePath);
+      let rows;
+      try {
+        rows = await all(db,
+          'SELECT place_id, encoding, geometry FROM place_geometry ORDER BY place_id');
+      } finally {
+        await close(db);
+      }
+
+      expect(rows.length).toEqual(PLACETYPES.length);
+
+      for (const row of rows) {
+        expect(`${row.place_id} encoding: ${row.encoding}`)
+          .toEqual(`${row.place_id} encoding: json`);
+
+        const raw = Buffer.isBuffer(row.geometry)
+          ? row.geometry.toString('utf8')
+          : String(row.geometry);
+        const parsed = JSON.parse(raw);
+
+        expect(`${row.place_id} type: ${parsed.type}`)
+          .toEqual(`${row.place_id} type: MultiPolygon`);
+
+        // Feed the payload to the reader's own consumer instead of
+        // type-checking its leaves. Each input polygon spans lon
+        // [band, band + 1] and lat [-2, 2], so a point inside must test
+        // inside and a point east of the band must not. Rings serialized
+        // as [lat, lon] rather than the contracted [lon, lat] fail here
+        // immediately — the same way a released reader would fail.
+        const band = (row.place_id - 4001) * 10;
+        const parsedGeometry = geometry.normalizeGeometry(parsed);
+
+        expect(`${row.place_id} inside: ${geometry.pointInGeometry(parsedGeometry, 0, band + 0.5)}`)
+          .toEqual(`${row.place_id} inside: true`);
+        expect(`${row.place_id} outside: ${geometry.pointInGeometry(parsedGeometry, 0, band + 5)}`)
+          .toEqual(`${row.place_id} outside: false`);
+      }
+    } finally {
+      built.cleanup();
+    }
+  }, 30000);
+
+  // The GeoNames base schema has its own generator: scripts/schema.sql,
+  // applied verbatim by scripts/generate_geonames.sh. Without this case a
+  // dropped or renamed generation-0 column — or a narrowed `everything`
+  // view — would ship while every fixture above stayed green, because the
+  // fixtures hand-write their own historical DDL.
+  describe('GeoNames base schema (scripts/schema.sql)', () => {
+    let fixture;
+
+    beforeAll(async () => {
+      fixture = createTempDatabase('schema-sql');
+      const schemaSql = fs.readFileSync(
+        path.join(__dirname, '..', 'scripts', 'schema.sql'), 'utf8');
+      await exec(fixture.db, schemaSql);
+
+      // Seeded so every assertion below can actually fail:
+      // - 802 has no admin1 row at all (the shape a supported
+      //   GEONAMES_INCLUDE_ADMIN1=0 build produces);
+      // - 803's ASCII spelling differs from its name, so a view that
+      //   projected `name AS asciiname` would lose the match;
+      // - 804 and 805 share a name and differ only in population, so a
+      //   view projecting a constant or wrong population would rank them
+      //   wrongly.
+      await exec(fixture.db, `
+        INSERT INTO countries(id, name) VALUES ('XE', 'Ecotopia');
+        INSERT INTO admin1(country_id, id, name) VALUES ('XE', 9, 'Cascade');
+        INSERT INTO features(id, name, asciiname, country_id, admin1_id, population) VALUES
+          (801, 'Matchedton', 'Matchedton', 'XE', 9, 40000),
+          (802, 'Adminless', 'Adminless', 'XE', NULL, 30000),
+          (803, 'Fjördvik', 'Fjordvik', 'XE', 9, 55000),
+          (804, 'Pairtown', 'Pairtown', 'XE', 9, 700000),
+          (805, 'Pairtown', 'Pairtown', 'XE', 9, 9000);
+        INSERT INTO coordinates(feature_id, latitude, longitude) VALUES
+          (801, -33.25, 18.25),
+          (802, -33.75, 18.75),
+          (803, -34.25, 19.25),
+          (804, -34.75, 19.75),
+          (805, -35.25, 20.25);
+      `);
+      await close(fixture.db);
+    });
+
+    afterAll(() => {
+      fixture.cleanup();
+    });
+
+    it('keeps every generation-0 table column', async () => {
+      await expectSuperset(fixture.databasePath, FROZEN_COLUMNS.centroid);
+    });
+
+    // Generation 0b too: asciiname and population shipped years ago and
+    // src/forward.js cannot work without them.
+    it('keeps every widened generation-0b table column', async () => {
+      await expectSuperset(fixture.databasePath, FROZEN_COLUMNS.centroidForward);
+    });
+
+    // This schema also creates the full boundary tables, and it is the
+    // starting point for `--append` builds: CREATE TABLE IF NOT EXISTS
+    // will not repair a table that schema.sql created with a column
+    // missing, so the builder's insert would fail against a database the
+    // boundary-mode specs never see (they start from an empty file).
+    it('keeps every shipped full and compact-legacy boundary column', async () => {
+      await expectSuperset(fixture.databasePath, FROZEN_COLUMNS.full);
+      await expectSuperset(fixture.databasePath, FROZEN_COLUMNS.compactLegacy);
+    });
+
+    it('keeps every shipped output column of the everything view', async () => {
+      const actual = await readSignatures(fixture.databasePath, 'everything');
+      const names = actual.map((column) => column.row.name);
+      const missing = FROZEN_EVERYTHING_COLUMNS_FORWARD.filter(
+        (column) => names.indexOf(column) === -1);
+      expect(`everything missing: ${missing.join(', ')}`).toEqual('everything missing: ');
+    });
+
+    // Structure is not the whole contract for a view: the join kind is.
+    // Turning `LEFT JOIN admin1` into an inner join keeps every output
+    // column in place while silently dropping rows, and a database built
+    // with the supported GEONAMES_INCLUDE_ADMIN1=0 setting has no admin1
+    // rows at all — so every place would vanish from centroid reverse,
+    // forward and id lookup at once.
+    it('keeps rows whose admin1 is missing visible through the view', async () => {
+      const geocoder = createGeocoder({ database: fixture.databasePath });
+
+      const reverse = await geocoder.reverse(-33.75, 18.75);
+      expect(reverse.id).toEqual(802);
+      expect(reverse.name).toEqual('Adminless');
+      expect(reverse.formatted).toEqual('Adminless, Ecotopia');
+
+      const found = await geocoder.location.find(802);
+      expect(found.name).toEqual('Adminless');
+
+      const forward = await geocoder.forward('Adminless');
+      expect(forward.id).toEqual(802);
+    });
+
+    // The view is where asciiname and population reach the forward
+    // reader, so project either wrongly and these two fail while every
+    // column check stays green.
+    it('surfaces asciiname and population through the view', async () => {
+      const geocoder = createGeocoder({ database: fixture.databasePath });
+
+      const alias = await geocoder.forward('Fjordvik');
+      expect(alias.id).toEqual(803);
+      expect(alias.name).toEqual('Fjördvik');
+
+      const ranked = await geocoder.forward('Pairtown');
+      expect(ranked.id).toEqual(804);
+    });
+  });
+});
+
+// The lookup keys in the fixtures above are all precision 5, which leaves
+// the ends of the configured 4-7 range untested: a regression in
+// reverseHashes that stopped emitting basePrecision or maxPrecision would
+// still match every precision-5 row here, while real databases — whose
+// adaptive index stores coarse cells for sparse regions and fine cells for
+// dense ones — would miss and quietly fall back to a centroid.
+//
+// This fixture keys each place at exactly one endpoint precision, so only
+// a reader that queries the whole range resolves them. Both are
+// cross-mapped: each point's key belongs to the place whose centroid is
+// farther away, so a fallback answers with the wrong place rather than
+// accidentally passing.
+describe('reader compatibility: geohash query range endpoints', () => {
+  let fixture;
+  let geocoder;
+
+  // Frozen literals, as always — never computed here.
+  const COARSE_CELL = 'ddk2';       // precision 4, contains (12.75, -61.25)
+  const FINE_CELL = 'ddhjdy5';      // precision 7, contains (12.25, -61.75)
+
+  beforeAll(async () => {
+    fixture = createTempDatabase('precision-endpoints');
+    const db = fixture.db;
+
+    await exec(db, `
+      CREATE TABLE compact_places(
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        country_id TEXT NOT NULL,
+        admin1_id INTEGER,
+        placetype_code INTEGER NOT NULL,
+        latitude REAL NOT NULL,
+        longitude REAL NOT NULL
+      );
+
+      CREATE TABLE compact_geohash_lookup(
+        geohash TEXT PRIMARY KEY,
+        place_id INTEGER NOT NULL,
+        FOREIGN KEY (place_id) REFERENCES compact_places(id)
+      );
+    `);
+
+    // Centroids sit at the OTHER place's test point.
+    await exec(db, `
+      INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude) VALUES
+        (91, 'Coarsehaven', 'XF', NULL, 0, 12.25, -61.75),
+        (92, 'Finewick', 'XF', NULL, 0, 12.75, -61.25);
+    `);
+
+    await run(db, 'INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES (?, ?)',
+      [COARSE_CELL, 91]);
+    await run(db, 'INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES (?, ?)',
+      [FINE_CELL, 92]);
+
+    await close(db);
+    geocoder = boundaryGeocoder(fixture.databasePath);
+  });
+
+  afterAll(() => {
+    fixture.cleanup();
+  });
+
+  it('matches a key stored at the base precision (4)', async () => {
+    const result = await geocoder.reverse(12.75, -61.25);
+    expect(result.id).toEqual(91);
+    expect(result.name).toEqual('Coarsehaven');
+  });
+
+  it('matches a key stored at the maximum precision (7)', async () => {
+    const result = await geocoder.reverse(12.25, -61.75);
+    expect(result.id).toEqual(92);
+    expect(result.name).toEqual('Finewick');
+  });
+
+  it('still produces the frozen endpoint keys', () => {
+    expect(geohash.encode(12.75, -61.25, 4)).toEqual(COARSE_CELL);
+    expect(geohash.encode(12.25, -61.75, 7)).toEqual(FINE_CELL);
+  });
+});
+
+// The GeoNames generator is more than its schema file. generate_geonames.sh
+// reshapes the upstream dumps with awk and loads them through SQLite's
+// positional `.import FILE TABLE`, so the field order of that awk output
+// has to line up with the column order scripts/schema.sql declares.
+//
+// That makes column order load-bearing for this one path even though it is
+// explicitly not binding for readers (they select by name), and nothing
+// else in this suite can see it: swapping latitude/longitude or
+// asciiname/population in either the awk print or the DDL leaves every
+// structural assertion green while producing databases full of
+// misassigned, reader-visible values.
+//
+// So run the real script over miniature local sources and let the reader
+// judge the result.
+describe('reader compatibility: GeoNames generator (scripts/generate_geonames.sh)', () => {
+  const GENERATOR = path.join(__dirname, '..', 'scripts', 'generate_geonames.sh');
+
+  // Upstream cities dumps are 19 tab-separated fields. Only these are
+  // read: 1 id, 2 name, 3 asciiname, 5 latitude, 6 longitude, 8 feature
+  // code, 9 country, 11 admin1, 15 population.
+  function cityRow(id, name, asciiname, latitude, longitude, featureCode, population) {
+    const fields = new Array(19).fill('');
+    fields[0] = String(id);
+    fields[1] = name;
+    fields[2] = asciiname;
+    fields[4] = String(latitude);
+    fields[5] = String(longitude);
+    fields[6] = 'P';
+    fields[7] = featureCode;
+    fields[8] = 'XH';
+    fields[10] = '07';
+    fields[14] = String(population);
+    fields[17] = 'Etc/UTC';
+    return fields.join('\t');
+  }
+
+  let dir;
+  let databasePath;
+  let generated;
+  let geocoder;
+
+  beforeAll(() => {
+    // The script drives the sqlite3 CLI, which is not a package
+    // dependency. Skip rather than fail where it is unavailable.
+    const probe = spawnSync('sqlite3', ['--version'], { encoding: 'utf8' });
+    if (probe.error || probe.status !== 0) {
+      generated = { skipped: true };
+      return;
+    }
+
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-compat-geonames-'));
+    const sourceDir = path.join(dir, '.geonames-build', 'source');
+    fs.mkdirSync(sourceDir, { recursive: true });
+
+    // Distinct latitude and longitude, an ASCII spelling that differs from
+    // the name, and two same-named places separated only by population —
+    // so a swap in any of those positions changes a reader's answer.
+    fs.writeFileSync(path.join(sourceDir, 'cities1000.txt'), [
+      cityRow(5001, 'Zürichbourg', 'Zurichbourg', 45.5, 9.25, 'PPLC', 250000),
+      cityRow(5002, 'Doubleton', 'Doubleton', 46.5, 9.75, 'PPLA', 800000),
+      cityRow(5003, 'Doubleton', 'Doubleton', 47.5, 10.25, 'PPLA', 12000)
+    ].join('\n') + '\n');
+
+    // countryInfo.txt: comment lines are stripped; ISO is field 1 and the
+    // country name is field 5.
+    const countryFields = new Array(19).fill('');
+    countryFields[0] = 'XH';
+    countryFields[4] = 'Helvetiana';
+    fs.writeFileSync(path.join(sourceDir, 'countryInfo.txt'),
+      '# ISO\tISO3\tISO-Numeric\tfips\tCountry\n' + countryFields.join('\t') + '\n');
+
+    // admin1CodesASCII.txt: "<country>.<id>" then the name.
+    fs.writeFileSync(path.join(sourceDir, 'admin1CodesASCII.txt'),
+      ['XH.07', 'Alpine Region', 'Alpine Region', '9999999'].join('\t') + '\n');
+
+    databasePath = path.join(dir, 'geonames.sqlite');
+    generated = spawnSync('bash', [GENERATOR, databasePath], {
+      encoding: 'utf8',
+      cwd: dir,
+      env: Object.assign({}, process.env, {
+        GEONAMES_DOWNLOAD: '0',
+        GEONAMES_WORKDIR: dir
+      })
+    });
+
+    geocoder = createGeocoder({ database: databasePath });
+  });
+
+  afterAll(() => {
+    if (dir) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function requireGenerated() {
+    if (generated.skipped) {
+      pending('sqlite3 CLI is not installed');
+      return false;
+    }
+    expect(`exit ${generated.status}: ${generated.stderr}`).toEqual('exit 0: ');
+    return true;
+  }
+
+  it('produces a database the schema assertions accept', async () => {
+    if (!requireGenerated()) return;
+    await expectSuperset(databasePath, FROZEN_COLUMNS.centroid);
+    await expectSuperset(databasePath, FROZEN_COLUMNS.centroidForward);
+  }, 30000);
+
+  it('imports coordinates into the columns the reader reads', async () => {
+    if (!requireGenerated()) return;
+    // Latitude 45.5 / longitude 9.25 — swapped on import, this point
+    // resolves to a different city or none at all.
+    const result = await geocoder.reverse(45.5, 9.25);
+    expect(result.id).toEqual(5001);
+    expect(result.name).toEqual('Zürichbourg');
+    expect(result.formatted).toEqual('Zürichbourg, Alpine Region, Helvetiana');
+    expect(result.coordinates).toEqual({ latitude: 45.5, longitude: 9.25 });
+  }, 30000);
+
+  it('imports the ASCII alias into asciiname', async () => {
+    if (!requireGenerated()) return;
+    const result = await geocoder.forward('Zurichbourg');
+    expect(result.id).toEqual(5001);
+    expect(result.name).toEqual('Zürichbourg');
+  }, 30000);
+
+  it('imports population where forward ranking can use it', async () => {
+    if (!requireGenerated()) return;
+    const result = await geocoder.forward('Doubleton');
+    expect(result.id).toEqual(5002);
+  }, 30000);
+
+  it('imports ids where location lookup can find them', async () => {
+    if (!requireGenerated()) return;
+    const result = await geocoder.location.find(5003);
+    expect(result.name).toEqual('Doubleton');
+  }, 30000);
+});
