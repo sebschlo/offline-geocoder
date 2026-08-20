@@ -7,8 +7,14 @@
   holding two centroids are still decided by population. Disable with
   `--home-cell-priority false` (`WOF_HOME_CELL_PRIORITY=0`).
 - Stop the dominant-city rollup absorbing the home cell of a town in another
-  country. Rollups inside a country are unchanged, so a metro still reads as
-  one city.
+  country, whether that cell is a descendant of the promoted parent or the
+  promoted parent itself. Rollups inside a country are unchanged, so a metro
+  still reads as one city.
+- Apply home-cell ownership across nested cover cells, not only within a single
+  hash. A place that owns the coarse cell holding its centroid now also keeps
+  the finer cells over that same point when a neighbour emits them, so the rule
+  holds for the longest-prefix lookup the runtime actually performs. Placetype
+  ranking still decides first, and no cell is added to the index.
 - Fix `--append` builds handing contested geohash cells to whichever batch ran
   last. Cells that already belong to a better-ranked place (by placetype, then
   population, then centroid distance) now keep their existing owner, so border

@@ -1115,15 +1115,93 @@ function localityShareMeetsThreshold(localityId, group, opts) {
   return localityShareInParent(localityId, group) >= threshold
 }
 
-function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
-  if (!opts.promoteLocalityOverRegion) {
-    return
+// Minor localities are folded into the dominant city, which is what makes a
+// metro read as one name.  The exception is a town in another country:
+// absorbing the cell holding its centroid would put its own centre on the
+// wrong side of a border, which no label choice can justify.  Intra-country
+// absorption is deliberate and stays untouched.
+function protectsForeignHomeCell(place, hash, dominantPlace, opts) {
+  if (!opts.homeCellPriority || !place) {
+    return false
   }
 
+  return isCityPlacetypeCode(place.placetypeCode) &&
+    ownsHomeCell(place, hash) &&
+    isForeignTo(place, dominantPlace)
+}
+
+// The cell map is keyed by exact hash, so the comparator only ever ranks
+// places that emitted the *same* cell.  Cover cells never nest within one
+// place, but they do nest across places: a town can win the coarse cell that
+// holds its centroid while a neighbour emits a finer cell over the same point,
+// and the runtime's longest-prefix walk then answers with the neighbour.
+// Replay the ownership rule down the chain of cells containing the centroid so
+// the home-cell guarantee holds at lookup time, not merely per hash.  Only
+// existing cells are reassigned - no new cell is created, so this cannot grow
+// the index.
+function reconcileNestedHomeCells(bestByHash, placeById, opts) {
+  if (!opts.homeCellPriority) {
+    return 0
+  }
+
+  var hashes = Object.keys(bestByHash)
+  var deepest = 0
+  for (var lengthIndex = 0; lengthIndex < hashes.length; lengthIndex++) {
+    if (hashes[lengthIndex].length > deepest) {
+      deepest = hashes[lengthIndex].length
+    }
+  }
+
+  var hashCenterCache = Object.create(null)
+  var reassigned = 0
+
+  for (var i = 0; i < hashes.length; i++) {
+    var hash = hashes[i]
+    var owner = bestByHash[hash]
+    if (owner === undefined) {
+      continue
+    }
+
+    var place = placeById[String(owner)]
+    if (!place || !ownsHomeCell(place, hash)) {
+      continue
+    }
+
+    for (var length = hash.length + 1; length <= deepest; length++) {
+      var finerHash = geohash.encode(place.centroidLat, place.centroidLon, length)
+      var incumbentId = bestByHash[finerHash]
+      if (incumbentId === undefined || Number(incumbentId) === Number(place.id)) {
+        continue
+      }
+
+      var incumbent = placeById[String(incumbentId)]
+      if (!incumbent) {
+        continue
+      }
+
+      // Reassign only when the same comparator that governs a single cell
+      // would hand this one over, so placetype rank still outranks the home
+      // cell and a cell shared by two centroids keeps its population ordering.
+      if (comparePlacesForHash(place, incumbent, finerHash, hashCenterCache, true) < 0) {
+        bestByHash[finerHash] = place.id
+        reassigned += 1
+      }
+    }
+  }
+
+  return reassigned
+}
+
+function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
+  if (!opts.promoteLocalityOverRegion) {
+    return 0
+  }
+
+  var refusedPromotions = 0
   var minPrecision = Number(opts.basePrecision || 1)
   var maxPrecision = Number(opts.maxPrecision || minPrecision)
   if (maxPrecision <= minPrecision) {
-    return
+    return refusedPromotions
   }
 
   for (var precision = maxPrecision - 1; precision >= minPrecision; precision--) {
@@ -1215,6 +1293,15 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
         }
       }
 
+      // The parent cell can itself be the home cell of a town across the
+      // border.  The descendant sweep below only visits hashes longer than
+      // `precision`, so without this check the promotion would overwrite that
+      // town's own centroid cell and never get the chance to protect it.
+      if (protectsForeignHomeCell(existingPlace, parentHash, placeById[String(promotion.localityId)], opts)) {
+        refusedPromotions += 1
+        continue
+      }
+
       bestByHash[parentHash] = promotion.localityId
       promotedParents[parentHash] = promotion
     }
@@ -1249,13 +1336,12 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
         continue
       }
 
-      // Minor localities are folded into the dominant city, which is what
-      // makes a metro read as one name.  The exception is a town in another
-      // country: absorbing the cell it sits in would put it on the wrong side
-      // of a border, which no label choice can justify.
-      var protectedHomeCell = opts.homeCellPriority &&
-        ownsHomeCell(descendantPlace, descendantHash) &&
-        isForeignTo(descendantPlace, placeById[String(promoted.localityId)])
+      var protectedHomeCell = protectsForeignHomeCell(
+        descendantPlace,
+        descendantHash,
+        placeById[String(promoted.localityId)],
+        opts
+      )
 
       if (promoted.suppressMinorLocalities &&
         isCityPlacetypeCode(descendantPlace.placetypeCode) &&
@@ -1265,6 +1351,8 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
       }
     }
   }
+
+  return refusedPromotions
 }
 
 function buildCompactLookupRows(places, opts) {
@@ -1295,7 +1383,11 @@ function buildCompactLookupRows(places, opts) {
     bestByHashId[currentHash] = bestByHash[currentHash].id
   }
 
-  promoteLocalityParentsByRegionCompetition(bestByHashId, placeById, opts)
+  // Runs before the rollup so the metro rollup keeps the last word on which
+  // cells a dominant city absorbs inside its own country.
+  var nestedHomeCellFixes = reconcileNestedHomeCells(bestByHashId, placeById, opts)
+
+  var refusedPromotions = promoteLocalityParentsByRegionCompetition(bestByHashId, placeById, opts)
 
   var rows = Object.keys(bestByHashId).map(function(hash) {
     return {
@@ -1338,7 +1430,9 @@ function buildCompactLookupRows(places, opts) {
 
   return {
     rows: compact,
-    placeById: placeById
+    placeById: placeById,
+    nestedHomeCellFixes: nestedHomeCellFixes,
+    refusedPromotions: refusedPromotions
   }
 }
 
@@ -1996,6 +2090,10 @@ async function main() {
     console.log('Mode: ' + modeLabel)
     console.log('Precision: ' + options.basePrecision + ' -> ' + options.maxPrecision)
     console.log('Home cell priority: ' + (options.homeCellPriority ? 'true' : 'false'))
+    if (compactBuild) {
+      console.log('Home cells kept from a nested foreign cell: ' + (compactBuild.nestedHomeCellFixes || 0))
+      console.log('Parent promotions refused over a foreign home cell: ' + (compactBuild.refusedPromotions || 0))
+    }
     console.log('Placetype precision caps: locality=' + options.localityMaxPrecision + ', localadmin=' + options.localadminMaxPrecision + ', county=' + options.countyMaxPrecision + ', region=' + options.regionMaxPrecision)
     if (Number.isFinite(options.regionSparseMaxPrecision) && Number.isFinite(options.regionSparseMinAreaKm2)) {
       console.log('Sparse region rule: area_km2>=' + options.regionSparseMinAreaKm2 + ' => max_precision=' + options.regionSparseMaxPrecision)

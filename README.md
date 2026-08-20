@@ -235,7 +235,7 @@ Builder notes:
   - `--region-max-precision`
   - `--region-sparse-max-precision` + `--region-sparse-min-area-km2` for very large sparse regions (for example geohash-3 in Amazon-like interiors)
 - `--promote-locality-over-region` (default `true`) prefers locality labels in shared parent cells when there is no competing locality (keeps city labels sticky against region-only outskirts)
-- `--home-cell-priority` (default `true`) gives a place the cell that contains its own centroid, ahead of the population tie-break, so a border town is not swallowed by the larger city across the border. Placetype ranking still applies first, and a cell holding two centroids is still decided by population. The dominant-city rollup keeps a foreign town's home cell for the same reason; rollups within one country are unaffected
+- `--home-cell-priority` (default `true`) gives a place the cell that contains its own centroid, ahead of the population tie-break, so a border town is not swallowed by the larger city across the border. Placetype ranking still applies first, and a cell holding two centroids is still decided by population. Because the index is walked by longest matching prefix, the claim is enforced across nested cells too: a place that owns the coarse cell holding its centroid also keeps the finer cells over that point. The dominant-city rollup keeps a foreign town's home cell for the same reason, whether that cell is the promoted parent or one of its descendants; rollups within one country are unaffected
 - Dominant-city rollup keeps broad city labels sticky in mixed city/suburb cells unless there is competing major-city pressure:
   - `--dominant-locality-population` (default `100000`)
   - `--dominant-locality-ratio` (default `3`)

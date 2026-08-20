@@ -225,4 +225,122 @@ describe('boundary builder home cell ownership', () => {
       }
     });
   });
+
+  // The cases below turn on a place whose polygon swallows a whole
+  // base-precision cell, so its cover terminates at precision 4 and the cell
+  // holding its centre is a *coarse* one.  That is what puts it out of reach
+  // of the two rules that only ever look at one exact hash: the rollup's
+  // descendant sweep (which skips hashes no longer than the parent) and the
+  // comparator (which only ranks places that emitted the same hash).
+  describe('across nested cover cells', () => {
+    // s000 spans lon 0..0.3515625, lat 0..0.17578125 and splits into 8x4
+    // children at precision 5.
+    const PARENT_HASH = 's000';
+
+    // A rural town on the far side of the border. Its polygon contains all of
+    // s000, so s000 is both its cover cell and its home cell.
+    const HOMELAND = {
+      id: 4001,
+      name: 'Homeland',
+      placetype: 'locality',
+      countryId: 'US',
+      population: 40000,
+      minLon: -0.05, minLat: -0.05, maxLon: 0.40, maxLat: 0.22,
+      centroid: [0.02, 0.02]
+    };
+
+    // The city across the border: seven times the population, covering the
+    // eastern six of the eight child columns (24 of 32 cells).
+    const METROPOLIS = {
+      id: 4002,
+      name: 'Metropolis',
+      placetype: 'locality',
+      countryId: 'MX',
+      population: 690000,
+      minLon: 0.088, minLat: -0.05, maxLon: 0.60, maxLat: 0.22,
+      centroid: [0.07, 0.29]
+    };
+
+    // A small neighbour in the same country as Metropolis, present only so the
+    // rollup takes its dominant-city branch instead of the single-locality one.
+    const SUBURB = {
+      id: 4003,
+      name: 'Suburb',
+      placetype: 'locality',
+      countryId: 'MX',
+      population: 20000,
+      minLon: 0.045, minLat: 0.002, maxLon: 0.086, maxLat: 0.085,
+      centroid: [0.04, 0.06]
+    };
+
+    const metropolisCell = geohash.encode(0.06, 0.285, 5);
+
+    it('keeps a foreign home cell when the rollup promotes that very cell', async () => {
+      await withTempDir(async (dir) => {
+        // Homeland's centre sits in the one child column no Mexican place
+        // covers, so nothing finer than s000 answers for it: if the promotion
+        // takes s000, the town's own centre reads as Mexico.
+        const input = writeFixture(dir, 'promote.geojson', [
+          place(HOMELAND), place(METROPOLIS), place(SUBURB)
+        ]);
+        const dbPath = path.join(dir, 'promote.sqlite');
+
+        expect(runBuilder(['--database', dbPath, '--input', input].concat(commonFlags)).status).toEqual(0);
+
+        const homeCell = geohash.encode(HOMELAND.centroid[0], HOMELAND.centroid[1], 5);
+        expect(homeCell.slice(0, PARENT_HASH.length)).toEqual(PARENT_HASH);
+
+        const owner = await lookupOwner(dbPath, homeCell);
+        expect(owner.id).toEqual(HOMELAND.id);
+        expect(owner.country_id).toEqual('US');
+
+        // The promotion is refused, not inverted: cells Metropolis covers
+        // itself still answer with Metropolis.
+        expect((await lookupOwner(dbPath, metropolisCell)).id).toEqual(METROPOLIS.id);
+      });
+    });
+
+    it('keeps a coarse home cell against a finer cell emitted by a neighbour', async () => {
+      await withTempDir(async (dir) => {
+        // Same geometry, but Homeland's centre now sits in a child cell
+        // Metropolis covers. Neither place emits the other's hash, so no
+        // single-cell comparison ever ranks them and the runtime's
+        // longest-prefix walk answers with the finer foreign row.
+        const input = writeFixture(dir, 'nested.geojson', [
+          place(Object.assign({}, HOMELAND, { centroid: [0.11, 0.11] })),
+          place(METROPOLIS)
+        ]);
+        const dbPath = path.join(dir, 'nested.sqlite');
+
+        expect(runBuilder(['--database', dbPath, '--input', input].concat(commonFlags)).status).toEqual(0);
+
+        const homeCell = geohash.encode(0.11, 0.11, 5);
+        expect(homeCell.length).toEqual(5);
+        expect(homeCell.slice(0, PARENT_HASH.length)).toEqual(PARENT_HASH);
+
+        const owner = await lookupOwner(dbPath, homeCell);
+        expect(owner.id).toEqual(HOMELAND.id);
+        expect(owner.country_id).toEqual('US');
+
+        // Only the cell holding the centre changes hands.
+        expect((await lookupOwner(dbPath, metropolisCell)).id).toEqual(METROPOLIS.id);
+      });
+    });
+
+    it('leaves the nested cell alone when the rule is disabled', async () => {
+      await withTempDir(async (dir) => {
+        const input = writeFixture(dir, 'nested.geojson', [
+          place(Object.assign({}, HOMELAND, { centroid: [0.11, 0.11] })),
+          place(METROPOLIS)
+        ]);
+        const dbPath = path.join(dir, 'nested-off.sqlite');
+
+        expect(runBuilder([
+          '--database', dbPath, '--input', input, '--home-cell-priority', 'false'
+        ].concat(commonFlags)).status).toEqual(0);
+
+        expect((await lookupOwner(dbPath, geohash.encode(0.11, 0.11, 5))).id).toEqual(METROPOLIS.id);
+      });
+    });
+  });
 });
