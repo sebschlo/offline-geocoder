@@ -531,6 +531,184 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
+  it('absorbs a foreign-tagged record only behind the explicit opt-in', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+      const before = await lookupSnapshot(dbPath);
+
+      // HOMONYM carries a CA tag while sitting on this file's ground - the
+      // misfiled-record case. Without the opt-in it is indistinguishable from
+      // a typo'd id, and must still be refused.
+      const withoutOptIn = baseDoc();
+      withoutOptIn.entries[0].absorb = [EAST, HOMONYM];
+      const refused = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'us.json', withoutOptIn)
+      ]);
+      expect(refused.status).toEqual(1);
+      expect(refused.stderr).toContain('belongs to country CA');
+      expect(refused.stderr).toContain('absorbForeignTagged');
+      expect(await lookupSnapshot(dbPath)).toEqual(before);
+
+      // With it, the foreign-tagged source is absorbed - but the target is
+      // never exempt, so the file can still only produce its own country's
+      // labels.
+      const withOptIn = baseDoc();
+      withOptIn.entries[0].absorb = [EAST, HOMONYM];
+      withOptIn.entries[0].absorbForeignTagged = true;
+      const accepted = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'us.json', withOptIn)
+      ]);
+      expect(accepted.status).toEqual(0);
+      const after = await lookupSnapshot(dbPath);
+      const homonymRow = after.find((row) => row.geohash === cells.homonymFine);
+      expect(homonymRow.place_id).toEqual(CITY);
+
+      const foreignTarget = baseDoc();
+      foreignTarget.entries[0].into = HOMONYM;
+      foreignTarget.entries[0].absorbForeignTagged = true;
+      const rejectedTarget = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'us.json', foreignTarget)
+      ]);
+      expect(rejectedTarget.status).toEqual(1);
+      expect(rejectedTarget.stderr).toContain('belongs to country CA');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds an unqualified guard probe to the entry country', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // 'Ghost Town' exists in both US and CA. This guard omits "country", so
+      // it means the entry's own country - US - but the coordinate resolves to
+      // the Canadian homonym. Matching on name alone would pass it, which is
+      // exactly the cross-border confusion the country check exists to stop,
+      // and it would apply to every probe ever written without a "country".
+      const doc = baseDoc();
+      doc.entries[0].probes.push({
+        lat: points.homonym.lat,
+        lon: points.homonym.lon,
+        expect: 'Ghost Town',
+        note: 'guard: unqualified, so it means the entry country'
+      });
+
+      const result = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'us.json', doc),
+        '--verify'
+      ]);
+
+      expect(result.status).toEqual(1);
+      const output = result.stdout + result.stderr;
+      expect(output).toContain('not US');
+      // And it says why, so the author can qualify the probe if that was the
+      // intent rather than guessing at the failure.
+      expect(output).toContain('probes default to the entry');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails a probe whose resolved place carries no country', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // A place with no country at all owns the cell the probe lands on. The
+      // name matches, so only the country check can catch it - and it has
+      // nothing to compare against. Verification fails closed rather than
+      // passing a probe it could not actually check.
+      const orphanPoint = { lat: 60.2, lon: 60.2 };
+      const orphanCell = geohash.encode(orphanPoint.lat, orphanPoint.lon, 5);
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `
+          INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude)
+            VALUES (9999001, 'Bystander County', '', 5, 3, ${orphanPoint.lat}, ${orphanPoint.lon});
+          INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES ('${orphanCell}', 9999001);
+        `);
+      } finally {
+        await close(db);
+      }
+
+      const doc = baseDoc();
+      doc.entries[0].probes.push({
+        lat: orphanPoint.lat,
+        lon: orphanPoint.lon,
+        expect: 'Bystander County',
+        note: 'guard: resolved place has no country'
+      });
+
+      const result = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'us.json', doc),
+        '--verify'
+      ]);
+
+      expect(result.status).toEqual(1);
+      expect(result.stdout + result.stderr).toContain('<no country>');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds a country-qualified guard probe to that country', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // 'Ghost Town' names a place in both US and CA. A guard probe that names
+      // the country must be satisfied by the CA one only - without the country
+      // check the same-named US place would silently pass it.
+      const doc = baseDoc();
+      doc.entries[0].probes.push({
+        lat: points.homonym.lat,
+        lon: points.homonym.lon,
+        expect: 'Ghost Town',
+        country: 'CA',
+        note: 'guard: the Canadian homonym keeps its own label'
+      });
+      const passing = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'us.json', doc),
+        '--verify'
+      ]);
+      expect(passing.status).toEqual(0);
+      expect(passing.stdout).toContain('the Canadian homonym keeps its own label');
+
+      // Pointing the same expectation at the US homonym's ground fails on the
+      // country even though the name matches.
+      await seedCompactDb(path.join(dir, 'second.sqlite'));
+      const wrongCountry = baseDoc();
+      wrongCountry.entries[0].probes.push({
+        lat: points.ghost.lat,
+        lon: points.ghost.lon,
+        expect: 'Ghost Town',
+        country: 'CA',
+        note: 'guard: pointed at the US homonym'
+      });
+      const failing = runCurate([
+        '--database', path.join(dir, 'second.sqlite'),
+        '--curation', writeDoc(dir, 'us.json', wrongCountry),
+        '--verify'
+      ]);
+      expect(failing.status).toEqual(1);
+      expect(failing.stdout + failing.stderr).toContain('not CA');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('does not defer guard failures unrelated to a missing merge source', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
     try {

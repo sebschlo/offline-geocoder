@@ -87,11 +87,13 @@ named for, and a country's whole overlay always travels in one file.
 | `entries[].op` | string | Operation. Currently only `"merge"`. |
 | `entries[].into` | integer | Place id (Who's On First id) whose label wins. Must exist in `compact_places`. |
 | `entries[].absorb` | array of integers | Place ids whose reverse-lookup cells are relabeled to `into`. Must exist in `compact_places`; must not include `into`. |
+| `entries[].absorbForeignTagged` | boolean | Optional, default `false`. Allows `absorb` ids whose stored `country_id` is *not* the file's country — for a record misfiled under the wrong country while carrying this country's coordinates. `into` is never exempt, so a file can still only ever produce labels for the country it is named for. |
 | `entries[].minPrecision` | integer (1–12) | Only geohash cells of at least this length are relabeled. Coarser cells keep their original owner. |
 | `entries[].rationale` | string | Required. The reviewable justification for the entry. |
 | `entries[].probes` | array | Required. Coordinates with expected reverse-lookup labels, checked by `--verify`. Must include at least one positive probe (`expect` equals the merge target's name, verified against the target's place id) and at least one guard probe (`expect` differs). |
 | `probes[].lat`, `probes[].lon` | number | Probe coordinate. |
 | `probes[].expect` | string | Expected `result.name` from a reverse lookup at that coordinate. Must name a place that exists in the entry's country (typo protection). |
+| `probes[].country` | string | Optional two-letter uppercase ISO code, default the entry's country. Names the country the expected label belongs to, so a guard can assert that a coordinate still resolves *outside* the curated country. Verification checks the resolved place's country, so a same-named place across the border cannot satisfy it. |
 | `probes[].note` | string | Optional human context (what the coordinate is, or which guard it enforces). |
 
 Unknown fields are rejected so that typos (`"absorbs"`, `"minPrecison"`) fail
@@ -265,6 +267,24 @@ the source owning that cell has no relabelable cells at all, the same
 situation *is* a data gap — the build simply has not reached this precision
 here — and stays deferrable.
 
+### Misfiled records: when the country tag itself is the defect
+
+Occasionally a source record carries one country's coordinates, name and
+population while being filed under another country entirely — Who's On First
+ships a duplicate of Mellieħa, Malta inside the Mali repository, tagged `ML`
+with `wof:parent_id: -1`. Such a record can win the cells over the real town,
+so reverse geocoding answers with a foreign id while forward search answers
+with the correct one, and the two can no longer be grouped.
+
+This is data repair, not a labeling opinion, so prefer a build rule if one can
+be made to work — `mt.json` records the four generic rules that were tried
+against a world build and the measured reason each was rejected, which is the
+sort of evidence a reviewer should expect before accepting an entry of this
+kind. When no rule can reach it, absorb the misfiled record into the correct
+place with `"absorbForeignTagged": true`, and pin the blast radius with a guard
+probe in the country the record was wrongly filed under, using
+`probes[].country`.
+
 ### A note on the Guatemala probes
 
 Every coordinate in `gt.json` was chosen **empirically against a world build
@@ -341,3 +361,14 @@ changing them are strict by design:
   intentionally keep their own identities, and Villa Canales — which owns the
   corridor cells nearer the city — keeps its own name too. Verified strictly
   against a world build; see the note on the Guatemala probes above.
+- **`mt.json` — Malta.** Who's On First files duplicates of two Maltese
+  localities inside the Mali repository — Mellieħa (101912869) and Naxxar
+  (101846471) — each carrying Malta's coordinates, name and population but a
+  Mali country tag, no parent and a hierarchy containing only Mali. Between
+  them they own three cells over the real towns, so those coordinates reverse
+  geocode into Mali while forward search returns the Maltese ids. Each is
+  absorbed into its correct Maltese locality with `absorbForeignTagged`. Two
+  further Mali-tagged records inside Malta's bounding box are deliberately left
+  out and the entries say why: San Giljan owns no cells, and Xghajra does not
+  clear the build's population floor. The rationale records the four generic
+  rules that were measured and rejected before curating. Verified strictly.
