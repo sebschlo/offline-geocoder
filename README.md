@@ -174,6 +174,10 @@ Environment variables for customization:
 The default feature codes exclude `PPL` which can include neighbourhood-like
 populated places. The schema is defined in [`scripts/schema.sql`](scripts/schema.sql).
 
+Database files and reader code are versioned independently, so schema
+changes must follow the backwards-compatibility contract in
+[`COMPATIBILITY.md`](COMPATIBILITY.md).
+
 ### Generating a Boundary Index
 
 Build boundary-aware reverse lookup tables from a polygon source (GeoJSON
@@ -317,6 +321,40 @@ It creates/updates:
 - `validation_results` (local vs LocationIQ comparison verdicts)
 
 Cache DB path is automatic (default behavior): `tmp/locationiq-validation-<database-basename>.sqlite`.
+
+### World Validation Sweep (LocationIQ)
+
+The same script also runs a quota-aware, resumable sweep over a world-wide
+points file and ranks countries by mismatch rate, so data work can be aimed at
+the worst areas first:
+
+```bash
+# 1. Build a points file from a GeoNames-style TSV (e.g. cities1000.txt):
+#    the top 25 most populous places per country. Not committed to the repo.
+node scripts/validate_with_locationiq.js sample \
+  --geonames tmp/cities1000.txt --per-country 25
+
+# 2. Run the sweep. Stays inside LocationIQ's free tier by default:
+#    max 4500 requests per UTC day (persisted across invocations) at 1 req/s.
+LOCATIONIQ_API_KEY=... node scripts/validate_with_locationiq.js sweep \
+  --points tmp/locationiq-sweep/points.jsonl --database tmp/world.sqlite
+
+# 3. Rebuild the report from cache only, no network:
+node scripts/validate_with_locationiq.js sweep \
+  --points tmp/locationiq-sweep/points.jsonl --database tmp/world.sqlite --dry-run
+```
+
+Every LocationIQ response is cached as JSONL keyed by coordinates rounded to
+four decimals, so re-running the same command never re-queries a cached point —
+if a run stops at the daily cap or on HTTP 429, just run it again later to
+resume. The daily-cap state lives outside the workdir (default
+`tmp/locationiq-quota.json`, suffixed with a non-reversible fingerprint of the
+API key), so every sweep configuration using one key shares a single cap, while
+separate keys — which LocationIQ meters separately — keep their own tallies.
+Outputs land under `--workdir` (default `tmp/locationiq-sweep/`):
+`report.md` (per-country point counts, agreement %, country mismatches, worst
+examples) and `mismatches.jsonl` (machine-readable list of all mismatches).
+See `sweep --help` and `sample --help` for all options.
 
 ## License
 
