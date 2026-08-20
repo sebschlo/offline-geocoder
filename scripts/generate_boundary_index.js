@@ -1797,10 +1797,27 @@ async function countHomeCellsShadowedByFinerRows(db, keptRows, placeById, batchP
 
   for (var placeIndex = 0; placeIndex < placeIds.length; placeIndex++) {
     var place = placeById[placeIds[placeIndex]]
-    if (!place || !place.homeGeohash) continue
+    if (!place || !place.homeGeohash || !place.cover) continue
+
+    // A place only ever claims cells *below* the cover cell that holds its
+    // centroid - that is the level its own cover terminates at, and the level
+    // reconcileNestedHomeCells() propagates down from. Starting the chain any
+    // coarser would judge cells the place never claimed: when the rollup
+    // suppresses a locality's own row and the promoted ancestor then defers to
+    // an existing owner, a scan reaching that ancestor would report a shadow
+    // for a cell that was never contested.
+    var homeCoverPrecision = 0
+    for (var coverIndex = 0; coverIndex < place.cover.length; coverIndex++) {
+      var coverHash = place.cover[coverIndex].geohash
+      if (ownsHomeCell(place, coverHash)) {
+        homeCoverPrecision = coverHash.length
+        break
+      }
+    }
+    if (!homeCoverPrecision || homeCoverPrecision >= deepest) continue
 
     var chain = []
-    for (var length = 1; length <= deepest; length++) {
+    for (var length = homeCoverPrecision + 1; length <= deepest; length++) {
       // The cached home geohash stops at HOME_CELL_PRECISION; past that,
       // encode from the centroid as ownsHomeCell() does, so a database built
       // deeper than the cache still gets real descendants instead of the same

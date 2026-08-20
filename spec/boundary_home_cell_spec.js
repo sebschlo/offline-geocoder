@@ -702,6 +702,65 @@ describe('boundary builder home cell ownership', () => {
     });
   });
 
+  it('does not report a cell the place never claimed', async () => {
+    await withTempDir(async (dir) => {
+      // The false-positive shape. Little Town's own row is suppressed by the
+      // same-country dominant-city rollup, and the promoted parent then defers
+      // to a more populous existing owner at that exact hash. Little Town is
+      // centred somewhere in that parent and outranks its owner on the
+      // home-cell rule, so a scan that starts at the top of the chain reports
+      // a shadow - for a cell Little Town never claimed and that nothing
+      // contested on its behalf. Claims only ever propagate *below* a place's
+      // own cover cell, and the scan has to respect the same bound.
+      const oldOwner = place({
+        id: 9401, name: 'Old Owner', placetype: 'locality', countryId: 'US',
+        population: 900000,
+        minLon: -0.01, minLat: -0.01, maxLon: 0.70, maxLat: 0.18,
+        centroid: [0.08, 0.50]
+      });
+      const metro = place({
+        id: 9402, name: 'Metro', placetype: 'locality', countryId: 'MX',
+        population: 600000,
+        minLon: 0.088, minLat: -0.05, maxLon: 0.60, maxLat: 0.22,
+        centroid: [0.07, 0.45]
+      });
+      const little = place({
+        id: 9403, name: 'Little Town', placetype: 'locality', countryId: 'MX',
+        population: 20000,
+        minLon: 0.045, minLat: 0.002, maxLon: 0.086, maxLat: 0.085,
+        centroid: [0.04, 0.06]
+      });
+
+      const dbPath = path.join(dir, 'never-claimed.sqlite');
+      expect(runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'owner.geojson', [oldOwner])
+      ].concat(commonFlags)).status).toEqual(0);
+
+      const appended = runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'metro.geojson', [metro, little]),
+        '--append'
+      ].concat(commonFlags));
+      expect(appended.status).toEqual(0);
+
+      // The scenario has to actually hold, or the count below proves nothing:
+      // the rollup took Little Town's cells, and the promoted parent deferred
+      // to Old Owner rather than replacing it.
+      const db = new sqlite3.Database(dbPath);
+      try {
+        const owned = await all(db, 'SELECT geohash FROM compact_geohash_lookup WHERE place_id = 9403');
+        expect(owned).toEqual([]);
+        const parent = await all(db, "SELECT place_id FROM compact_geohash_lookup WHERE geohash = 's000'");
+        expect(parent.map((row) => row.place_id)).toEqual([9401]);
+      } finally {
+        await close(db);
+      }
+
+      expect(appended.stdout).toContain('Home cells shadowed by a finer existing row: 0');
+    });
+  });
+
   it('resolves the home cell the same way in either append order', async () => {
     await withTempDir(async (dir) => {
       const bigInput = writeFixture(dir, 'big.geojson', [place(BIGVILLE)]);
