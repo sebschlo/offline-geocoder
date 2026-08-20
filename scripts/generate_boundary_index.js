@@ -1727,7 +1727,7 @@ async function resolveExistingCellConflicts(db, rows, placeById, batchPlaceIds, 
     kept.push(row)
   })
 
-  var shadowed = await countHomeCellsShadowedByFinerRows(db, kept, placeById, batchPlaceIds, homeCellPriority)
+  var shadowed = await countHomeCellsShadowedByFinerRows(db, kept, placeById, batchPlaceIds, homeCellPriority, rows)
 
   return { rows: kept, skipped: skipped, shadowedHomeCells: shadowed }
 }
@@ -1746,68 +1746,89 @@ async function resolveExistingCellConflicts(db, rows, placeById, batchPlaceIds, 
 // foreign polygon, which is what would have to intrude to own a finer cell
 // there. This counter exists so that claim stays falsifiable: if a build ever
 // reports a non-zero number, the reconciliation is worth its cost.
-async function countHomeCellsShadowedByFinerRows(db, rows, placeById, batchPlaceIds, homeCellPriority) {
-  if (!homeCellPriority || !rows.length) {
+//
+// It is written to mirror the runtime rather than the builder's bookkeeping,
+// because a diagnostic that counts something other than what a lookup returns
+// is worse than none at all:
+//
+//   - Every place in the batch with a valid home cell is scanned, whether or
+//     not it won the cell it emitted there. A place that loses its coarse cell
+//     to a co-centred neighbour can still be the rightful owner of the finer
+//     cell over its own centre, which is exactly what the in-batch
+//     reconciliation does for it.
+//   - Only the deepest owner on each centroid path is judged, because that is
+//     the only row a longest-prefix lookup can return. A shallower row that
+//     the place outranks is invisible to the runtime and must not be counted.
+//   - The count is per place, not per row, so one shadowed centre is one.
+async function countHomeCellsShadowedByFinerRows(db, keptRows, placeById, batchPlaceIds, homeCellPriority, emittedRows) {
+  if (!homeCellPriority) {
     return 0
   }
 
-  var rowsByHash = Object.create(null)
-  var batchDeepest = 0
-  for (var i = 0; i < rows.length; i++) {
-    rowsByHash[rows[i].geohash] = rows[i].placeId
-    if (rows[i].geohash.length > batchDeepest) batchDeepest = rows[i].geohash.length
+  var keptByHash = Object.create(null)
+  var deepest = 0
+  var allRows = (emittedRows || []).concat(keptRows)
+
+  for (var i = 0; i < keptRows.length; i++) {
+    keptByHash[keptRows[i].geohash] = keptRows[i].placeId
+  }
+  for (var r = 0; r < allRows.length; r++) {
+    if (allRows[r].geohash.length > deepest) deepest = allRows[r].geohash.length
   }
 
-  // How deep to look must come from what is already stored, not from what this
-  // batch emits.  The shadowing condition is precisely that the batch answers
-  // for a point through a *coarse* cell while a finer row already exists, so
-  // bounding the scan by the batch's own deepest row makes the check blindest
-  // exactly where it is needed - and a batch built with a lower
+  // How deep to look must come from what is already stored, not only from what
+  // this batch emits. The shadowing condition is precisely that the batch
+  // answers for a point through a *coarse* cell while a finer row already
+  // exists, so bounding the scan by the batch's own rows makes the check
+  // blindest exactly where it is needed - and a batch built with a lower
   // --max-precision than the database would never look deep enough either.
   var storedDepth = await dbAll(db, 'SELECT MAX(LENGTH(geohash)) AS depth FROM compact_geohash_lookup')
-  var storedDeepest = storedDepth.length && Number.isFinite(Number(storedDepth[0].depth))
-    ? Number(storedDepth[0].depth)
-    : 0
+  if (storedDepth.length && Number.isFinite(Number(storedDepth[0].depth))) {
+    deepest = Math.max(deepest, Number(storedDepth[0].depth))
+  }
 
-  var deepest = Math.max(batchDeepest, storedDeepest)
+  if (!deepest) {
+    return 0
+  }
 
-  // One candidate per place per precision below the cell this batch answers
-  // with, so the query set is bounded by places, not by rows.
-  var candidates = []
-  var seen = Object.create(null)
+  var paths = []
+  var wanted = Object.create(null)
   var placeIds = Object.keys(placeById)
 
   for (var placeIndex = 0; placeIndex < placeIds.length; placeIndex++) {
     var place = placeById[placeIds[placeIndex]]
     if (!place || !place.homeGeohash) continue
 
-    var answeredAt = 0
+    var chain = []
     for (var length = 1; length <= deepest; length++) {
-      if (rowsByHash[place.homeGeohash.slice(0, length)] === place.id) answeredAt = length
-    }
-    if (!answeredAt) continue
+      // The cached home geohash stops at HOME_CELL_PRECISION; past that,
+      // encode from the centroid as ownsHomeCell() does, so a database built
+      // deeper than the cache still gets real descendants instead of the same
+      // truncated hash repeated.
+      var hash = length <= place.homeGeohash.length
+        ? place.homeGeohash.slice(0, length)
+        : geohash.encode(place.centroidLat, place.centroidLon, length)
 
-    for (var finer = answeredAt + 1; finer <= deepest; finer++) {
-      var hash = place.homeGeohash.slice(0, finer)
-      if (seen[hash + '|' + place.id]) continue
-      seen[hash + '|' + place.id] = true
-      candidates.push({ hash: hash, place: place })
+      chain.push(hash)
+      if (keptByHash[hash] === undefined) wanted[hash] = true
     }
+
+    paths.push({ place: place, chain: chain })
   }
 
-  if (!candidates.length) {
+  var wantedHashes = Object.keys(wanted)
+  if (!paths.length || !wantedHashes.length) {
     return 0
   }
 
-  var ownerByHash = Object.create(null)
+  var storedByHash = Object.create(null)
   var chunkSize = 400
 
-  for (var offset = 0; offset < candidates.length; offset += chunkSize) {
-    var chunk = candidates.slice(offset, offset + chunkSize)
+  for (var offset = 0; offset < wantedHashes.length; offset += chunkSize) {
+    var chunk = wantedHashes.slice(offset, offset + chunkSize)
     var placeholders = chunk.map(function() { return '?' }).join(',')
-    var params = chunk.map(function(candidate) { return candidate.hash })
 
-    var existingRows = await dbAll(db, `
+    var storedRows = await dbAll(db, `
       SELECT
         l.geohash AS geohash,
         p.id AS id,
@@ -1820,23 +1841,46 @@ async function countHomeCellsShadowedByFinerRows(db, rows, placeById, batchPlace
       FROM compact_geohash_lookup l
       JOIN compact_places p ON p.id = l.place_id
       WHERE l.geohash IN (${placeholders})
-    `, params)
+    `, chunk)
 
-    existingRows.forEach(function(row) {
-      ownerByHash[row.geohash] = row
+    storedRows.forEach(function(row) {
+      // Rows belonging to this batch's own places are deleted and rewritten by
+      // this run, so they are not incumbents.
+      if (!batchPlaceIds[String(row.id)]) storedByHash[row.geohash] = row
     })
   }
 
   var hashCenterCache = Object.create(null)
   var shadowed = 0
 
-  candidates.forEach(function(candidate) {
-    var existing = ownerByHash[candidate.hash]
-    if (!existing || batchPlaceIds[String(existing.id)]) return
-    if (rowsByHash[candidate.hash] !== undefined) return
+  paths.forEach(function(path) {
+    var winnerHash = null
+    var winnerRow = null
+    var winnerIsBatch = false
 
-    var incumbent = cellCandidateFromCompactRow(existing)
-    if (comparePlacesForHash(candidate.place, incumbent, candidate.hash, hashCenterCache, true) < 0) {
+    for (var depth = path.chain.length - 1; depth >= 0; depth--) {
+      var hash = path.chain[depth]
+      if (keptByHash[hash] !== undefined) {
+        winnerHash = hash
+        winnerIsBatch = true
+        break
+      }
+      if (storedByHash[hash]) {
+        winnerHash = hash
+        winnerRow = storedByHash[hash]
+        break
+      }
+    }
+
+    // Nothing answers for the point, or this batch does - either way no
+    // earlier batch is shadowing it. Whether the batch's answer is the place
+    // itself or a neighbour is the in-batch reconciliation's business.
+    if (!winnerHash || winnerIsBatch || !winnerRow) {
+      return
+    }
+
+    var incumbent = cellCandidateFromCompactRow(winnerRow)
+    if (comparePlacesForHash(path.place, incumbent, winnerHash, hashCenterCache, true) < 0) {
       shadowed += 1
     }
   })
