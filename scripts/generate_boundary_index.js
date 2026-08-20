@@ -1727,7 +1727,109 @@ async function resolveExistingCellConflicts(db, rows, placeById, batchPlaceIds, 
     kept.push(row)
   })
 
-  return { rows: kept, skipped: skipped }
+  var shadowed = await countHomeCellsShadowedByFinerRows(db, kept, placeById, batchPlaceIds, homeCellPriority)
+
+  return { rows: kept, skipped: skipped, shadowedHomeCells: shadowed }
+}
+
+// The conflict resolver above compares exact hashes, which is all a cell
+// collision needs. It cannot see the other shape a cross-batch disagreement
+// can take: an appended place is centred in a cell an earlier batch already
+// owns at a *finer* precision, while this batch answers for that point only
+// through a coarser cell. Both rows are legitimate covers, no hash collides,
+// and the runtime's longest-prefix walk hands the point to the earlier row.
+//
+// Reconciling that would mean ranking stored owners across nested cells on
+// every append. It is not done here because the state does not occur in the
+// data - a place whose cover terminates at a coarse cell that fully contains
+// it has its centroid deep inside that cell, structurally far from any
+// foreign polygon, which is what would have to intrude to own a finer cell
+// there. This counter exists so that claim stays falsifiable: if a build ever
+// reports a non-zero number, the reconciliation is worth its cost.
+async function countHomeCellsShadowedByFinerRows(db, rows, placeById, batchPlaceIds, homeCellPriority) {
+  if (!homeCellPriority || !rows.length) {
+    return 0
+  }
+
+  // The deepest cell this batch emits bounds how far a shadowing row can sit.
+  var deepest = 0
+  var rowsByHash = Object.create(null)
+  for (var i = 0; i < rows.length; i++) {
+    rowsByHash[rows[i].geohash] = rows[i].placeId
+    if (rows[i].geohash.length > deepest) deepest = rows[i].geohash.length
+  }
+
+  // One candidate per place per precision below the cell this batch answers
+  // with, so the query set is bounded by places, not by rows.
+  var candidates = []
+  var seen = Object.create(null)
+  var placeIds = Object.keys(placeById)
+
+  for (var placeIndex = 0; placeIndex < placeIds.length; placeIndex++) {
+    var place = placeById[placeIds[placeIndex]]
+    if (!place || !place.homeGeohash) continue
+
+    var answeredAt = 0
+    for (var length = 1; length <= deepest; length++) {
+      if (rowsByHash[place.homeGeohash.slice(0, length)] === place.id) answeredAt = length
+    }
+    if (!answeredAt) continue
+
+    for (var finer = answeredAt + 1; finer <= deepest; finer++) {
+      var hash = place.homeGeohash.slice(0, finer)
+      if (seen[hash + '|' + place.id]) continue
+      seen[hash + '|' + place.id] = true
+      candidates.push({ hash: hash, place: place })
+    }
+  }
+
+  if (!candidates.length) {
+    return 0
+  }
+
+  var ownerByHash = Object.create(null)
+  var chunkSize = 400
+
+  for (var offset = 0; offset < candidates.length; offset += chunkSize) {
+    var chunk = candidates.slice(offset, offset + chunkSize)
+    var placeholders = chunk.map(function() { return '?' }).join(',')
+    var params = chunk.map(function(candidate) { return candidate.hash })
+
+    var existingRows = await dbAll(db, `
+      SELECT
+        l.geohash AS geohash,
+        p.id AS id,
+        p.placetype_code AS placetype_code,
+        p.population AS population,
+        p.area AS area,
+        p.latitude AS latitude,
+        p.longitude AS longitude,
+        p.centroid_inside AS centroid_inside
+      FROM compact_geohash_lookup l
+      JOIN compact_places p ON p.id = l.place_id
+      WHERE l.geohash IN (${placeholders})
+    `, params)
+
+    existingRows.forEach(function(row) {
+      ownerByHash[row.geohash] = row
+    })
+  }
+
+  var hashCenterCache = Object.create(null)
+  var shadowed = 0
+
+  candidates.forEach(function(candidate) {
+    var existing = ownerByHash[candidate.hash]
+    if (!existing || batchPlaceIds[String(existing.id)]) return
+    if (rowsByHash[candidate.hash] !== undefined) return
+
+    var incumbent = cellCandidateFromCompactRow(existing)
+    if (comparePlacesForHash(candidate.place, incumbent, candidate.hash, hashCenterCache, true) < 0) {
+      shadowed += 1
+    }
+  })
+
+  return shadowed
 }
 
 function dbExec(db, sql) {
@@ -2290,6 +2392,7 @@ async function main() {
   var compactBuild = options.indexMode === 'compact' ? buildCompactLookupRows(finalPlaces, options) : null
   var compactLookupRows = compactBuild ? compactBuild.rows : []
   var lookupRowsDeferred = 0
+  var lookupHomeCellsShadowed = 0
 
   var databasePath = path.resolve(options.database)
   var db = new sqlite3.Database(databasePath)
@@ -2306,6 +2409,7 @@ async function main() {
       var resolved = await resolveExistingCellConflicts(db, compactBuild.rows, compactBuild.placeById, batchPlaceIds, options.homeCellPriority)
       compactLookupRows = resolved.rows
       lookupRowsDeferred = resolved.skipped
+      lookupHomeCellsShadowed = resolved.shadowedHomeCells || 0
     }
 
     await writePlaces(db, finalPlaces, options, compactLookupRows)
@@ -2331,6 +2435,7 @@ async function main() {
       console.log('Geohash lookup rows: ' + compactLookupRows.length)
       if (!options.replace) {
         console.log('Lookup rows deferring to better existing matches: ' + lookupRowsDeferred)
+        console.log('Home cells shadowed by a finer existing row: ' + lookupHomeCellsShadowed)
       }
     } else {
       console.log('Geohash cover rows: ' + coverCount)

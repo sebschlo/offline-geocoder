@@ -10,6 +10,12 @@
   ch/at/nl/cz have a centroid outside their own polygon. Older databases are
   upgraded in place; `NULL` keeps the pre-upgrade behaviour and readers ignore
   the column.
+- Report `Home cells shadowed by a finer existing row` on `--append` builds. The
+  conflict resolver compares exact hashes, so it cannot see the case where an
+  appended place is centred in a cell an earlier batch already owns at a finer
+  precision while this batch answers for that point only through a coarser
+  cell. Reconciling stored owners across nested cells is not done, because the
+  state does not occur in the data; the counter keeps that claim falsifiable.
 - Give every place the geohash cell that contains its own centroid, ahead of
   the population tie-break, so a border town no longer loses its own centre to
   the larger city across the border (for example Calexico resolving to

@@ -469,6 +469,78 @@ describe('boundary builder home cell ownership', () => {
     });
   });
 
+  it('reports a home cell shadowed by a finer row from an earlier batch', async () => {
+    await withTempDir(async (dir) => {
+      // The one cross-batch shape the exact-hash conflict resolver cannot see:
+      // the horseshoe owns the fine cell holding Bigtown's centre, and Bigtown
+      // answers for that point only through the coarse cell it fully covers,
+      // so no hash collides and longest-prefix keeps the horseshoe. The
+      // builder does not reconcile this - it counts it, so that the claim that
+      // real boundaries never produce it stays falsifiable.
+      const horseshoe = {
+        type: 'Feature',
+        id: 9101,
+        properties: {
+          name: 'Horseshoe',
+          placetype: 'locality',
+          country_id: 'US',
+          admin1_id: 1,
+          is_current: 1,
+          population: 500000
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[
+            [0.00, 0.00], [0.40, 0.00], [0.40, 0.20], [0.21, 0.20],
+            [0.21, 0.06], [0.19, 0.06], [0.19, 0.20], [0.00, 0.20], [0.00, 0.00]
+          ]]
+        }
+      };
+      // Swallows the whole precision-4 cell, and is centred inside the
+      // precision-5 cell the horseshoe already owns.
+      const bigtown = place({
+        id: 9102,
+        name: 'Bigtown',
+        placetype: 'locality',
+        countryId: 'MX',
+        population: 100000,
+        minLon: -0.05, minLat: -0.05, maxLon: 0.40, maxLat: 0.22,
+        centroid: [0.10, 0.20]
+      });
+
+      const dbPath = path.join(dir, 'shadowed.sqlite');
+      expect(runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'horseshoe.geojson', [horseshoe])
+      ].concat(commonFlags)).status).toEqual(0);
+
+      const appended = runBuilder([
+        '--database', dbPath,
+        '--input', writeFixture(dir, 'bigtown.geojson', [bigtown]),
+        '--append'
+      ].concat(commonFlags));
+      expect(appended.status).toEqual(0);
+
+      expect(appended.stdout).toContain('Home cells shadowed by a finer existing row: 1');
+
+      // And an ordinary append, where the two places contest the same hash,
+      // leaves the counter at zero - the exact-hash resolver handles that one.
+      const plainDb = path.join(dir, 'plain.sqlite');
+      expect(runBuilder([
+        '--database', plainDb,
+        '--input', writeFixture(dir, 'big.geojson', [place(BIGVILLE)])
+      ].concat(commonFlags)).status).toEqual(0);
+
+      const plain = runBuilder([
+        '--database', plainDb,
+        '--input', writeFixture(dir, 'small.geojson', [place(SMALLTOWN)]),
+        '--append'
+      ].concat(commonFlags));
+      expect(plain.status).toEqual(0);
+      expect(plain.stdout).toContain('Home cells shadowed by a finer existing row: 0');
+    });
+  });
+
   it('resolves the home cell the same way in either append order', async () => {
     await withTempDir(async (dir) => {
       const bigInput = writeFixture(dir, 'big.geojson', [place(BIGVILLE)]);
