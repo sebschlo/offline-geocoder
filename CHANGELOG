@@ -15,6 +15,21 @@
   the finer cells over that same point when a neighbour emits them, so the rule
   holds for the longest-prefix lookup the runtime actually performs. Placetype
   ranking still decides first, and no cell is added to the index.
+- Stop the dominant-city rollup suppressing a place whose placetype it does not
+  outrank. A county could absorb the cell holding a town's own centre, which is
+  a downgrade the cell comparator would never make - and because the rollup runs
+  per batch, it left that cell undefended in an `--append` build, so the next
+  country written took it and the town's centre resolved across the border
+  (Douglas AZ reading as Agua Prieta; Mittelberg and Riezlern, the Austrian
+  Kleinwalsertal, reading as Oberstdorf). Rollups between localities, which are
+  what make a metro read as one city, are unchanged.
+- Judge compact-index redundancy against the nearest kept ancestor cell instead
+  of any matching prefix. A row was dropped whenever some coarser cell named the
+  same place, even when a different place owned the cell in between, and the
+  lookup then answered with that other place.
+- Reconcile nested home cells from a snapshot of cell ownership, so a place that
+  loses its own cell to a coarser claimant still carries its claim to the cells
+  below it. The pass no longer depends on the order places are read.
 - Fix `--append` builds handing contested geohash cells to whichever batch ran
   last. Cells that already belong to a better-ranked place (by placetype, then
   population, then centroid distance) now keep their existing owner, so border

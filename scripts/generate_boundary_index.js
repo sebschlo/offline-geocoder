@@ -1144,33 +1144,40 @@ function reconcileNestedHomeCells(bestByHash, placeById, opts) {
     return 0
   }
 
+  // Collect every claim before applying any of it.  A claimant can lose its
+  // own cell to a coarser claimant partway through the pass, and reading the
+  // owner map as it mutates would then drop the displaced place's claim on the
+  // cells below - which made the result depend on the order places were read.
+  // Each cell is still settled by a running maximum under the comparator, so
+  // applying the claims in any order gives the same map.
   var hashes = Object.keys(bestByHash)
   var deepest = 0
-  for (var lengthIndex = 0; lengthIndex < hashes.length; lengthIndex++) {
-    if (hashes[lengthIndex].length > deepest) {
-      deepest = hashes[lengthIndex].length
+  var claims = []
+
+  for (var i = 0; i < hashes.length; i++) {
+    var hash = hashes[i]
+    if (hash.length > deepest) {
+      deepest = hash.length
     }
+
+    var place = placeById[String(bestByHash[hash])]
+    if (!place || !ownsHomeCell(place, hash)) {
+      continue
+    }
+
+    claims.push({ place: place, precision: hash.length })
   }
 
   var hashCenterCache = Object.create(null)
   var reassigned = 0
 
-  for (var i = 0; i < hashes.length; i++) {
-    var hash = hashes[i]
-    var owner = bestByHash[hash]
-    if (owner === undefined) {
-      continue
-    }
+  for (var claimIndex = 0; claimIndex < claims.length; claimIndex++) {
+    var claimant = claims[claimIndex].place
 
-    var place = placeById[String(owner)]
-    if (!place || !ownsHomeCell(place, hash)) {
-      continue
-    }
-
-    for (var length = hash.length + 1; length <= deepest; length++) {
-      var finerHash = geohash.encode(place.centroidLat, place.centroidLon, length)
+    for (var length = claims[claimIndex].precision + 1; length <= deepest; length++) {
+      var finerHash = geohash.encode(claimant.centroidLat, claimant.centroidLon, length)
       var incumbentId = bestByHash[finerHash]
-      if (incumbentId === undefined || Number(incumbentId) === Number(place.id)) {
+      if (incumbentId === undefined || Number(incumbentId) === Number(claimant.id)) {
         continue
       }
 
@@ -1182,8 +1189,8 @@ function reconcileNestedHomeCells(bestByHash, placeById, opts) {
       // Reassign only when the same comparator that governs a single cell
       // would hand this one over, so placetype rank still outranks the home
       // cell and a cell shared by two centroids keeps its population ordering.
-      if (comparePlacesForHash(place, incumbent, finerHash, hashCenterCache, true) < 0) {
-        bestByHash[finerHash] = place.id
+      if (comparePlacesForHash(claimant, incumbent, finerHash, hashCenterCache, true) < 0) {
+        bestByHash[finerHash] = claimant.id
         reassigned += 1
       }
     }
@@ -1336,16 +1343,27 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
         continue
       }
 
+      var dominantPlace = placeById[String(promoted.localityId)]
       var protectedHomeCell = protectsForeignHomeCell(
         descendantPlace,
         descendantHash,
-        placeById[String(promoted.localityId)],
+        dominantPlace,
         opts
       )
+
+      // The rollup makes a metro read as one city, so it may only fold a place
+      // into a better- or equally-ranked label.  A county absorbing a locality
+      // is a downgrade the comparator would never make, and it also strips the
+      // town of the cell holding its own centre - which in an append build is
+      // then taken by whichever neighbouring country was written first,
+      // because nothing is left to defend it.
+      var dominantOutranks = dominantPlace &&
+        placetypeRank(dominantPlace.placetype) <= placetypeRank(descendantPlace.placetype)
 
       if (promoted.suppressMinorLocalities &&
         isCityPlacetypeCode(descendantPlace.placetypeCode) &&
         !isMajorLocality(descendantPlace, opts) &&
+        dominantOutranks &&
         !protectedHomeCell) {
         delete bestByHash[descendantHash]
       }
@@ -1407,21 +1425,34 @@ function buildCompactLookupRows(places, opts) {
 
   var compact = []
   var selectedByHash = Object.create(null)
+  var shadowedRowsKept = 0
 
   for (var index = 0; index < rows.length; index++) {
     var row = rows[index]
-    var redundant = false
 
-    for (var precision = 1; precision < row.geohash.length; precision++) {
-      var prefix = row.geohash.slice(0, precision)
-      if (selectedByHash[prefix] === row.placeId) {
-        redundant = true
+    // Only the *nearest* kept ancestor decides whether a row can be dropped.
+    // The runtime answers with the longest matching prefix, so a row is
+    // redundant only when the cell that would answer in its place already
+    // names the same place.  Matching any ancestor drops rows that a nearer,
+    // different owner shadows, and the lookup then returns that other place.
+    var nearestAncestor
+    for (var precision = row.geohash.length - 1; precision >= 1; precision--) {
+      var ancestor = selectedByHash[row.geohash.slice(0, precision)]
+      if (ancestor !== undefined) {
+        nearestAncestor = ancestor
         break
       }
     }
 
-    if (redundant) {
+    if (nearestAncestor === row.placeId) {
       continue
+    }
+
+    for (var farther = row.geohash.length - 1; farther >= 1; farther--) {
+      if (selectedByHash[row.geohash.slice(0, farther)] === row.placeId) {
+        shadowedRowsKept += 1
+        break
+      }
     }
 
     selectedByHash[row.geohash] = row.placeId
@@ -1432,7 +1463,8 @@ function buildCompactLookupRows(places, opts) {
     rows: compact,
     placeById: placeById,
     nestedHomeCellFixes: nestedHomeCellFixes,
-    refusedPromotions: refusedPromotions
+    refusedPromotions: refusedPromotions,
+    shadowedRowsKept: shadowedRowsKept
   }
 }
 
@@ -2093,6 +2125,7 @@ async function main() {
     if (compactBuild) {
       console.log('Home cells kept from a nested foreign cell: ' + (compactBuild.nestedHomeCellFixes || 0))
       console.log('Parent promotions refused over a foreign home cell: ' + (compactBuild.refusedPromotions || 0))
+      console.log('Rows kept from a nearer shadowing owner: ' + (compactBuild.shadowedRowsKept || 0))
     }
     console.log('Placetype precision caps: locality=' + options.localityMaxPrecision + ', localadmin=' + options.localadminMaxPrecision + ', county=' + options.countyMaxPrecision + ', region=' + options.regionMaxPrecision)
     if (Number.isFinite(options.regionSparseMaxPrecision) && Number.isFinite(options.regionSparseMinAreaKm2)) {

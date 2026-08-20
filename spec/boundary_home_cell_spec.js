@@ -205,6 +205,47 @@ describe('boundary builder home cell ownership', () => {
     });
   });
 
+  it('will not let a county rollup swallow a locality it outranks', async () => {
+    await withTempDir(async (dir) => {
+      // A county dominates its parent cell on population and would suppress
+      // every minor place under it - including the locality whose centre is
+      // there. That is a label downgrade the comparator would never make,
+      // and in an append build it leaves the cell undefended: the next
+      // country written takes it, and the town's centre crosses the border.
+      const county = {
+        id: 6001,
+        name: 'Border County',
+        placetype: 'county',
+        countryId: 'US',
+        population: 400000,
+        minLon: 0.088, minLat: -0.05, maxLon: 0.60, maxLat: 0.22,
+        centroid: [0.07, 0.29]
+      };
+      const town = {
+        id: 6002,
+        name: 'County Town',
+        placetype: 'locality',
+        countryId: 'US',
+        population: 20000,
+        minLon: 0.045, minLat: 0.002, maxLon: 0.086, maxLat: 0.085,
+        centroid: [0.04, 0.06]
+      };
+
+      const input = writeFixture(dir, 'county-rollup.geojson', [place(county), place(town)]);
+      const dbPath = path.join(dir, 'county-rollup.sqlite');
+
+      expect(runBuilder([
+        '--database', dbPath, '--input', input, '--include-county', 'true'
+      ].concat(commonFlags)).status).toEqual(0);
+
+      const owner = await lookupOwner(dbPath, geohash.encode(town.centroid[0], town.centroid[1], 5));
+      expect(owner.id).toEqual(town.id);
+
+      // The county still holds the cells it covers on its own.
+      expect((await lookupOwner(dbPath, geohash.encode(0.06, 0.285, 5))).id).toEqual(county.id);
+    });
+  });
+
   it('resolves the home cell the same way in either append order', async () => {
     await withTempDir(async (dir) => {
       const bigInput = writeFixture(dir, 'big.geojson', [place(BIGVILLE)]);
@@ -340,6 +381,106 @@ describe('boundary builder home cell ownership', () => {
         ].concat(commonFlags)).status).toEqual(0);
 
         expect((await lookupOwner(dbPath, geohash.encode(0.11, 0.11, 5))).id).toEqual(METROPOLIS.id);
+      });
+    });
+  });
+
+  // Three precisions are needed to see these two: a claim has to be able to
+  // lose one level and still matter at the next, which cannot happen when the
+  // index only holds two. Base precision 3 gives the cells s00 > s000 > s0000.
+  describe('with three levels of nesting', () => {
+    const deepFlags = ['--base-precision', '3', '--max-precision', '5', '--index-mode', 'compact'];
+
+    // Covers all of s00, so its cover terminates at precision 3.
+    const PROVINCE_TOWN = {
+      id: 5001,
+      name: 'Province Town',
+      placetype: 'locality',
+      countryId: 'US',
+      population: 100000,
+      minLon: -0.05, minLat: -0.05, maxLon: 1.45, maxLat: 1.45,
+      centroid: [0.02, 0.02]
+    };
+
+    // Covers all of s000, so its cover terminates at precision 4, one level
+    // inside Province Town. Its centre is in s000 but not in s0000.
+    const INNER_CITY = {
+      id: 5002,
+      name: 'Inner City',
+      placetype: 'locality',
+      countryId: 'MX',
+      population: 500000,
+      minLon: -0.02, minLat: -0.02, maxLon: 0.37, maxLat: 0.19,
+      centroid: [0.11, 0.11]
+    };
+
+    // Clips the corner of s0000 from outside s00, so it emits that one cell at
+    // precision 5 and is centred nowhere near it.
+    const CORNER_TOWN = {
+      id: 5003,
+      name: 'Corner Town',
+      placetype: 'locality',
+      countryId: 'MX',
+      population: 200000,
+      minLon: -0.30, minLat: -0.30, maxLon: 0.02, maxLat: 0.02,
+      centroid: [-0.15, -0.15]
+    };
+
+    it('keeps a reclaimed cell that a nearer owner shadows', async () => {
+      await withTempDir(async (dir) => {
+        // Province Town owns s00 and is centred in it, so it claims down the
+        // chain: it loses s000 to the bigger Inner City on population but wins
+        // s0000 from Corner Town, which is not centred there. That leaves
+        // s00=Province Town, s000=Inner City, s0000=Province Town - and the
+        // s0000 row only survives compaction if redundancy is judged against
+        // the nearest kept ancestor rather than any matching prefix.
+        const input = writeFixture(dir, 'shadow.geojson', [
+          place(PROVINCE_TOWN), place(INNER_CITY), place(CORNER_TOWN)
+        ]);
+        const dbPath = path.join(dir, 'shadow.sqlite');
+
+        expect(runBuilder(['--database', dbPath, '--input', input].concat(deepFlags)).status).toEqual(0);
+
+        const owner = await lookupOwner(dbPath, geohash.encode(0.02, 0.02, 5));
+        expect(owner.id).toEqual(PROVINCE_TOWN.id);
+        expect(owner.country_id).toEqual('US');
+
+        // Inner City still holds the level in between.
+        expect((await lookupOwner(dbPath, geohash.encode(0.11, 0.11, 5))).id).toEqual(INNER_CITY.id);
+      });
+    });
+
+    it('propagates a displaced place\'s claim in either read order', async () => {
+      await withTempDir(async (dir) => {
+        // Province Town takes s000 from Inner City here (it is the more
+        // populous of the two), so Inner City's own claim on the cell holding
+        // its centre has to survive losing the cell it was claiming from.
+        const outer = Object.assign({}, PROVINCE_TOWN, { population: 900000 });
+        const inner = Object.assign({}, INNER_CITY, { population: 300000 });
+        const neighbour = {
+          id: 5004,
+          name: 'Neighbour City',
+          placetype: 'locality',
+          countryId: 'MX',
+          population: 690000,
+          minLon: 0.088, minLat: -0.05, maxLon: 0.60, maxLat: 0.22,
+          centroid: [0.07, 0.29]
+        };
+
+        const orders = {
+          'outer-first': [place(outer), place(inner), place(neighbour)],
+          'inner-first': [place(neighbour), place(inner), place(outer)]
+        };
+
+        for (const [label, features] of Object.entries(orders)) {
+          const input = writeFixture(dir, `order-${label}.geojson`, features);
+          const dbPath = path.join(dir, `order-${label}.sqlite`);
+
+          expect(runBuilder(['--database', dbPath, '--input', input].concat(deepFlags)).status).toEqual(0);
+
+          const owner = await lookupOwner(dbPath, geohash.encode(inner.centroid[0], inner.centroid[1], 5));
+          expect(`${label}:${owner.id}`).toEqual(`${label}:${inner.id}`);
+        }
       });
     });
   });

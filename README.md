@@ -239,6 +239,7 @@ Builder notes:
 - Dominant-city rollup keeps broad city labels sticky in mixed city/suburb cells unless there is competing major-city pressure:
   - `--dominant-locality-population` (default `100000`)
   - `--dominant-locality-ratio` (default `3`)
+  - A rollup only folds a place into a better- or equally-ranked label, so a county never absorbs a locality: that would be a downgrade, and it would also strip the town of the cell holding its own centre
 - Parent-cell takeover guard:
   - `--parent-locality-min-share` (default `0.5`) requires locality ownership of at least that child-cell share before replacing a parent cell label
 - Excludes neighbourhood-like placetypes from default reverse output
