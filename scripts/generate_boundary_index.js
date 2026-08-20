@@ -1093,7 +1093,17 @@ function cellCandidateFromCompactRow(row) {
 
   var latitude = Number(row.latitude)
   var longitude = Number(row.longitude)
-  var homeGeohash = Number.isFinite(latitude) && Number.isFinite(longitude)
+
+  // `centroid_inside` records whether the stored coordinates were actually
+  // inside the place's own geometry.  A row written before the column existed
+  // leaves it NULL, which keeps the pre-upgrade behaviour of trusting the
+  // coordinates; an explicit 0 means the point is a bbox fallback outside the
+  // shape and must not claim a home cell.
+  var centroidInside = row.centroid_inside === null || row.centroid_inside === undefined
+    ? true
+    : Number(row.centroid_inside) === 1
+
+  var homeGeohash = centroidInside && Number.isFinite(latitude) && Number.isFinite(longitude)
     ? geohash.encode(latitude, longitude, HOME_CELL_PRECISION)
     : null
 
@@ -1683,7 +1693,8 @@ async function resolveExistingCellConflicts(db, rows, placeById, batchPlaceIds, 
         p.population AS population,
         p.area AS area,
         p.latitude AS latitude,
-        p.longitude AS longitude
+        p.longitude AS longitude,
+        p.centroid_inside AS centroid_inside
       FROM compact_geohash_lookup l
       JOIN compact_places p ON p.id = l.place_id
       WHERE l.geohash IN (${placeholders})
@@ -1790,6 +1801,9 @@ async function ensureCompactPlacesColumns(db) {
   if (!names.area) {
     await dbExec(db, 'ALTER TABLE compact_places ADD COLUMN area REAL')
   }
+  if (!names.centroid_inside) {
+    await dbExec(db, 'ALTER TABLE compact_places ADD COLUMN centroid_inside INTEGER')
+  }
 }
 
 async function ensureBoundarySchema(db, opts) {
@@ -1817,7 +1831,8 @@ async function ensureBoundarySchema(db, opts) {
         latitude REAL NOT NULL,
         longitude REAL NOT NULL,
         population REAL,
-        area REAL
+        area REAL,
+        centroid_inside INTEGER
       );
 
       CREATE TABLE IF NOT EXISTS compact_geohash_lookup(
@@ -2076,8 +2091,8 @@ async function writePlaces(db, places, opts, compactLookupRows) {
       placeStmt = db.prepare(`
         INSERT OR REPLACE INTO compact_places(
           id, name, country_id, admin1_id, placetype_code,
-          latitude, longitude, population, area
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          latitude, longitude, population, area, centroid_inside
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
 
       compactStmt = db.prepare(`
@@ -2111,7 +2126,8 @@ async function writePlaces(db, places, opts, compactLookupRows) {
             place.centroidLat,
             place.centroidLon,
             place.population,
-            place.area
+            place.area,
+            place.homeGeohash ? 1 : 0
           ])
         } else {
           await stmtRun(placeStmt, [

@@ -1,5 +1,15 @@
 ### Unreleased
 
+- Persist whether a place's stored centroid lies inside its own geometry
+  (nullable `compact_places.centroid_inside`) and honour it when an `--append`
+  batch reconstructs an incumbent. Normalization already refuses a home-cell
+  claim to a bounding-box fallback that falls outside a concave, holed, or
+  multipart shape, but that decision lived only in memory, so every later
+  append batch handed the claim back and a challenger genuinely centred in a
+  contested cell could lose it. Affects real data: 52 of 3,354 places in
+  ch/at/nl/cz have a centroid outside their own polygon. Older databases are
+  upgraded in place; `NULL` keeps the pre-upgrade behaviour and readers ignore
+  the column.
 - Give every place the geohash cell that contains its own centroid, ahead of
   the population tie-break, so a border town no longer loses its own centre to
   the larger city across the border (for example Calexico resolving to

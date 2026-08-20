@@ -166,6 +166,15 @@ const FROZEN_COLUMNS = {
       'population REAL', 'area REAL'
     ],
     compact_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
+  },
+  compactV2CentroidInside: {
+    compact_places: [
+      'id INTEGER PK', 'name TEXT NOT NULL', 'country_id TEXT NOT NULL',
+      'admin1_id INTEGER', 'placetype_code INTEGER NOT NULL',
+      'latitude REAL NOT NULL', 'longitude REAL NOT NULL',
+      'population REAL', 'area REAL', 'centroid_inside INTEGER'
+    ],
+    compact_geohash_lookup: ['geohash TEXT PK', 'place_id INTEGER NOT NULL']
   }
 };
 
@@ -219,7 +228,8 @@ const FROZEN_OBJECTS = {
   ],
   compactLegacy: ['admin1', 'countries', 'place_geohash_lookup', 'places'],
   compactV2: ['compact_geohash_lookup', 'compact_places'],
-  compactV2Population: ['compact_geohash_lookup', 'compact_places']
+  compactV2Population: ['compact_geohash_lookup', 'compact_places'],
+  compactV2CentroidInside: ['compact_geohash_lookup', 'compact_places']
 };
 
 function exec(db, sql) {
@@ -1093,6 +1103,82 @@ describe('reader compatibility: compact v2 schema generation with population/are
   // columns (valued or NULL) must not change any reader-visible result.
   expectCompactV2Results(() => geocoder);
   expectFrozenSchema(() => fixture.databasePath, 'compactV2Population');
+});
+// Generation 5: compact v2 plus the nullable `centroid_inside` flag, added
+// so an --append batch can tell a stored centroid that lies inside its own
+// geometry from a bounding-box fallback that does not. Older databases are
+// upgraded in place with ALTER TABLE ... ADD COLUMN.
+//
+// Same tables as generation 4 plus one nullable INTEGER the reader does not
+// select. The fixture stores 1 on one locality, 0 on another and NULL on the
+// region — the three states a database can carry, including the NULL that
+// every pre-upgrade row keeps — and the expected results are identical to
+// generation 3.
+describe('reader compatibility: compact v2 schema generation with centroid_inside', () => {
+  let fixture;
+  let geocoder;
+
+  const schema = `
+    CREATE TABLE compact_places(
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      country_id TEXT NOT NULL,
+      admin1_id INTEGER,
+      placetype_code INTEGER NOT NULL,
+      latitude REAL NOT NULL,
+      longitude REAL NOT NULL,
+      population REAL,
+      area REAL,
+      centroid_inside INTEGER
+    );
+
+    CREATE TABLE compact_geohash_lookup(
+      geohash TEXT PRIMARY KEY,
+      place_id INTEGER NOT NULL,
+      FOREIGN KEY (place_id) REFERENCES compact_places(id)
+    );
+  `;
+
+  const extrasById = {
+    81: { population: 125000, area: 42.5, centroidInside: 1 },
+    82: { population: null, area: null, centroidInside: 0 }
+  };
+
+  beforeAll(async () => {
+    fixture = createTempDatabase('compact-v2-centroid-inside');
+    const db = fixture.db;
+
+    await exec(db, schema);
+
+    const rows = [COMPACT_V2_ROWS.region].concat(COMPACT_V2_ROWS.localities);
+    for (const row of rows) {
+      const extras = extrasById[row.id] || { population: null, area: null, centroidInside: null };
+      await run(db, `
+        INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude, population, area, centroid_inside)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        row.id, row.name, row.countryId, row.admin1Id || null, row.placetypeCode,
+        row.lat, row.lon, extras.population, extras.area, extras.centroidInside
+      ]);
+    }
+
+    for (const lookup of COMPACT_V2_ROWS.lookups) {
+      await run(db, 'INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES (?, ?)',
+        [lookup.geohash, lookup.placeId]);
+    }
+
+    await close(db);
+    geocoder = boundaryGeocoder(fixture.databasePath);
+  });
+
+  afterAll(() => {
+    fixture.cleanup();
+  });
+
+  // Identical expectations to the shipped compact v2 generation: the new
+  // column, whatever its value, must not change any reader-visible result.
+  expectCompactV2Results(() => geocoder);
+  expectFrozenSchema(() => fixture.databasePath, 'compactV2CentroidInside');
 });
 
 // The opposite direction of the contract: an older reader opening a NEWLY
