@@ -56,6 +56,9 @@ function parsePlacetypeList(value, defaultValue) {
     if (!Object.prototype.hasOwnProperty.call(PLACETYPE_CODES, name)) {
       throw new Error('Unknown placetype in --dominant-city-placetypes: ' + parts[i].trim())
     }
+    if (!isCityPlacetypeCode(PLACETYPE_CODES[name])) {
+      throw new Error('--dominant-city-placetypes only accepts city-like placetypes: ' + parts[i].trim())
+    }
     if (placetypes.indexOf(name) === -1) {
       placetypes.push(name)
     }

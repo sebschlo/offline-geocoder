@@ -882,4 +882,24 @@ describe('boundary builder', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+  it('rejects a dominant-city placetype that cannot own a city label', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-builder-'));
+    try {
+      const inputPath = path.join(dir, 'dominant-city-placetypes.geojson');
+      const dbPath = path.join(dir, 'dominant-city-placetypes.sqlite');
+
+      const result = spawnSync('node', [
+        path.join(__dirname, '..', 'scripts', 'generate_boundary_index.js'),
+        '--database', dbPath,
+        '--input', writeDominantCountyFixture(inputPath),
+        '--index-mode', 'compact',
+        '--dominant-city-placetypes', 'locality,region'
+      ], { encoding: 'utf8' });
+
+      expect(result.status).not.toEqual(0);
+      expect(result.stderr).toContain('--dominant-city-placetypes only accepts city-like placetypes');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
