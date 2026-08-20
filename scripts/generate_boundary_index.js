@@ -22,6 +22,11 @@ const PLACETYPE_BY_CODE = {
   3: 'county'
 }
 
+// Placetypes allowed to play the "dominant city" role in the parent-cell
+// rollup. A county is a city-like placetype for ownership purposes, but naming
+// a metro after its county reads as a mistake, so counties are out by default.
+const DEFAULT_DOMINANT_CITY_PLACETYPES = ['locality', 'localadmin']
+
 function parseBool(value, defaultValue) {
   if (value === undefined || value === null || value === '') {
     return defaultValue
@@ -36,6 +41,34 @@ function parseBool(value, defaultValue) {
   }
 
   return defaultValue
+}
+
+function parsePlacetypeList(value, defaultValue) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return defaultValue
+  }
+
+  var parts = String(value).split(',')
+  var placetypes = []
+  for (var i = 0; i < parts.length; i++) {
+    var name = parts[i].toLowerCase().trim()
+    if (!name) continue
+    if (!Object.prototype.hasOwnProperty.call(PLACETYPE_CODES, name)) {
+      throw new Error('Unknown placetype in --dominant-city-placetypes: ' + parts[i].trim())
+    }
+    if (!isCityPlacetypeCode(PLACETYPE_CODES[name])) {
+      throw new Error('--dominant-city-placetypes only accepts city-like placetypes: ' + parts[i].trim())
+    }
+    if (placetypes.indexOf(name) === -1) {
+      placetypes.push(name)
+    }
+  }
+
+  if (!placetypes.length) {
+    throw new Error('--dominant-city-placetypes requires at least one placetype')
+  }
+
+  return placetypes
 }
 
 function parseArgs(argv) {
@@ -60,13 +93,16 @@ function parseArgs(argv) {
     localityMaxPrecision: null,
     localadminMaxPrecision: null,
     countyMaxPrecision: null,
+    countyDenseMaxPrecision: null,
+    countyDenseMaxAreaKm2: null,
     regionMaxPrecision: null,
     regionSparseMaxPrecision: null,
     regionSparseMinAreaKm2: null,
     promoteLocalityOverRegion: true,
     dominantLocalityPopulation: 100000,
     dominantLocalityRatio: 3,
-    parentLocalityMinShare: 0.5
+    parentLocalityMinShare: 0.5,
+    dominantCityPlacetypes: DEFAULT_DOMINANT_CITY_PLACETYPES.slice()
   }
 
   for (var i = 0; i < argv.length; i++) {
@@ -117,6 +153,12 @@ function parseArgs(argv) {
     } else if (arg === '--county-max-precision') {
       var countyMax = Number(argv[++i])
       opts.countyMaxPrecision = Number.isFinite(countyMax) ? Math.trunc(countyMax) : null
+    } else if (arg === '--county-dense-max-precision') {
+      var countyDenseMax = Number(argv[++i])
+      opts.countyDenseMaxPrecision = Number.isFinite(countyDenseMax) ? Math.trunc(countyDenseMax) : null
+    } else if (arg === '--county-dense-max-area-km2') {
+      var denseAreaKm2 = Number(argv[++i])
+      opts.countyDenseMaxAreaKm2 = Number.isFinite(denseAreaKm2) && denseAreaKm2 > 0 ? denseAreaKm2 : null
     } else if (arg === '--region-max-precision') {
       var regionMax = Number(argv[++i])
       opts.regionMaxPrecision = Number.isFinite(regionMax) ? Math.trunc(regionMax) : null
@@ -134,6 +176,8 @@ function parseArgs(argv) {
     } else if (arg === '--dominant-locality-ratio') {
       var dominantRatio = Number(argv[++i])
       opts.dominantLocalityRatio = Number.isFinite(dominantRatio) ? dominantRatio : opts.dominantLocalityRatio
+    } else if (arg === '--dominant-city-placetypes') {
+      opts.dominantCityPlacetypes = parsePlacetypeList(argv[++i], opts.dominantCityPlacetypes)
     } else if (arg === '--parent-locality-min-share') {
       var minShare = Number(argv[++i])
       opts.parentLocalityMinShare = Number.isFinite(minShare) ? minShare : opts.parentLocalityMinShare
@@ -175,6 +219,10 @@ function usage() {
     '  --locality-max-precision       Max precision override for locality placetype',
     '  --localadmin-max-precision     Max precision override for localadmin placetype',
     '  --county-max-precision         Max precision override for county placetype',
+    '  --county-dense-max-precision   Optional precision for very small county polygons (for example 5).',
+    '                                 When set together with the area threshold and no explicit',
+    '                                 --county-max-precision, the county cap defaults to one below this',
+    '  --county-dense-max-area-km2    Bbox area threshold to apply dense county precision',
     '  --region-max-precision         Max precision override for region placetype',
     '  --region-sparse-max-precision  Optional precision for very large region polygons (for example 3)',
     '  --region-sparse-min-area-km2   Area threshold to apply sparse region precision',
@@ -182,6 +230,7 @@ function usage() {
     '  --dominant-locality-population Population threshold that marks locality as major for dominant-city rollups (default: 100000)',
     '  --dominant-locality-ratio      Required dominant-vs-next population ratio for locality rollups (default: 3)',
     '  --parent-locality-min-share    Minimum child-cell share (0..1) required to let a locality take over a parent cell (default: 0.5)',
+    '  --dominant-city-placetypes     Comma-separated placetypes eligible to take over a parent cell, by competition or as its only city-like owner (default: ' + DEFAULT_DOMINANT_CITY_PLACETYPES.join(',') + ')',
     '  --append                       Keep existing boundary rows and append/replace by place id',
     '  --replace                      Clear boundary rows first (default)',
     '  --help, -h                     Show this help message'
@@ -862,7 +911,16 @@ function placetypeCode(placetype) {
 function resolveMaxPrecisionForPlacetype(opts, placetype, bbox) {
   if (placetype === 'locality') return opts.localityMaxPrecision
   if (placetype === 'localadmin') return opts.localadminMaxPrecision
-  if (placetype === 'county') return opts.countyMaxPrecision
+  if (placetype === 'county') {
+    var countyPrecision = opts.countyMaxPrecision
+    if (Number.isFinite(opts.countyDenseMaxPrecision) && Number.isFinite(opts.countyDenseMaxAreaKm2)) {
+      var countyAreaKm2 = bboxAreaKm2(bbox)
+      if (countyAreaKm2 <= opts.countyDenseMaxAreaKm2) {
+        countyPrecision = Math.max(countyPrecision, opts.countyDenseMaxPrecision)
+      }
+    }
+    return countyPrecision
+  }
   if (placetype === 'region') {
     var regionPrecision = opts.regionMaxPrecision
     if (Number.isFinite(opts.regionSparseMaxPrecision) && Number.isFinite(opts.regionSparseMinAreaKm2)) {
@@ -923,6 +981,28 @@ function comparePlacesForHash(a, b, hash, hashCenterCache) {
 
 function isCityPlacetypeCode(code) {
   return code === PLACETYPE_CODES.locality || code === PLACETYPE_CODES.localadmin || code === PLACETYPE_CODES.county
+}
+
+// Owning a cell and standing in for a whole metro are different jobs. Every
+// city-like placetype (county included) can win a cell through the comparator;
+// only these placetypes may become the dominant city a parent cell is named
+// after, so a metro never ends up labelled with its county's name.
+function isDominantCityPlacetypeCode(code, opts) {
+  if (!isCityPlacetypeCode(code)) {
+    return false
+  }
+
+  var names = opts && Array.isArray(opts.dominantCityPlacetypes) && opts.dominantCityPlacetypes.length
+    ? opts.dominantCityPlacetypes
+    : DEFAULT_DOMINANT_CITY_PLACETYPES
+
+  for (var i = 0; i < names.length; i++) {
+    if (PLACETYPE_CODES[names[i]] === code) {
+      return true
+    }
+  }
+
+  return false
 }
 
 // Rebuild a comparable place record from a stored compact_places row so that
@@ -990,6 +1070,7 @@ function selectDominantLocalityId(localityIds, placeById, opts) {
       var place = placeById[String(id)]
       return {
         id: Number(id),
+        placetypeCode: place ? place.placetypeCode : null,
         population: placePopulation(place)
       }
     })
@@ -1042,6 +1123,24 @@ function localityShareMeetsThreshold(localityId, group, opts) {
   }
 
   return localityShareInParent(localityId, group) >= threshold
+}
+
+// The single gate for taking over a parent cell, shared by both roll-up paths
+// -- the lone city-like owner and the winner of a dominant-city competition --
+// so that neither can drift away from the other. A candidate qualifies only if
+// its placetype may name a parent cell (counties may not, by default) and it
+// owns enough of the parent's child cells to stand in for the whole of it.
+// A candidate rejected here is not replaced by a runner-up: the runner-up lost
+// the cell competition, so promoting it would name the parent after a place
+// that owns less of it. The parent keeps its existing owner instead, and every
+// child keeps the cell it won.
+function localityMayTakeOverParent(localityId, group, placeById, opts) {
+  var place = placeById[String(localityId)]
+  if (!place || !isDominantCityPlacetypeCode(place.placetypeCode, opts)) {
+    return false
+  }
+
+  return localityShareMeetsThreshold(localityId, group, opts)
 }
 
 function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) {
@@ -1102,7 +1201,7 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
 
       if (localityIds.length === 1) {
         var localityId = Number(localityIds[0])
-        if (!localityShareMeetsThreshold(localityId, group, opts)) {
+        if (!localityMayTakeOverParent(localityId, group, placeById, opts)) {
           continue
         }
 
@@ -1127,7 +1226,7 @@ function promoteLocalityParentsByRegionCompetition(bestByHash, placeById, opts) 
         if (dominantLocalityId === null) {
           continue
         }
-        if (!localityShareMeetsThreshold(dominantLocalityId, group, opts)) {
+        if (!localityMayTakeOverParent(dominantLocalityId, group, placeById, opts)) {
           continue
         }
 
@@ -1812,6 +1911,26 @@ async function main() {
     throw new Error('--index-mode must be either compact or full')
   }
 
+  if (options.countyDenseMaxPrecision !== null) {
+    if (!Number.isFinite(options.countyDenseMaxPrecision) || options.countyDenseMaxPrecision < 1) {
+      options.countyDenseMaxPrecision = null
+    } else {
+      options.countyDenseMaxPrecision = Math.trunc(options.countyDenseMaxPrecision)
+      if (options.countyDenseMaxPrecision > options.maxPrecision) {
+        options.countyDenseMaxPrecision = options.maxPrecision
+      }
+    }
+  }
+  if (options.countyMaxPrecision === null &&
+    Number.isFinite(options.countyDenseMaxPrecision) &&
+    Number.isFinite(options.countyDenseMaxAreaKm2)) {
+    // The dense rule only differentiates when the regular county cap is
+    // coarser than the dense precision. Without an explicit
+    // --county-max-precision, default the cap to one below the (clamped)
+    // dense precision instead of the global max.
+    options.countyMaxPrecision = Math.max(options.basePrecision, options.countyDenseMaxPrecision - 1)
+  }
+
   options.localityMaxPrecision = clampPrecision(options.localityMaxPrecision, options.basePrecision, options.maxPrecision)
   options.localadminMaxPrecision = clampPrecision(options.localadminMaxPrecision, options.basePrecision, options.maxPrecision)
   options.countyMaxPrecision = clampPrecision(options.countyMaxPrecision, options.basePrecision, options.maxPrecision)
@@ -1823,6 +1942,9 @@ async function main() {
   }
   if (!Number.isFinite(options.dominantLocalityRatio) || options.dominantLocalityRatio < 1) {
     options.dominantLocalityRatio = 1
+  }
+  if (!Array.isArray(options.dominantCityPlacetypes) || !options.dominantCityPlacetypes.length) {
+    options.dominantCityPlacetypes = DEFAULT_DOMINANT_CITY_PLACETYPES.slice()
   }
   if (!Number.isFinite(options.parentLocalityMinShare)) {
     options.parentLocalityMinShare = 0.5
@@ -1842,7 +1964,6 @@ async function main() {
       }
     }
   }
-
   var files = collectInputFiles(options)
   if (!files.length) {
     throw new Error('No input files were found after filtering')
@@ -1919,8 +2040,11 @@ async function main() {
     if (Number.isFinite(options.regionSparseMaxPrecision) && Number.isFinite(options.regionSparseMinAreaKm2)) {
       console.log('Sparse region rule: area_km2>=' + options.regionSparseMinAreaKm2 + ' => max_precision=' + options.regionSparseMaxPrecision)
     }
+    if (Number.isFinite(options.countyDenseMaxPrecision) && Number.isFinite(options.countyDenseMaxAreaKm2)) {
+      console.log('Dense county rule: area_km2<=' + options.countyDenseMaxAreaKm2 + ' => max_precision=' + options.countyDenseMaxPrecision)
+    }
     if (options.dominantLocalityPopulation > 0) {
-      console.log('Dominant locality rollup: major_population>=' + options.dominantLocalityPopulation + ', ratio>=' + options.dominantLocalityRatio)
+      console.log('Dominant locality rollup: major_population>=' + options.dominantLocalityPopulation + ', ratio>=' + options.dominantLocalityRatio + ', placetypes=' + options.dominantCityPlacetypes.join(','))
     } else {
       console.log('Dominant locality rollup: disabled')
     }

@@ -16,7 +16,12 @@ set -euo pipefail
 #   WOF_MAX_PRECISION              Geohash max precision (default: 5)
 #   WOF_LOCALITY_MAX_PRECISION     Locality max precision override (default: WOF_MAX_PRECISION)
 #   WOF_LOCALADMIN_MAX_PRECISION   Localadmin max precision override (default: WOF_MAX_PRECISION)
-#   WOF_COUNTY_MAX_PRECISION       County max precision override (default: WOF_MAX_PRECISION)
+#   WOF_COUNTY_MAX_PRECISION       County max precision override. When unset, the node script
+#                                  picks the default: WOF_MAX_PRECISION, or one below the dense
+#                                  precision (clamped to WOF_MAX_PRECISION) when the dense
+#                                  county rule is enabled
+#   WOF_COUNTY_DENSE_MAX_PRECISION Dense small-county precision (default: empty = rule off)
+#   WOF_COUNTY_DENSE_MAX_AREA_KM2  Bbox area threshold to apply dense county precision (default: empty = rule off)
 #   WOF_REGION_MAX_PRECISION       Region max precision override (default: 4)
 #   WOF_REGION_SPARSE_MAX_PRECISION  Sparse large-region precision (default: 3)
 #   WOF_REGION_SPARSE_MIN_AREA_KM2 Area threshold for sparse region precision (default: 80000)
@@ -24,6 +29,7 @@ set -euo pipefail
 #   WOF_DOMINANT_LOCALITY_POPULATION Major-locality threshold for dominant-city rollup (default: 100000)
 #   WOF_DOMINANT_LOCALITY_RATIO      Dominant-vs-next locality population ratio (default: 3)
 #   WOF_PARENT_LOCALITY_MIN_SHARE    Minimum child-cell share (0..1) required for locality parent takeover (default: 0.5)
+#   WOF_DOMINANT_CITY_PLACETYPES     Placetypes eligible to take over a parent cell (default: locality,localadmin)
 #   WOF_INCLUDE_LOCALADMIN         Include localadmin placetypes (default: 0)
 #   WOF_INCLUDE_COUNTY             Include county placetypes (default: 1)
 #   WOF_INCLUDE_REGION             Include region placetypes (default: 1)
@@ -53,7 +59,13 @@ WOF_BASE_PRECISION="${WOF_BASE_PRECISION:-4}"
 WOF_MAX_PRECISION="${WOF_MAX_PRECISION:-5}"
 WOF_LOCALITY_MAX_PRECISION="${WOF_LOCALITY_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
 WOF_LOCALADMIN_MAX_PRECISION="${WOF_LOCALADMIN_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
-WOF_COUNTY_MAX_PRECISION="${WOF_COUNTY_MAX_PRECISION:-${WOF_MAX_PRECISION}}"
+# WOF_COUNTY_MAX_PRECISION deliberately has no shell-side default: when it is
+# unset the flag is omitted and the node script derives the county cap (the
+# global max precision, or one below the clamped dense precision when the
+# dense county rule is enabled), so both entry points behave identically.
+WOF_COUNTY_MAX_PRECISION="${WOF_COUNTY_MAX_PRECISION:-}"
+WOF_COUNTY_DENSE_MAX_PRECISION="${WOF_COUNTY_DENSE_MAX_PRECISION:-}"
+WOF_COUNTY_DENSE_MAX_AREA_KM2="${WOF_COUNTY_DENSE_MAX_AREA_KM2:-}"
 WOF_REGION_MAX_PRECISION="${WOF_REGION_MAX_PRECISION:-4}"
 WOF_REGION_SPARSE_MAX_PRECISION="${WOF_REGION_SPARSE_MAX_PRECISION:-3}"
 WOF_REGION_SPARSE_MIN_AREA_KM2="${WOF_REGION_SPARSE_MIN_AREA_KM2:-80000}"
@@ -61,6 +73,7 @@ WOF_PROMOTE_LOCALITY_OVER_REGION="${WOF_PROMOTE_LOCALITY_OVER_REGION:-1}"
 WOF_DOMINANT_LOCALITY_POPULATION="${WOF_DOMINANT_LOCALITY_POPULATION:-100000}"
 WOF_DOMINANT_LOCALITY_RATIO="${WOF_DOMINANT_LOCALITY_RATIO:-3}"
 WOF_PARENT_LOCALITY_MIN_SHARE="${WOF_PARENT_LOCALITY_MIN_SHARE:-0.5}"
+WOF_DOMINANT_CITY_PLACETYPES="${WOF_DOMINANT_CITY_PLACETYPES:-locality,localadmin}"
 WOF_INCLUDE_LOCALADMIN="${WOF_INCLUDE_LOCALADMIN:-0}"
 WOF_INCLUDE_COUNTY="${WOF_INCLUDE_COUNTY:-1}"
 WOF_INCLUDE_REGION="${WOF_INCLUDE_REGION:-1}"
@@ -133,7 +146,6 @@ COMMON_FLAGS=(
   --max-precision "${WOF_MAX_PRECISION}"
   --locality-max-precision "${WOF_LOCALITY_MAX_PRECISION}"
   --localadmin-max-precision "${WOF_LOCALADMIN_MAX_PRECISION}"
-  --county-max-precision "${WOF_COUNTY_MAX_PRECISION}"
   --region-max-precision "${WOF_REGION_MAX_PRECISION}"
   --region-sparse-max-precision "${WOF_REGION_SPARSE_MAX_PRECISION}"
   --region-sparse-min-area-km2 "${WOF_REGION_SPARSE_MIN_AREA_KM2}"
@@ -141,6 +153,7 @@ COMMON_FLAGS=(
   --dominant-locality-population "${WOF_DOMINANT_LOCALITY_POPULATION}"
   --dominant-locality-ratio "${WOF_DOMINANT_LOCALITY_RATIO}"
   --parent-locality-min-share "${WOF_PARENT_LOCALITY_MIN_SHARE}"
+  --dominant-city-placetypes "${WOF_DOMINANT_CITY_PLACETYPES}"
   --include-localadmin "${WOF_INCLUDE_LOCALADMIN}"
   --include-county "${WOF_INCLUDE_COUNTY}"
   --include-region "${WOF_INCLUDE_REGION}"
@@ -150,6 +163,18 @@ COMMON_FLAGS=(
   --isolation-min-population "${WOF_ISOLATION_MIN_POPULATION}"
   --ensure-country-locality "${WOF_ENSURE_COUNTRY_LOCALITY}"
 )
+
+if [[ -n "${WOF_COUNTY_MAX_PRECISION}" ]]; then
+  COMMON_FLAGS+=(--county-max-precision "${WOF_COUNTY_MAX_PRECISION}")
+fi
+
+if [[ -n "${WOF_COUNTY_DENSE_MAX_PRECISION}" ]]; then
+  COMMON_FLAGS+=(--county-dense-max-precision "${WOF_COUNTY_DENSE_MAX_PRECISION}")
+fi
+
+if [[ -n "${WOF_COUNTY_DENSE_MAX_AREA_KM2}" ]]; then
+  COMMON_FLAGS+=(--county-dense-max-area-km2 "${WOF_COUNTY_DENSE_MAX_AREA_KM2}")
+fi
 
 if [[ -n "${WOF_MAX_PLACES}" ]]; then
   COMMON_FLAGS+=(--max-places "${WOF_MAX_PLACES}")
