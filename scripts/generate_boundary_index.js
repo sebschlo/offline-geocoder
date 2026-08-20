@@ -1751,13 +1751,25 @@ async function countHomeCellsShadowedByFinerRows(db, rows, placeById, batchPlace
     return 0
   }
 
-  // The deepest cell this batch emits bounds how far a shadowing row can sit.
-  var deepest = 0
   var rowsByHash = Object.create(null)
+  var batchDeepest = 0
   for (var i = 0; i < rows.length; i++) {
     rowsByHash[rows[i].geohash] = rows[i].placeId
-    if (rows[i].geohash.length > deepest) deepest = rows[i].geohash.length
+    if (rows[i].geohash.length > batchDeepest) batchDeepest = rows[i].geohash.length
   }
+
+  // How deep to look must come from what is already stored, not from what this
+  // batch emits.  The shadowing condition is precisely that the batch answers
+  // for a point through a *coarse* cell while a finer row already exists, so
+  // bounding the scan by the batch's own deepest row makes the check blindest
+  // exactly where it is needed - and a batch built with a lower
+  // --max-precision than the database would never look deep enough either.
+  var storedDepth = await dbAll(db, 'SELECT MAX(LENGTH(geohash)) AS depth FROM compact_geohash_lookup')
+  var storedDeepest = storedDepth.length && Number.isFinite(Number(storedDepth[0].depth))
+    ? Number(storedDepth[0].depth)
+    : 0
+
+  var deepest = Math.max(batchDeepest, storedDeepest)
 
   // One candidate per place per precision below the cell this batch answers
   // with, so the query set is bounded by places, not by rows.
