@@ -15,14 +15,15 @@
   the finer cells over that same point when a neighbour emits them, so the rule
   holds for the longest-prefix lookup the runtime actually performs. Placetype
   ranking still decides first, and no cell is added to the index.
-- Stop the dominant-city rollup suppressing a place whose placetype it does not
-  outrank. A county could absorb the cell holding a town's own centre, which is
-  a downgrade the cell comparator would never make - and because the rollup runs
-  per batch, it left that cell undefended in an `--append` build, so the next
-  country written took it and the town's centre resolved across the border
-  (Douglas AZ reading as Agua Prieta; Mittelberg and Riezlern, the Austrian
-  Kleinwalsertal, reading as Oberstdorf). Rollups between localities, which are
-  what make a metro read as one city, are unchanged.
+- By default, stop the dominant-city rollup suppressing a place whose placetype
+  it does not outrank. A county could absorb the cell holding a town's own
+  centre, which is a downgrade the cell comparator would never make - and
+  because the rollup runs per batch, it left that cell undefended in an
+  `--append` build, so the next country written took it and the town's centre
+  resolved across the border (Douglas AZ reading as Agua Prieta; Mittelberg and
+  Riezlern, the Austrian Kleinwalsertal, reading as Oberstdorf). Rollups between
+  localities are unchanged; explicitly adding `county` to
+  `--dominant-city-placetypes` restores the earlier county suppression behavior.
 - Judge compact-index redundancy against the nearest kept ancestor cell instead
   of any matching prefix. A row was dropped whenever some coarser cell named the
   same place, even when a different place owned the cell in between, and the
@@ -30,6 +31,22 @@
 - Reconcile nested home cells from a snapshot of cell ownership, so a place that
   loses its own cell to a coarser claimant still carries its claim to the cells
   below it. The pass no longer depends on the order places are read.
+- Keep counties out of the dominant-city rollup. A parent geohash cell rolled
+  up to the place that dominates its children on population, and `county`
+  counted as a city-like placetype, so a metro could be labelled with its
+  county's name while the smaller localities under it lost their own cells
+  (Brockport and Greece, NY answering "Monroe"). The rollup now only hands a
+  parent cell to a placetype listed in `--dominant-city-placetypes`
+  (default `locality,localadmin`, env `WOF_DOMINANT_CITY_PLACETYPES`); add
+  `county` to restore county eligibility. Counties still win cells
+  through the normal comparator. Both routes into a parent cell -- winning the
+  dominant-city competition, and being the only city-like owner in the cell --
+  share one eligibility gate, so a county cannot take a parent cell through the
+  single-candidate path either.
+
+- Document the database backwards-compatibility contract in COMPATIBILITY.md
+  and enforce it with permanent per-generation reader fixtures in
+  spec/reader_compatibility_spec.js
 - Fix `--append` builds handing contested geohash cells to whichever batch ran
   last. Cells that already belong to a better-ranked place (by placetype, then
   population, then centroid distance) now keep their existing owner, so border
@@ -39,6 +56,11 @@
   candidates against previously written places. Existing databases are
   upgraded in place when appending; the new columns are nullable and readers
   are unaffected.
+- Add optional dense-county precision rule (`--county-dense-max-precision` / `--county-dense-max-area-km2`, env `WOF_COUNTY_DENSE_MAX_PRECISION` / `WOF_COUNTY_DENSE_MAX_AREA_KM2`): small county polygons get a finer geohash cap so municipality-sized counties are not swallowed by neighbors in coarse cells; enabling the rule without an explicit county cap (`--county-max-precision` / `WOF_COUNTY_MAX_PRECISION`) defaults the cap to one below the clamped dense precision so the area threshold actually differentiates
+- Add `sample` and `sweep` subcommands to `scripts/validate_with_locationiq.js`: a quota-aware, resumable world validation sweep against LocationIQ (JSONL response cache keyed by rounded coordinates, persisted per-UTC-day request cap, per-country Markdown mismatch report plus machine-readable mismatch JSONL, `--dry-run` for cache-only evaluation) and a GeoNames-TSV sampler that picks the top-N most populous places per country. Name comparison now preserves non-Latin scripts.
+- Run the test suite in GitHub Actions on pushes to master and all pull
+  requests (Node 20.x and 22.x); raise Jasmine's per-hook timeout so
+  fixture-database construction survives slow shared runners
 
 ### 1.0.0 - 2018-08-02
 

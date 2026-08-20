@@ -174,6 +174,10 @@ Environment variables for customization:
 The default feature codes exclude `PPL` which can include neighbourhood-like
 populated places. The schema is defined in [`scripts/schema.sql`](scripts/schema.sql).
 
+Database files and reader code are versioned independently, so schema
+changes must follow the backwards-compatibility contract in
+[`COMPATIBILITY.md`](COMPATIBILITY.md).
+
 ### Generating a Boundary Index
 
 Build boundary-aware reverse lookup tables from a polygon source (GeoJSON
@@ -219,8 +223,8 @@ The builder uses a multi-stage pipeline to decide which localities make it into 
 2. **Isolation pass** (`--isolation-min-population`): localities between the isolation floor and the primary threshold are evaluated as candidates. A candidate is promoted if at least one of its geohash cover cells (at base precision) is not already claimed by a primary locality. This ensures small but geographically isolated places like islands, remote towns, and oases get their own label without adding noise in dense urban areas.
 3. **Country guarantee** (`--ensure-country-locality`): after the isolation pass, any country that still has zero localities gets its highest-population candidate promoted unconditionally.
 4. **Contained-locality pruning** (`--drop-contained-localities`): removes localities whose polygon is fully contained inside a larger locality in the same country/admin1 group.
-5. **Dominant-city rollup**: in the geohash index, when a major city (population >= `--dominant-locality-population`) dominates its neighbours by a ratio of `--dominant-locality-ratio`, smaller nearby localities are absorbed into the major city label.
-6. **Locality-over-region promotion**: when a locality and a region compete for the same parent geohash cell, the locality wins if it covers >= `--parent-locality-min-share` of child cells.
+5. **Dominant-city rollup**: in the geohash index, when a major city (population >= `--dominant-locality-population`) dominates its neighbours by a ratio of `--dominant-locality-ratio`, smaller nearby localities are absorbed into the major city label. Only the placetypes listed in `--dominant-city-placetypes` (default `locality,localadmin`) may play that dominant role, so a metro is never named after the county it sits in; counties still own cells on their own merits.
+6. **Locality-over-region promotion**: when a locality and a region compete for the same parent geohash cell, the locality wins if it covers >= `--parent-locality-min-share` of child cells and its placetype is listed in `--dominant-city-placetypes`. Both routes to a parent cell share that eligibility gate, so a lone county cannot take a parent cell that the dominant-city rollup would have refused it.
 
 Builder notes:
 
@@ -239,7 +243,8 @@ Builder notes:
 - Dominant-city rollup keeps broad city labels sticky in mixed city/suburb cells unless there is competing major-city pressure:
   - `--dominant-locality-population` (default `100000`)
   - `--dominant-locality-ratio` (default `3`)
-  - A rollup only folds a place into a better- or equally-ranked label, so a county never absorbs a locality: that would be a downgrade, and it would also strip the town of the cell holding its own centre
+  - `--dominant-city-placetypes` (default `locality,localadmin`) lists placetypes eligible to be the dominant city of a parent cell, whether one wins a competition or is the only city-like owner in that cell. A county still wins cells on its own merits but is excluded from naming a whole parent cell by default; explicitly adding `county` restores the earlier county rollup, including suppression of lower-ranked locality descendants
+  - Without that explicit county override, a rollup only folds a place into a better- or equally-ranked label, so a county cannot absorb a locality and strip the town of the cell holding its own centre
 - Parent-cell takeover guard:
   - `--parent-locality-min-share` (default `0.5`) requires locality ownership of at least that child-cell share before replacing a parent cell label
 - Excludes neighbourhood-like placetypes from default reverse output
@@ -281,6 +286,7 @@ Useful WOF build env vars:
 - `WOF_HOME_CELL_PRIORITY=1|0` let a place keep the cell that contains its own centroid (default `1`)
 - `WOF_DOMINANT_LOCALITY_POPULATION` major-locality threshold for dominant-city rollup (default `100000`)
 - `WOF_DOMINANT_LOCALITY_RATIO` dominant-vs-next locality population ratio (default `3`)
+- `WOF_DOMINANT_CITY_PLACETYPES` placetypes eligible to be a parent cell's dominant city (default `locality,localadmin`)
 - `WOF_PARENT_LOCALITY_MIN_SHARE` minimum child-cell share for locality parent takeover (default `0.5`)
 - `WOF_GEOMETRY_DECIMALS` round coordinates before storage/indexing (for example `4`)
 - `WOF_MIN_POPULATION` filter out places below threshold (for example `10000`)
@@ -318,6 +324,40 @@ It creates/updates:
 - `validation_results` (local vs LocationIQ comparison verdicts)
 
 Cache DB path is automatic (default behavior): `tmp/locationiq-validation-<database-basename>.sqlite`.
+
+### World Validation Sweep (LocationIQ)
+
+The same script also runs a quota-aware, resumable sweep over a world-wide
+points file and ranks countries by mismatch rate, so data work can be aimed at
+the worst areas first:
+
+```bash
+# 1. Build a points file from a GeoNames-style TSV (e.g. cities1000.txt):
+#    the top 25 most populous places per country. Not committed to the repo.
+node scripts/validate_with_locationiq.js sample \
+  --geonames tmp/cities1000.txt --per-country 25
+
+# 2. Run the sweep. Stays inside LocationIQ's free tier by default:
+#    max 4500 requests per UTC day (persisted across invocations) at 1 req/s.
+LOCATIONIQ_API_KEY=... node scripts/validate_with_locationiq.js sweep \
+  --points tmp/locationiq-sweep/points.jsonl --database tmp/world.sqlite
+
+# 3. Rebuild the report from cache only, no network:
+node scripts/validate_with_locationiq.js sweep \
+  --points tmp/locationiq-sweep/points.jsonl --database tmp/world.sqlite --dry-run
+```
+
+Every LocationIQ response is cached as JSONL keyed by coordinates rounded to
+four decimals, so re-running the same command never re-queries a cached point —
+if a run stops at the daily cap or on HTTP 429, just run it again later to
+resume. The daily-cap state lives outside the workdir (default
+`tmp/locationiq-quota.json`, suffixed with a non-reversible fingerprint of the
+API key), so every sweep configuration using one key shares a single cap, while
+separate keys — which LocationIQ meters separately — keep their own tallies.
+Outputs land under `--workdir` (default `tmp/locationiq-sweep/`):
+`report.md` (per-country point counts, agreement %, country mismatches, worst
+examples) and `mismatches.jsonl` (machine-readable list of all mismatches).
+See `sweep --help` and `sample --help` for all options.
 
 ## License
 
