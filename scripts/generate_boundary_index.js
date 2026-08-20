@@ -1799,13 +1799,22 @@ async function countHomeCellsShadowedByFinerRows(db, keptRows, placeById, batchP
     var place = placeById[placeIds[placeIndex]]
     if (!place || !place.homeGeohash || !place.cover) continue
 
-    // A place only ever claims cells *below* the cover cell that holds its
-    // centroid - that is the level its own cover terminates at, and the level
-    // reconcileNestedHomeCells() propagates down from. Starting the chain any
-    // coarser would judge cells the place never claimed: when the rollup
-    // suppresses a locality's own row and the promoted ancestor then defers to
-    // an existing owner, a scan reaching that ancestor would report a shadow
-    // for a cell that was never contested.
+    // The chain runs from the cover cell holding the centroid downwards, and
+    // no coarser. Both bounds are load-bearing, and they pull opposite ways:
+    //
+    //   - Nothing *above* that cell is judged, because a place never claims
+    //     one. When the rollup suppresses a locality's row and the promoted
+    //     ancestor then defers to an existing owner, a scan reaching that
+    //     ancestor would report a shadow on a cell nothing contested.
+    //   - The cell itself *is* judged, because the batch may hold no row for
+    //     it: promotion to an ancestor makes the exact home-cover row
+    //     redundant, buildCompactLookupRows drops it, and the exact-hash
+    //     resolver then never compares it against an earlier batch that owns
+    //     it - leaving that earlier row as the runtime's deepest match.
+    //
+    // Judging it is safe when the row was retained: either this batch won it,
+    // in which case the scan stops at a batch-owned cell, or it lost it to the
+    // incumbent on merit, in which case the same comparator declines here too.
     var homeCoverPrecision = 0
     for (var coverIndex = 0; coverIndex < place.cover.length; coverIndex++) {
       var coverHash = place.cover[coverIndex].geohash
@@ -1814,10 +1823,10 @@ async function countHomeCellsShadowedByFinerRows(db, keptRows, placeById, batchP
         break
       }
     }
-    if (!homeCoverPrecision || homeCoverPrecision >= deepest) continue
+    if (!homeCoverPrecision || homeCoverPrecision > deepest) continue
 
     var chain = []
-    for (var length = homeCoverPrecision + 1; length <= deepest; length++) {
+    for (var length = homeCoverPrecision; length <= deepest; length++) {
       // The cached home geohash stops at HOME_CELL_PRECISION; past that,
       // encode from the centroid as ownsHomeCell() does, so a database built
       // deeper than the cache still gets real descendants instead of the same

@@ -20,10 +20,11 @@
   with a valid home cell is scanned whether or not it won the cell it emitted,
   only the deepest owner on each centroid path is judged (that is the only row
   a longest-prefix lookup can return), the count is per place rather than per
-  row, each chain starts strictly below the cover cell holding the place's
-  centroid (a place never claims coarser cells, so judging them would report
-  shadows on cells nothing contested), and scan depth comes from the stored
-  index rather than from this batch's rows.
+  row, each chain runs from the cover cell holding the place's centroid
+  downwards and no coarser (a place never claims a coarser cell, but its own
+  home-cover row can be compacted away into a promoted ancestor and never
+  compared against an earlier batch that owns that hash), and scan depth comes
+  from the stored index rather than from this batch's rows.
 - Give every place the geohash cell that contains its own centroid, ahead of
   the population tie-break, so a border town no longer loses its own centre to
   the larger city across the border (for example Calexico resolving to
