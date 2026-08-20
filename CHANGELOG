@@ -1,5 +1,8 @@
 ### Unreleased
 
+- Document the database backwards-compatibility contract in COMPATIBILITY.md
+  and enforce it with permanent per-generation reader fixtures in
+  spec/reader_compatibility_spec.js
 - Fix `--append` builds handing contested geohash cells to whichever batch ran
   last. Cells that already belong to a better-ranked place (by placetype, then
   population, then centroid distance) now keep their existing owner, so border
