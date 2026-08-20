@@ -302,6 +302,20 @@ Boundary runtime modes:
   - Uses compact `compact_geohash_lookup` when present (fast geohash-to-place).
   - Falls back to full polygon-aware tables when compact rows are absent.
 
+### Curation Overlays
+
+After building a compact boundary database, you can apply hand-maintained
+curation overlays for labeling judgment calls that no generic build rule can
+derive from data (for example, corridors that locals consider part of a city):
+
+```bash
+npm run curate -- --database data/geocoder.sqlite --curation curation/
+```
+
+Curation is a last resort — prefer generalizing the build rules. See
+[`curation/README.md`](curation/README.md) for the philosophy, the file
+format, and how to propose changes.
+
 ### External Reverse Validation (LocationIQ)
 
 Use this script to compare local reverse results against LocationIQ at sampled
