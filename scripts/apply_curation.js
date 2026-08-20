@@ -1080,16 +1080,30 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
       // They must also resolve FROM A LOOKUP CELL: the nearest-centroid
       // fallback can return the target itself for a coordinate no cell
       // covers, which would pass without exercising any relabeled cell.
-      var probeCountry = probe.country || entry.country
-      var isPositive = probe.expect === intoName && probeCountry === entry.country
-      // A country-qualified probe must resolve into that country, so a guard
-      // cannot be satisfied by a same-named place on the other side of it. The
-      // country comes from the database rather than the reverse result, whose
-      // shape differs between reader modes.
+      var entryCountry = String(entry.country).toUpperCase()
+      var probeCountry = String(probe.country || entry.country).toUpperCase()
+      var isPositive = probe.expect === intoName && probeCountry === entryCountry
+
+      // The expected label must live in the expected country, whether or not
+      // the probe spelled that country out. An omitted "country" means the
+      // entry's own country, so a same-named place across the border must not
+      // satisfy an unqualified guard either - which is the whole reason the
+      // field exists.
+      //
+      // Both sides are already uppercase: entry and probe countries are
+      // validated as /^[A-Z]{2}$/, and placeCountry() uppercases the stored
+      // country_id. The explicit normalisation keeps the comparison correct if
+      // either validator is ever relaxed.
+      //
+      // The country comes from the database rather than the reverse result,
+      // whose shape differs between reader modes. A country that cannot be
+      // resolved fails closed: compact_places.country_id is NOT NULL, so this
+      // means the result carried no id at all, and a verification tool must
+      // never pass a probe it was unable to check.
       var resolvedCountry = result && result.id !== undefined
         ? await placeCountry(db, result.id)
         : null
-      var countryMatches = !probe.country || resolvedCountry === probeCountry
+      var countryMatches = Boolean(resolvedCountry) && resolvedCountry === probeCountry
       var idMatches = !isPositive || Boolean(result && Number(result.id) === entry.into)
       var pathMatches = !isPositive || resolvedVia === 'geohash_lookup'
       var territory = isPositive
@@ -1155,7 +1169,8 @@ async function verifyEntries(db, entries, skipUnresolvable, boundary, resolvabil
           ' — move it onto a cell the entry relabels, or make it a guard probe expecting "' + actual + '"'
       } else if (actual === probe.expect && !countryMatches) {
         hint = ' — resolved to a place named "' + actual + '" in ' +
-          (resolvedCountry || '?') + ', not ' + probeCountry
+          (resolvedCountry || '<no country>') + ', not ' + probeCountry +
+          (probe.country ? '' : ' (probes default to the entry\'s country; set "country" if another is intended)')
       } else if (actual === probe.expect && !idMatches) {
         got = '"' + actual + '" (same-named place ' + (result && result.id) + ', not the merge target ' + entry.into + ')'
       } else if (actual === probe.expect && !pathMatches) {

@@ -581,6 +581,86 @@ describe('curation overlay (scripts/apply_curation.js)', () => {
     }
   });
 
+  it('holds an unqualified guard probe to the entry country', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // 'Ghost Town' exists in both US and CA. This guard omits "country", so
+      // it means the entry's own country - US - but the coordinate resolves to
+      // the Canadian homonym. Matching on name alone would pass it, which is
+      // exactly the cross-border confusion the country check exists to stop,
+      // and it would apply to every probe ever written without a "country".
+      const doc = baseDoc();
+      doc.entries[0].probes.push({
+        lat: points.homonym.lat,
+        lon: points.homonym.lon,
+        expect: 'Ghost Town',
+        note: 'guard: unqualified, so it means the entry country'
+      });
+
+      const result = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'us.json', doc),
+        '--verify'
+      ]);
+
+      expect(result.status).toEqual(1);
+      const output = result.stdout + result.stderr;
+      expect(output).toContain('not US');
+      // And it says why, so the author can qualify the probe if that was the
+      // intent rather than guessing at the failure.
+      expect(output).toContain('probes default to the entry');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails a probe whose resolved place carries no country', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
+    try {
+      const dbPath = path.join(dir, 'compact.sqlite');
+      await seedCompactDb(dbPath);
+
+      // A place with no country at all owns the cell the probe lands on. The
+      // name matches, so only the country check can catch it - and it has
+      // nothing to compare against. Verification fails closed rather than
+      // passing a probe it could not actually check.
+      const orphanPoint = { lat: 60.2, lon: 60.2 };
+      const orphanCell = geohash.encode(orphanPoint.lat, orphanPoint.lon, 5);
+      const db = new sqlite3.Database(dbPath);
+      try {
+        await exec(db, `
+          INSERT INTO compact_places(id, name, country_id, admin1_id, placetype_code, latitude, longitude)
+            VALUES (9999001, 'Bystander County', '', 5, 3, ${orphanPoint.lat}, ${orphanPoint.lon});
+          INSERT INTO compact_geohash_lookup(geohash, place_id) VALUES ('${orphanCell}', 9999001);
+        `);
+      } finally {
+        await close(db);
+      }
+
+      const doc = baseDoc();
+      doc.entries[0].probes.push({
+        lat: orphanPoint.lat,
+        lon: orphanPoint.lon,
+        expect: 'Bystander County',
+        note: 'guard: resolved place has no country'
+      });
+
+      const result = runCurate([
+        '--database', dbPath,
+        '--curation', writeDoc(dir, 'us.json', doc),
+        '--verify'
+      ]);
+
+      expect(result.status).toEqual(1);
+      expect(result.stdout + result.stderr).toContain('<no country>');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('holds a country-qualified guard probe to that country', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-geocoder-curation-'));
     try {
