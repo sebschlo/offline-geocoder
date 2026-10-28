@@ -4,6 +4,60 @@ Node and React Native library for offline geocoding. Designed to be used
 offline (for example embedded in a desktop or mobile application) — no web
 requests are made to perform a lookup.
 
+<p align="center">
+  <img src="docs/images/cells-guatemala-city.svg" width="520" alt="Geohash cells around Guatemala City, coloured by the place that owns each one, over the real municipal boundaries">
+</p>
+<p align="center"><sub>Guatemala City from a world build. Each square is one stored geohash cell, coloured by the place that owns it, drawn over the real municipal boundaries.</sub></p>
+
+## How boundary mode works
+
+Shipping admin polygons to a phone is too big and too slow to search. Boundary
+mode works the answers out ahead of time instead: the build intersects
+[Who's On First](https://whosonfirst.org/) boundaries with a geohash grid and
+stores one row per cell, `geohash → place`. A lookup hashes the coordinate and
+takes the longest stored prefix. That's one indexed SQLite query and no
+geometry at runtime. The world build that ships in [Citylap](https://getcitylap.com)
+is 24.6 MB and holds 448,033 cells.
+
+For a slide-by-slide walkthrough with an interactive lookup map, see
+[getcitylap.com/geocoder](https://getcitylap.com/geocoder/).
+
+### Geohash cells nest
+
+Each character of a geohash cuts its cell into 32 smaller ones, so a longer hash
+is a smaller box inside the shorter one. `9fx` (about 150 km) contains `9fxe`
+(about 38 × 20 km), which contains `9fxeh` (about 5 km).
+
+<p align="center">
+  <img src="docs/images/geohash-nesting.svg" alt="Geohash 9fx contains 9fxe, which contains 9fxeh, shown as three panels joined by zoom lines">
+</p>
+
+### Fine where places are small, coarse where they aren't
+
+Every cell has exactly one owner, so cell size limits how small a place can be
+and still be returned. The build stores fine cells only where they change the
+answer and leaves sparse areas coarse. Precision caps are set per placetype,
+for example `WOF_COUNTY_MAX_PRECISION`, and `WOF_COUNTY_DENSE_MAX_PRECISION`
+with `WOF_COUNTY_DENSE_MAX_AREA_KM2` refines only municipality-sized counties.
+In Guatemala that means 5 km cells across the dense south and 39 × 20 km cells
+across the jungle of Petén.
+
+<p align="center">
+  <img src="docs/images/adaptive-precision-guatemala.svg" width="560" alt="Guatemala's stored cells coloured by precision: fine in the populated south, coarse in Petén">
+</p>
+
+### Cells ignore borders
+
+A cell that straddles a national border can only belong to one side. The build
+keeps this error small: a place owns the cell containing its own centre
+(`WOF_HOME_CELL_PRIORITY`), metro rollups never cross a country, and contested
+cells are settled by a fixed order (placetype, population, distance to the cell
+centre, area, id), so batch order can't change the result.
+
+<p align="center">
+  <img src="docs/images/border-san-diego-tijuana.svg" width="560" alt="Cells along the San Diego and Tijuana border, over the real city and national boundaries">
+</p>
+
 ## Data
 
 This uses data from the [GeoNames project](http://www.geonames.org/), which is
@@ -318,6 +372,11 @@ npm run curate -- --database data/geocoder.sqlite --curation curation/
 Curation is a last resort — prefer generalizing the build rules. See
 [`curation/README.md`](curation/README.md) for the philosophy, the file
 format, and how to propose changes.
+
+<p align="center">
+  <img src="docs/images/curation-guatemala-city.svg" width="520" alt="Guatemala City cells with the four cells relabeled by curation/gt.json outlined and hatched">
+</p>
+<p align="center"><sub>The four hatched cells are relabeled from Santa Catarina Pinula and Fraijanes to Guatemala City by <code>curation/gt.json</code>. Mixco and Villa Nueva keep their own names.</sub></p>
 
 ### External Reverse Validation (LocationIQ)
 
